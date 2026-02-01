@@ -135,7 +135,7 @@ async def retrieve_transactions(chain: str, start_date: str, end_date: str) -> N
 
     # Setup Paths & Connection
     token_path = TOKENS_FOLDER / f"{chain}_tokens.json"
-    output_path = TRANSACTIONS_FOLDER / f"{chain}_transactions_bls.csv"
+    output_path = TRANSACTIONS_FOLDER / f"{chain}_transactions.csv"
     os.makedirs(TRANSACTIONS_FOLDER, exist_ok=True)
     os.makedirs(TOKENS_FOLDER, exist_ok=True)
 
