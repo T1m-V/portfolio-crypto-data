@@ -12,7 +12,7 @@ from web3 import Web3
 
 from blockchain_reader.token_manager import TokenManager
 from blockchain_reader.transaction_analyzer import analyze_transaction
-from file_paths import CHAIN_INFO_PATH, TOKENS_FOLDER, TRANSACTIONS_FOLDER
+from file_paths import BLOCKCHAIN_TRANSACTIONS_FOLDER, CHAIN_INFO_PATH, TOKENS_FOLDER
 
 ctx = Context(prec=78, rounding=ROUND_HALF_UP)
 
@@ -109,7 +109,9 @@ def build_internal_eth_map(txs_internal: list[dict], my_address: str) -> dict[st
     return internal_map
 
 
-async def retrieve_transactions(chain: str, start_date: str, end_date: str) -> None:
+async def retrieve_transactions(
+    chain: str, start_date: str | None = None, end_date: str | None = None
+) -> None:
     """
     Main entry point to fetch and analyze transactions for a chain.
 
@@ -135,14 +137,32 @@ async def retrieve_transactions(chain: str, start_date: str, end_date: str) -> N
 
     # Setup Paths & Connection
     token_path = TOKENS_FOLDER / f"{chain}_tokens.json"
-    output_path = TRANSACTIONS_FOLDER / f"{chain}_transactions.csv"
-    os.makedirs(TRANSACTIONS_FOLDER, exist_ok=True)
+    output_path = BLOCKCHAIN_TRANSACTIONS_FOLDER / f"{chain}_transactions.csv"
+    os.makedirs(BLOCKCHAIN_TRANSACTIONS_FOLDER, exist_ok=True)
     os.makedirs(TOKENS_FOLDER, exist_ok=True)
 
     w3 = Web3(Web3.HTTPProvider(cfg["rpc_url"]))
     if not w3.is_connected():
         print("No RPC connection.")
         return
+
+    # Determine dates if not provided
+    if end_date is None:
+        end_date = datetime.now().strftime("%d/%m/%Y")
+
+    if start_date is None:
+        start_date = "01/01/2000"
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            try:
+                df_dates = pd.read_csv(output_path, usecols=["Date"])
+                if not df_dates.empty:
+                    start_date = (
+                        pd.to_datetime(df_dates["Date"], format="%d/%m/%Y %H:%M:%S")
+                        .min()
+                        .strftime("%d/%m/%Y")
+                    )
+            except Exception:
+                pass
 
     # 2. Parse Dates
     start_ts = int(datetime.strptime(start_date, "%d/%m/%Y").timestamp())
@@ -212,11 +232,22 @@ async def retrieve_transactions(chain: str, start_date: str, end_date: str) -> N
 
     # 7. Export
     if results:
-        df = pd.DataFrame(results)
-        df["_sort_helper"] = pd.to_datetime(df["Date"], format="%d/%m/%Y %H:%M:%S")
-        df = df.sort_values(by="_sort_helper", ascending=True).drop(columns=["_sort_helper"])
-        df.to_csv(output_path, index=False)
-        print(f"Done. Saved {len(results)} rows to {output_path}")
+        new_results_df = pd.DataFrame(results)
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            existing_results_df = pd.read_csv(output_path)
+            results_df = pd.concat([existing_results_df, new_results_df]).drop_duplicates(
+                subset=["TX Hash"], keep="first"
+            )
+        else:
+            results_df = new_results_df
+
+        results_df["_sort_helper"] = pd.to_datetime(results_df["Date"], format="%d/%m/%Y %H:%M:%S")
+        results_df = results_df.sort_values(by="_sort_helper", ascending=True).drop(
+            columns=["_sort_helper"]
+        )
+        results_df.to_csv(output_path, index=False)
+        print(f"Done. Saved {len(results_df)} rows to {output_path}")
     else:
         print("No results generated.")
 
