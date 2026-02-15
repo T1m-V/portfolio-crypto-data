@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 from web3 import Web3
 
-from file_paths import BLOCKCHAIN_TRANSACTIONS_FOLDER, CHAIN_INFO_PATH
+from file_paths import BLOCKCHAIN_BLOCK_MAP_FOLDER, BLOCKCHAIN_TRANSACTIONS_FOLDER, CHAIN_INFO_PATH
 
 
 def get_block_by_timestamp(w3: Web3, target_ts: int, low: int, high: int) -> int:
@@ -99,8 +99,8 @@ def map_blocks(chain: str, start_date: str | None = None, end_date: str | None =
     search_low = 0
 
     # Define output path similar to evm_reader
-    map_file_path = BLOCKCHAIN_TRANSACTIONS_FOLDER / f"block_map_{chain}.csv"
-    os.makedirs(name=BLOCKCHAIN_TRANSACTIONS_FOLDER, exist_ok=True)
+    map_file_path = BLOCKCHAIN_BLOCK_MAP_FOLDER / f"block_map_{chain}.csv"
+    os.makedirs(name=BLOCKCHAIN_BLOCK_MAP_FOLDER, exist_ok=True)
 
     # 2. Load Existing Map
     block_map = {}

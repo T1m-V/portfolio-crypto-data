@@ -235,7 +235,7 @@ async def retrieve_transactions(
         new_results_df = pd.DataFrame(results)
 
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            existing_results_df = pd.read_csv(output_path)
+            existing_results_df = pd.read_csv(output_path, dtype=str)
             results_df = pd.concat([existing_results_df, new_results_df]).drop_duplicates(
                 subset=["TX Hash"], keep="first"
             )
