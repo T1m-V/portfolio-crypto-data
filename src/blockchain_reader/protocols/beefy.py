@@ -9,7 +9,7 @@ from web3 import Web3
 
 from file_paths import (
     BLOCKCHAIN_BLOCK_MAP_FOLDER,
-    BLOCKHAIN_SNAPSHOT_FOLDER,
+    BLOCKCHAIN_SNAPSHOT_FOLDER,
     CHAIN_INFO_PATH,
     PROTOCOL_UNDERLYING_TOKEN_FOLDER,
     TOKENS_FOLDER,
@@ -126,8 +126,11 @@ def get_beefy_history(
         print(f"Chain '{chain}' not found in config.")
         return
 
-    cfg = config_data[chain]
-    rpc_url = cfg["alchemy_url"]
+    cfg: dict[str, str] = config_data[chain]
+    rpc_url = cfg.get("alchemy_url") or cfg.get("rpc_url")
+    if not rpc_url:
+        print(f"Chain '{chain}' is missing both 'alchemy_url' and 'rpc_url'.")
+        return
 
     w3 = Web3(provider=Web3.HTTPProvider(endpoint_uri=rpc_url))
     if not w3.is_connected():
@@ -214,7 +217,7 @@ def process_all_beefy_tokens(chain: str) -> None:
     with open(file=tokens_file_path, mode="r") as f:
         tokens = json.load(fp=f)
 
-    snapshots_file_path = BLOCKHAIN_SNAPSHOT_FOLDER / f"{chain}_snapshots.csv"
+    snapshots_file_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_snapshots.csv"
     if not os.path.exists(snapshots_file_path):
         print(f"Snapshots '{snapshots_file_path}' not found.")
         return

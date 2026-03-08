@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any
 
@@ -388,7 +388,9 @@ def analyze_transaction(
         data = _fetch_transaction_data(w3=w3, tx_hash=tx_hash)
         tx, receipt, block = data.tx, data.receipt, data.block
 
-        date_str = datetime.fromtimestamp(block["timestamp"]).strftime("%d/%m/%Y %H:%M:%S")
+        date_str = datetime.fromtimestamp(block["timestamp"], tz=timezone.utc).strftime(
+            "%d/%m/%Y %H:%M:%S"
+        )
         fee_val, fee_token = _calculate_fee(tx=tx, receipt=receipt, my_address=my_address)
 
         raw_ins, raw_outs = _process_native_eth_transfer(tx=tx, my_address=my_address)

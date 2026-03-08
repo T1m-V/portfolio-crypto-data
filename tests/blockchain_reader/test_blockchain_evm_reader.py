@@ -1,0 +1,61 @@
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import pandas as pd
+
+from blockchain_reader.evm_reader import (
+    OUTPUT_COLUMNS,
+    _derive_start_date,
+    _fetch_explorer_data,
+    _normalize_results_frame,
+)
+
+
+class BlockchainEvmReaderTests(unittest.TestCase):
+    def test_derive_start_date_uses_latest_date_with_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = Path(tmp_dir) / "tx.csv"
+            pd.DataFrame(
+                {
+                    "Date": [
+                        "01/01/2026 08:00:00",
+                        "05/01/2026 11:30:00",
+                        "03/01/2026 09:45:00",
+                    ]
+                }
+            ).to_csv(csv_path, index=False)
+
+            derived = _derive_start_date(output_path=csv_path, overlap_days=1)
+            self.assertEqual(derived, "04/01/2026")
+
+    def test_normalize_results_frame_enforces_columns(self) -> None:
+        raw = pd.DataFrame([{"TX Hash": "0x1", "Date": "01/01/2026 10:00:00", "Fee": 1.2}])
+        normalized = _normalize_results_frame(raw)
+
+        self.assertEqual(list(normalized.columns), OUTPUT_COLUMNS)
+        self.assertEqual(normalized.iloc[0]["Fee"], "1.2")
+        self.assertEqual(normalized.iloc[0]["Token in"], "")
+
+    def test_fetch_explorer_data_handles_no_transactions(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "status": "0",
+            "message": "No transactions found",
+            "result": "No transactions found",
+        }
+
+        with patch("blockchain_reader.evm_reader.requests.get", return_value=response) as get_mock:
+            data = _fetch_explorer_data(
+                api_url="https://example.test",
+                params={"action": "txlist"},
+            )
+
+        self.assertEqual(data, [])
+        get_mock.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

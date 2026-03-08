@@ -1,7 +1,8 @@
 import asyncio
 import json
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Context, Decimal
 from typing import Any
 
@@ -15,10 +16,26 @@ from blockchain_reader.transaction_analyzer import analyze_transaction
 from file_paths import BLOCKCHAIN_TRANSACTIONS_FOLDER, CHAIN_INFO_PATH, TOKENS_FOLDER
 
 ctx = Context(prec=78, rounding=ROUND_HALF_UP)
+DEFAULT_START_DATE = "01/01/2000"
+OUTPUT_COLUMNS = [
+    "TX Hash",
+    "Date",
+    "Qty in",
+    "Token in",
+    "Qty out",
+    "Token out",
+    "Type",
+    "Fee",
+    "Fee Token",
+]
 
 
 def _fetch_explorer_data(
-    api_url: str, params: dict[str, Any], result_key: str = "result"
+    api_url: str,
+    params: dict[str, Any],
+    result_key: str = "result",
+    timeout_seconds: int = 20,
+    max_retries: int = 3,
 ) -> list[Any]:
     """
     Executes a GET request to the Explorer API.
@@ -31,14 +48,78 @@ def _fetch_explorer_data(
     returns:
         List of result items.
     """
-    try:
-        response = requests.get(api_url, params=params)
-        data = response.json()
-        if data.get("status") == "1":
-            return data.get(result_key, [])
-    except Exception as e:
-        print(f"[!] API Request Error: {e}")
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.get(api_url, params=params, timeout=timeout_seconds)
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError) as e:
+            if attempt == max_retries:
+                print(f"[!] API Request Error for action={params.get('action')}: {e}")
+                return []
+            time.sleep(0.4 * (2**attempt))
+            continue
+
+        status = data.get("status")
+        message = str(data.get("message", "")).lower()
+        result = data.get(result_key, [])
+        result_str = str(result).lower()
+
+        if status == "1":
+            if isinstance(result, list):
+                return result
+            return []
+
+        if status == "0" and "no transactions found" in (message + result_str):
+            return []
+
+        if attempt == max_retries:
+            print(f"[!] Unexpected explorer payload for action={params.get('action')}: {data}")
+            return []
+        time.sleep(0.4 * (2**attempt))
+
     return []
+
+
+def _parse_input_date_to_utc(date_str: str, end_of_day: bool) -> datetime:
+    parsed = datetime.strptime(date_str, "%d/%m/%Y").replace(tzinfo=timezone.utc)
+    if end_of_day:
+        return parsed.replace(hour=23, minute=59, second=59)
+    return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _derive_start_date(output_path: str, overlap_days: int = 1) -> str:
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        return DEFAULT_START_DATE
+    try:
+        df_dates = pd.read_csv(output_path, usecols=["Date"])
+        if df_dates.empty:
+            return DEFAULT_START_DATE
+        latest = pd.to_datetime(df_dates["Date"], format="%d/%m/%Y %H:%M:%S").max()
+        start_dt = (latest - timedelta(days=overlap_days)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return start_dt.strftime("%d/%m/%Y")
+    except (ValueError, KeyError, pd.errors.ParserError):
+        return DEFAULT_START_DATE
+
+
+def _normalize_results_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.copy()
+    for col in OUTPUT_COLUMNS:
+        if col not in normalized.columns:
+            normalized[col] = ""
+    normalized = normalized[OUTPUT_COLUMNS]
+    for col in OUTPUT_COLUMNS:
+        normalized[col] = normalized[col].fillna("").astype(str)
+    return normalized
+
+
+def _safe_timestamp(tx: dict[str, Any]) -> int:
+    try:
+        return int(tx.get("timeStamp", 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def get_all_transaction_hashes(
@@ -71,18 +152,18 @@ def get_all_transaction_hashes(
     # 1. Standard TX List
     p_std = {**base_params, "action": "txlist"}
     txs_std = _fetch_explorer_data(api_url=api_url, params=p_std)
-    hashes_std = {tx["hash"] for tx in txs_std if start_ts <= int(tx["timeStamp"]) <= end_ts}
+    hashes_std = {tx["hash"] for tx in txs_std if start_ts <= _safe_timestamp(tx) <= end_ts}
 
     # 2. Token Transfers (ERC20)
     p_tok = {**base_params, "action": "tokentx"}
     txs_tok = _fetch_explorer_data(api_url=api_url, params=p_tok)
-    hashes_tok = {tx["hash"] for tx in txs_tok if start_ts <= int(tx["timeStamp"]) <= end_ts}
+    hashes_tok = {tx["hash"] for tx in txs_tok if start_ts <= _safe_timestamp(tx) <= end_ts}
 
     # 3. Internal Transactions
     # We return the raw list to map values later, but here we just need hashes
     p_int = {**base_params, "action": "txlistinternal"}
     txs_int = _fetch_explorer_data(api_url=api_url, params=p_int)
-    hashes_int = {tx["hash"] for tx in txs_int if start_ts <= int(tx["timeStamp"]) <= end_ts}
+    hashes_int = {tx["hash"] for tx in txs_int if start_ts <= _safe_timestamp(tx) <= end_ts}
 
     all_hashes = hashes_std | hashes_tok | hashes_int
     return hashes_std, all_hashes, txs_int
@@ -102,9 +183,10 @@ def build_internal_eth_map(txs_internal: list[dict], my_address: str) -> dict[st
     internal_map = {}
     for tx in txs_internal:
         # Check if 'to' exists (contract creation has None/empty 'to')
-        if tx.get("to") and tx["to"].lower() == my_address and float(tx["value"]) > 0:
+        value = Decimal(str(tx.get("value", "0")))
+        if tx.get("to") and tx["to"].lower() == my_address and value > 0:
             tx_hash = tx["hash"]
-            amount = Decimal(tx["value"]) / Decimal(10**18)
+            amount = value / Decimal(10**18)
             internal_map[tx_hash] = internal_map.get(tx_hash, Decimal(0)) + amount
     return internal_map
 
@@ -132,8 +214,13 @@ async def retrieve_transactions(
     if chain not in config_data:
         raise ValueError(f"Chain '{chain}' not found.")
 
-    cfg = config_data[chain]
+    cfg: dict[str, str] = config_data[chain]
     my_address = cfg["my_address"].lower()
+    api_url = cfg.get("api_url")
+    api_key = cfg.get("api_key")
+    chain_id = cfg.get("chain_id")
+    if not api_url:
+        raise ValueError(f"Chain '{chain}' missing 'api_url' in config.")
 
     # Setup Paths & Connection
     token_path = TOKENS_FOLDER / f"{chain}_tokens.json"
@@ -148,33 +235,21 @@ async def retrieve_transactions(
 
     # Determine dates if not provided
     if end_date is None:
-        end_date = datetime.now().strftime("%d/%m/%Y")
+        end_date = datetime.now(tz=timezone.utc).strftime("%d/%m/%Y")
 
     if start_date is None:
-        start_date = "01/01/2000"
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            try:
-                df_dates = pd.read_csv(output_path, usecols=["Date"])
-                if not df_dates.empty:
-                    start_date = (
-                        pd.to_datetime(df_dates["Date"], format="%d/%m/%Y %H:%M:%S")
-                        .min()
-                        .strftime("%d/%m/%Y")
-                    )
-            except Exception:
-                pass
+        start_date = _derive_start_date(output_path=output_path, overlap_days=1)
 
     # 2. Parse Dates
-    start_ts = int(datetime.strptime(start_date, "%d/%m/%Y").timestamp())
-    end_dt = datetime.strptime(end_date, "%d/%m/%Y")
-    end_ts = int(end_dt.replace(hour=23, minute=59, second=59).timestamp())
+    start_ts = int(_parse_input_date_to_utc(start_date, end_of_day=False).timestamp())
+    end_ts = int(_parse_input_date_to_utc(end_date, end_of_day=True).timestamp())
 
     # 3. Fetch Hashes
     print("Fetching transaction lists...")
     std_hashes, all_hashes, raw_internal_txs = get_all_transaction_hashes(
-        api_url=cfg.get("api_url"),
-        api_key=cfg.get("api_key"),
-        chain_id=cfg.get("chain_id"),
+        api_url=api_url,
+        api_key=api_key,
+        chain_id=chain_id,
         address=my_address,
         start_ts=start_ts,
         end_ts=end_ts,
@@ -231,25 +306,31 @@ async def retrieve_transactions(
         results.extend([r for r in batch_results if r])
 
     # 7. Export
-    if results:
-        new_results_df = pd.DataFrame(results)
+    try:
+        if results:
+            new_results_df = _normalize_results_frame(pd.DataFrame(results))
 
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            existing_results_df = pd.read_csv(output_path, dtype=str)
-            results_df = pd.concat([existing_results_df, new_results_df]).drop_duplicates(
-                subset=["TX Hash"], keep="first"
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                existing_results_df = _normalize_results_frame(pd.read_csv(output_path, dtype=str))
+                results_df = pd.concat([existing_results_df, new_results_df]).drop_duplicates(
+                    subset=["TX Hash"], keep="last"
+                )
+            else:
+                results_df = new_results_df
+
+            results_df["_sort_helper"] = pd.to_datetime(
+                results_df["Date"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
             )
+            results_df = results_df.sort_values(by="_sort_helper", ascending=True).drop(
+                columns=["_sort_helper"]
+            )
+            results_df = _normalize_results_frame(results_df)
+            results_df.to_csv(output_path, index=False)
+            print(f"Done. Saved {len(results_df)} rows to {output_path}")
         else:
-            results_df = new_results_df
-
-        results_df["_sort_helper"] = pd.to_datetime(results_df["Date"], format="%d/%m/%Y %H:%M:%S")
-        results_df = results_df.sort_values(by="_sort_helper", ascending=True).drop(
-            columns=["_sort_helper"]
-        )
-        results_df.to_csv(output_path, index=False)
-        print(f"Done. Saved {len(results_df)} rows to {output_path}")
-    else:
-        print("No results generated.")
+            print("No results generated.")
+    finally:
+        token_manager.flush()
 
 
 if __name__ == "__main__":
