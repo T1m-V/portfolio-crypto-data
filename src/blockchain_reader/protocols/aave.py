@@ -13,6 +13,8 @@ from blockchain_reader.protocols.common import (
     load_chain_config,
     load_chain_web3,
     load_tokens,
+    resolve_effective_start_date,
+    should_skip_date_window,
     write_protocol_history_csv,
 )
 from blockchain_reader.symbols import (
@@ -410,9 +412,23 @@ def get_aave_daily_exposure(
         )
 
 
-def process_all_aave_tokens(chain: str) -> None:
-    start_date, end_date = _derive_aave_bounds_from_transactions(chain=chain)
-    get_aave_daily_exposure(chain=chain, start_date=start_date, end_date=end_date)
+def process_all_aave_tokens(chain: str, start_date: str | None = None) -> None:
+    fallback_start_date, end_date = _derive_aave_bounds_from_transactions(chain=chain)
+    resolved_start_date = resolve_effective_start_date(
+        protocol="aave",
+        chain=chain,
+        symbol="aave_daily_exposure",
+        explicit_start_date=start_date,
+        fallback_start_date=fallback_start_date,
+    )
+    if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
+        print(
+            "[aave] Skipping aave_daily_exposure: "
+            f"start={resolved_start_date} is after end={end_date}"
+        )
+        return
+
+    get_aave_daily_exposure(chain=chain, start_date=resolved_start_date, end_date=end_date)
 
 
 if __name__ == "__main__":

@@ -1,18 +1,17 @@
-import csv
-import json
-import os
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from decimal import Decimal
 
-import pandas as pd
 from web3 import Web3
 
-from file_paths import (
-    BLOCKCHAIN_BLOCK_MAP_FOLDER,
-    BLOCKCHAIN_SNAPSHOT_FOLDER,
-    CHAIN_INFO_PATH,
-    PROTOCOL_UNDERLYING_TOKEN_FOLDER,
-    TOKENS_FOLDER,
+from blockchain_reader.protocols.common import (
+    load_block_map,
+    load_chain_web3,
+    load_snapshot_ranges,
+    load_tokens,
+    resolve_date_window,
+    resolve_effective_start_date,
+    should_skip_date_window,
+    write_protocol_history_csv,
 )
 
 # ==========================================
@@ -115,34 +114,9 @@ def get_beefy_history(
     start_date: str,
     end_date: str,
 ) -> None:
-    if not os.path.exists(CHAIN_INFO_PATH):
-        print(f"Config '{CHAIN_INFO_PATH}' not found.")
-        return
-
-    with open(file=CHAIN_INFO_PATH, mode="r") as f:
-        config_data = json.load(fp=f)
-
-    if chain not in config_data:
-        print(f"Chain '{chain}' not found in config.")
-        return
-
-    cfg: dict[str, str] = config_data[chain]
-    rpc_url = cfg.get("alchemy_url") or cfg.get("rpc_url")
-    if not rpc_url:
-        print(f"Chain '{chain}' is missing both 'alchemy_url' and 'rpc_url'.")
-        return
-
-    w3 = Web3(provider=Web3.HTTPProvider(endpoint_uri=rpc_url))
-    if not w3.is_connected():
-        print("Connection Failed")
-        return
-
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    end_dt = (
-        datetime.now(tz=timezone.utc)
-        if end_date.lower() == "now"
-        else datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    )
+    w3 = load_chain_web3(chain=chain)
+    start_dt, end_dt = resolve_date_window(start_date=start_date, end_date=end_date)
+    block_map = load_block_map(chain=chain)
 
     history_data = []
     vault = w3.to_checksum_address(vault_address)
@@ -154,14 +128,6 @@ def get_beefy_history(
     except Exception:
         vault_decimals = 18
         vault_symbol = "MOO"
-
-    map_file_path = BLOCKCHAIN_BLOCK_MAP_FOLDER / f"block_map_{chain}.csv"
-    block_map = {}
-    if os.path.exists(path=map_file_path):
-        with open(file=map_file_path, mode="r") as f:
-            reader = csv.DictReader(f=f)
-            for row in reader:
-                block_map[row["date"]] = int(row["block"])
 
     current_dt = start_dt
     while current_dt <= end_dt:
@@ -197,55 +163,51 @@ def get_beefy_history(
 
         current_dt += timedelta(days=1)
 
-    if history_data:
-        output_file = PROTOCOL_UNDERLYING_TOKEN_FOLDER / "beefy" / f"{chain}_{vault_symbol}.csv"
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
-        keys = set().union(*(d.keys() for d in history_data))
-        with open(file=output_file, mode="w", newline="") as f:
-            writer = csv.DictWriter(f=f, fieldnames=sorted(list(keys)))
-            writer.writeheader()
-            writer.writerows(history_data)
-        print(f"Saved to {output_file}")
+    output = write_protocol_history_csv(
+        protocol="beefy",
+        chain=chain,
+        symbol=vault_symbol,
+        history_data=history_data,
+    )
+    if output:
+        print(f"[beefy] Saved to {output}")
 
 
-def process_all_beefy_tokens(chain: str) -> None:
-    tokens_file_path = TOKENS_FOLDER / f"{chain}_tokens.json"
-    if not os.path.exists(tokens_file_path):
-        print(f"Config '{tokens_file_path}' not found.")
-        return
-
-    with open(file=tokens_file_path, mode="r") as f:
-        tokens = json.load(fp=f)
-
-    snapshots_file_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_snapshots.csv"
-    if not os.path.exists(snapshots_file_path):
-        print(f"Snapshots '{snapshots_file_path}' not found.")
-        return
-
-    df = pd.read_csv(snapshots_file_path)
-    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
-    df = df.sort_values("Date")
-
-    token_ranges = {}
-    for coin, group in df.groupby("Coin"):
-        token_ranges[coin] = {
-            "start": group["Date"].min(),
-            "end": group["Date"].max(),
-            "qty": group["Quantity"].iloc[-1],
-        }
-
+def process_all_beefy_tokens(chain: str, start_date: str | None = None) -> None:
+    tokens = load_tokens(chain=chain)
+    token_ranges = load_snapshot_ranges(chain=chain)
     for address, info in tokens.items():
-        if info.get("protocol") == "beefy":
-            symbol = info.get("symbol", address)
-            if symbol in token_ranges:
-                rng = token_ranges[symbol]
-                start_date = rng["start"].strftime("%Y-%m-%d")
-                end_date = "now" if rng["qty"] > 0 else rng["end"].strftime("%Y-%m-%d")
-                print(f"Processing Beefy Token: {symbol} ({start_date} -> {end_date})")
-                get_beefy_history(
-                    chain=chain, vault_address=address, start_date=start_date, end_date=end_date
-                )
+        if info.get("protocol") != "beefy":
+            continue
+
+        symbol = info.get("symbol", address)
+        if symbol not in token_ranges:
+            continue
+
+        rng = token_ranges[symbol]
+        fallback_start_date = rng["start"].strftime("%Y-%m-%d")
+        resolved_start_date = resolve_effective_start_date(
+            protocol="beefy",
+            chain=chain,
+            symbol=symbol,
+            explicit_start_date=start_date,
+            fallback_start_date=fallback_start_date,
+        )
+        end_date = "now" if rng["qty"] > 0 else rng["end"].strftime("%Y-%m-%d")
+        if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
+            print(f"[beefy] Skipping {symbol}: start={resolved_start_date} is after end={end_date}")
+            continue
+
+        if resolved_start_date is None:
+            continue
+
+        print(f"[beefy] Processing {symbol} ({resolved_start_date} -> {end_date})")
+        get_beefy_history(
+            chain=chain,
+            vault_address=address,
+            start_date=resolved_start_date,
+            end_date=end_date,
+        )
 
 
 if __name__ == "__main__":

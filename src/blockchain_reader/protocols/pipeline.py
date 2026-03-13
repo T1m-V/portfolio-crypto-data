@@ -6,19 +6,23 @@ from blockchain_reader.protocols.composer import compose_base_ingredients
 from blockchain_reader.protocols.curve import process_all_curve_tokens
 
 
-def run_protocol_pipeline(chain: str, protocols: list[str] | None = None) -> None:
+def run_protocol_pipeline(
+    chain: str,
+    protocols: list[str] | None = None,
+    start_date: str | None = None,
+) -> None:
     selected = set(protocols or ["beefy", "balancer", "aave", "aura", "curve"])
 
     if "beefy" in selected:
-        process_all_beefy_tokens(chain=chain)
+        process_all_beefy_tokens(chain=chain, start_date=start_date)
     if "balancer" in selected:
-        process_all_balancer_tokens(chain=chain)
+        process_all_balancer_tokens(chain=chain, start_date=start_date)
     if "aura" in selected:
-        process_all_aura_tokens(chain=chain)
+        process_all_aura_tokens(chain=chain, start_date=start_date)
     if "curve" in selected:
-        process_all_curve_tokens(chain=chain)
+        process_all_curve_tokens(chain=chain, start_date=start_date)
     if "aave" in selected:
-        process_all_aave_tokens(chain=chain)
+        process_all_aave_tokens(chain=chain, start_date=start_date)
 
     compose_base_ingredients(chain=chain)
 

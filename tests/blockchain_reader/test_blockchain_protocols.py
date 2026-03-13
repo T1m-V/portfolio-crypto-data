@@ -1,10 +1,14 @@
+import csv
 import unittest
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
-from blockchain_reader.protocols import aave, curve
+import pandas as pd
+
+from blockchain_reader.protocols import aave, common, curve
 
 
 class DummyProgress:
@@ -307,6 +311,215 @@ class BlockchainProtocolTests(unittest.TestCase):
         read_pool_mock.assert_called_once_with(w3=w3, pool_address=pool_address, block_number=123)
         self.assertEqual(result["USDC"], Decimal("0.001"))
         self.assertEqual(result["WETH"], Decimal("2"))
+
+    def test_resolve_effective_start_date_prefers_existing_output_plus_one(self) -> None:
+        with patch(
+            "blockchain_reader.protocols.common.get_output_max_processed_date",
+            return_value=date(2026, 1, 5),
+        ):
+            result = common.resolve_effective_start_date(
+                protocol="curve",
+                chain="arbitrum",
+                symbol="LP",
+                explicit_start_date=None,
+                fallback_start_date="2026-01-01",
+            )
+        self.assertEqual(result, "2026-01-06")
+
+    def test_resolve_effective_start_date_respects_explicit_start(self) -> None:
+        with patch(
+            "blockchain_reader.protocols.common.get_output_max_processed_date",
+            return_value=date(2026, 1, 5),
+        ):
+            result = common.resolve_effective_start_date(
+                protocol="curve",
+                chain="arbitrum",
+                symbol="LP",
+                explicit_start_date="2025-09-01",
+                fallback_start_date="2026-01-01",
+            )
+        self.assertEqual(result, "2025-09-01")
+
+    def test_resolve_effective_start_date_uses_fallback_without_existing_output(self) -> None:
+        with patch(
+            "blockchain_reader.protocols.common.get_output_max_processed_date",
+            return_value=None,
+        ):
+            result = common.resolve_effective_start_date(
+                protocol="curve",
+                chain="arbitrum",
+                symbol="LP",
+                explicit_start_date=None,
+                fallback_start_date="2026-01-01",
+            )
+        self.assertEqual(result, "2026-01-01")
+
+    def test_resolve_effective_start_date_clamps_to_fallback_floor(self) -> None:
+        with patch(
+            "blockchain_reader.protocols.common.get_output_max_processed_date",
+            return_value=date(2026, 1, 1),
+        ):
+            result = common.resolve_effective_start_date(
+                protocol="curve",
+                chain="arbitrum",
+                symbol="LP",
+                explicit_start_date=None,
+                fallback_start_date="2026-01-10",
+            )
+        self.assertEqual(result, "2026-01-10")
+
+    def test_write_protocol_history_csv_merges_rows_and_keeps_existing_overlap(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            protocol_dir = root / "curve"
+            protocol_dir.mkdir(parents=True, exist_ok=True)
+            output_path = protocol_dir / "arbitrum_LP.csv"
+
+            with open(output_path, mode="w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f=f,
+                    fieldnames=["date", "block", "asset_A", "legacy_col"],
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "date": "2026-01-01",
+                        "block": 10,
+                        "asset_A": 1.1,
+                        "legacy_col": "keep",
+                    }
+                )
+                writer.writerow(
+                    {
+                        "date": "2026-01-02",
+                        "block": 20,
+                        "asset_A": 2.2,
+                        "legacy_col": "keep2",
+                    }
+                )
+
+            with patch("blockchain_reader.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER", root):
+                output = common.write_protocol_history_csv(
+                    protocol="curve",
+                    chain="arbitrum",
+                    symbol="LP",
+                    history_data=[
+                        {"date": "2026-01-02", "block": 999, "asset_A": 9.9, "asset_B": 99},
+                        {"date": "2026-01-03", "block": 30, "asset_A": 3.3, "asset_B": 33},
+                    ],
+                    fieldnames=["date", "block", "asset_A"],
+                )
+
+            self.assertEqual(output, output_path)
+            with open(output_path, mode="r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f=f)
+                rows = list(reader)
+                self.assertEqual(
+                    reader.fieldnames,
+                    ["date", "block", "asset_A", "asset_B", "legacy_col"],
+                )
+
+            self.assertEqual(
+                [row["date"] for row in rows],
+                ["2026-01-01", "2026-01-02", "2026-01-03"],
+            )
+            self.assertEqual(rows[1]["block"], "20")
+            self.assertEqual(rows[1]["legacy_col"], "keep2")
+            self.assertEqual(rows[2]["block"], "30")
+            self.assertEqual(rows[2]["asset_B"], "33")
+
+    def test_process_all_curve_tokens_passes_resolved_incremental_start(self) -> None:
+        with (
+            patch(
+                "blockchain_reader.protocols.curve.load_tokens",
+                return_value={"0xpool": {"protocol": "curve", "symbol": "CurveLP"}},
+            ),
+            patch(
+                "blockchain_reader.protocols.curve.load_snapshot_ranges",
+                return_value={
+                    "CurveLP": {
+                        "start": pd.Timestamp("2024-01-01"),
+                        "end": pd.Timestamp("2024-01-10"),
+                        "qty": 1,
+                    }
+                },
+            ),
+            patch(
+                "blockchain_reader.protocols.curve.resolve_effective_start_date",
+                return_value="2024-01-05",
+            ),
+            patch("blockchain_reader.protocols.curve.get_curve_history") as history_mock,
+        ):
+            curve.process_all_curve_tokens(chain="arbitrum")
+
+        history_mock.assert_called_once_with(
+            chain="arbitrum",
+            token_address="0xpool",
+            start_date="2024-01-05",
+            end_date="now",
+        )
+
+    def test_process_all_curve_tokens_skips_when_resolved_start_after_end(self) -> None:
+        with (
+            patch(
+                "blockchain_reader.protocols.curve.load_tokens",
+                return_value={"0xpool": {"protocol": "curve", "symbol": "CurveLP"}},
+            ),
+            patch(
+                "blockchain_reader.protocols.curve.load_snapshot_ranges",
+                return_value={
+                    "CurveLP": {
+                        "start": pd.Timestamp("2024-01-01"),
+                        "end": pd.Timestamp("2024-01-10"),
+                        "qty": 0,
+                    }
+                },
+            ),
+            patch(
+                "blockchain_reader.protocols.curve.resolve_effective_start_date",
+                return_value="2024-01-20",
+            ),
+            patch("blockchain_reader.protocols.curve.get_curve_history") as history_mock,
+        ):
+            curve.process_all_curve_tokens(chain="arbitrum")
+
+        history_mock.assert_not_called()
+
+    def test_process_all_aave_tokens_uses_resolved_incremental_start(self) -> None:
+        with (
+            patch(
+                "blockchain_reader.protocols.aave._derive_aave_bounds_from_transactions",
+                return_value=("2024-01-01", "2024-01-10"),
+            ),
+            patch(
+                "blockchain_reader.protocols.aave.resolve_effective_start_date",
+                return_value="2024-01-06",
+            ),
+            patch("blockchain_reader.protocols.aave.get_aave_daily_exposure") as exposure_mock,
+        ):
+            aave.process_all_aave_tokens(chain="arbitrum")
+
+        exposure_mock.assert_called_once_with(
+            chain="arbitrum",
+            start_date="2024-01-06",
+            end_date="2024-01-10",
+        )
+
+    def test_process_all_aave_tokens_skips_when_resolved_start_after_end(self) -> None:
+        with (
+            patch(
+                "blockchain_reader.protocols.aave._derive_aave_bounds_from_transactions",
+                return_value=("2024-01-01", "2024-01-10"),
+            ),
+            patch(
+                "blockchain_reader.protocols.aave.resolve_effective_start_date",
+                return_value="2024-01-20",
+            ),
+            patch("blockchain_reader.protocols.aave.get_aave_daily_exposure") as exposure_mock,
+        ):
+            aave.process_all_aave_tokens(chain="arbitrum")
+
+        exposure_mock.assert_not_called()
 
 
 if __name__ == "__main__":

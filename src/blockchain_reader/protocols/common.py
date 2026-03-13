@@ -1,7 +1,7 @@
 import csv
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -93,6 +93,109 @@ def load_block_map(chain: str) -> dict[str, int]:
     return block_map
 
 
+def protocol_history_output_path(protocol: str, chain: str, symbol: str) -> Path:
+    return PROTOCOL_UNDERLYING_TOKEN_FOLDER / protocol / f"{chain}_{symbol}.csv"
+
+
+def _parse_history_date(raw_value: object) -> date | None:
+    if isinstance(raw_value, datetime):
+        return raw_value.date()
+    if isinstance(raw_value, date):
+        return raw_value
+
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+
+    value = value.split(" ")[0]
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _normalize_history_date(raw_value: object) -> str | None:
+    parsed = _parse_history_date(raw_value=raw_value)
+    if parsed is None:
+        return None
+    return parsed.strftime("%Y-%m-%d")
+
+
+def get_output_max_processed_date(protocol: str, chain: str, symbol: str) -> date | None:
+    output_file = protocol_history_output_path(protocol=protocol, chain=chain, symbol=symbol)
+    if not output_file.exists():
+        return None
+
+    with open(file=output_file, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f=f)
+        if not reader.fieldnames or "date" not in reader.fieldnames:
+            return None
+
+        max_date: date | None = None
+        for row in reader:
+            parsed = _parse_history_date(raw_value=row.get("date"))
+            if parsed is None:
+                continue
+            if max_date is None or parsed > max_date:
+                max_date = parsed
+        return max_date
+
+
+def resolve_effective_start_date(
+    *,
+    protocol: str,
+    chain: str,
+    symbol: str,
+    explicit_start_date: str | None,
+    fallback_start_date: str | None,
+) -> str | None:
+    if explicit_start_date:
+        return explicit_start_date
+
+    max_processed_date = get_output_max_processed_date(
+        protocol=protocol,
+        chain=chain,
+        symbol=symbol,
+    )
+    inferred_start_date: str | None = None
+    if max_processed_date is not None:
+        inferred_start_date = (max_processed_date + timedelta(days=1)).strftime("%Y-%m-%d")
+
+    if inferred_start_date and fallback_start_date:
+        return max(inferred_start_date, fallback_start_date)
+    return inferred_start_date or fallback_start_date
+
+
+def should_skip_date_window(start_date: str | None, end_date: str | None) -> bool:
+    if not start_date or not end_date:
+        return False
+    if str(end_date).lower() == "now":
+        return False
+
+    start = _parse_history_date(raw_value=start_date)
+    end = _parse_history_date(raw_value=end_date)
+    if start is None or end is None:
+        return False
+    return start > end
+
+
+def _normalize_history_row(row: dict[str, object]) -> tuple[str | None, dict[str, object]]:
+    normalized = dict(row)
+    date_key = _normalize_history_date(raw_value=normalized.get("date"))
+    if date_key is not None:
+        normalized["date"] = date_key
+    return date_key, normalized
+
+
+def _read_existing_history_rows(output_file: Path) -> list[dict[str, object]]:
+    if not output_file.exists():
+        return []
+
+    with open(file=output_file, mode="r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f=f)
+        return [dict(row) for row in reader]
+
+
 def write_protocol_history_csv(
     protocol: str,
     chain: str,
@@ -103,9 +206,35 @@ def write_protocol_history_csv(
     if not history_data:
         return None
 
-    output_file = PROTOCOL_UNDERLYING_TOKEN_FOLDER / protocol / f"{chain}_{symbol}.csv"
-    os.makedirs(Path(output_file).parent, exist_ok=True)
-    keys = set().union(*(d.keys() for d in history_data))
+    output_file = protocol_history_output_path(protocol=protocol, chain=chain, symbol=symbol)
+    os.makedirs(output_file.parent, exist_ok=True)
+
+    existing_rows = _read_existing_history_rows(output_file=output_file)
+    existing_by_date: dict[str, dict[str, object]] = {}
+    for row in existing_rows:
+        date_key, normalized_row = _normalize_history_row(row=row)
+        if date_key is None:
+            continue
+        # Existing rows win when incoming data overlaps on the same date.
+        existing_by_date.setdefault(date_key, normalized_row)
+
+    incoming_by_date: dict[str, dict[str, object]] = {}
+    for row in history_data:
+        date_key, normalized_row = _normalize_history_row(row=row)
+        if date_key is None:
+            continue
+        incoming_by_date[date_key] = normalized_row
+
+    merged_by_date = dict(existing_by_date)
+    for date_key, row in incoming_by_date.items():
+        if date_key not in merged_by_date:
+            merged_by_date[date_key] = row
+
+    if not merged_by_date:
+        return None
+
+    merged_rows = [merged_by_date[date_key] for date_key in sorted(merged_by_date)]
+    keys = set().union(*(d.keys() for d in merged_rows))
     ordered_fieldnames = sorted(list(keys))
     if fieldnames:
         preferred = [name for name in fieldnames if name in keys]
@@ -115,5 +244,5 @@ def write_protocol_history_csv(
     with open(file=output_file, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f=f, fieldnames=ordered_fieldnames)
         writer.writeheader()
-        writer.writerows(history_data)
+        writer.writerows(merged_rows)
     return output_file

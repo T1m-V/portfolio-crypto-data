@@ -10,6 +10,8 @@ from blockchain_reader.protocols.common import (
     load_snapshot_ranges,
     load_tokens,
     resolve_date_window,
+    resolve_effective_start_date,
+    should_skip_date_window,
     write_protocol_history_csv,
 )
 
@@ -206,7 +208,7 @@ def get_aura_history(chain: str, token_address: str, start_date: str, end_date: 
         print(f"[aura] Saved to {output}")
 
 
-def process_all_aura_tokens(chain: str) -> None:
+def process_all_aura_tokens(chain: str, start_date: str | None = None) -> None:
     tokens = load_tokens(chain=chain)
     token_ranges = load_snapshot_ranges(chain=chain)
 
@@ -218,13 +220,27 @@ def process_all_aura_tokens(chain: str) -> None:
             continue
 
         rng = token_ranges[symbol]
-        start_date = rng["start"].strftime("%Y-%m-%d")
+        fallback_start_date = rng["start"].strftime("%Y-%m-%d")
+        resolved_start_date = resolve_effective_start_date(
+            protocol="aura",
+            chain=chain,
+            symbol=symbol,
+            explicit_start_date=start_date,
+            fallback_start_date=fallback_start_date,
+        )
         end_date = "now" if rng["qty"] > 0 else rng["end"].strftime("%Y-%m-%d")
-        print(f"[aura] Processing {symbol} ({start_date} -> {end_date})")
+        if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
+            print(f"[aura] Skipping {symbol}: start={resolved_start_date} is after end={end_date}")
+            continue
+
+        if resolved_start_date is None:
+            continue
+
+        print(f"[aura] Processing {symbol} ({resolved_start_date} -> {end_date})")
         get_aura_history(
             chain=chain,
             token_address=address,
-            start_date=start_date,
+            start_date=resolved_start_date,
             end_date=end_date,
         )
 
