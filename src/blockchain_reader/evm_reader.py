@@ -95,13 +95,31 @@ def _derive_start_date(output_path: str, overlap_days: int = 1) -> str:
         df_dates = pd.read_csv(output_path, usecols=["Date"])
         if df_dates.empty:
             return DEFAULT_START_DATE
-        latest = pd.to_datetime(df_dates["Date"], format="%d/%m/%Y %H:%M:%S").max()
+        latest = _parse_transaction_datetime_series(df_dates["Date"]).max()
+        if pd.isna(latest):
+            return DEFAULT_START_DATE
         start_dt = (latest - timedelta(days=overlap_days)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
         return start_dt.strftime("%d/%m/%Y")
     except (ValueError, KeyError, pd.errors.ParserError):
         return DEFAULT_START_DATE
+
+
+def _parse_transaction_datetime_series(series: pd.Series) -> pd.Series:
+    parsed = pd.to_datetime(series, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    missing = parsed.isna()
+
+    if missing.any():
+        parsed_alt = pd.to_datetime(series[missing], format="%d/%m/%Y %H:%M", errors="coerce")
+        parsed.loc[missing] = parsed_alt
+
+    missing = parsed.isna()
+    if missing.any():
+        parsed_fallback = pd.to_datetime(series[missing], dayfirst=True, errors="coerce")
+        parsed.loc[missing] = parsed_fallback
+
+    return parsed
 
 
 def _normalize_results_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -318,9 +336,7 @@ async def retrieve_transactions(
             else:
                 results_df = new_results_df
 
-            results_df["_sort_helper"] = pd.to_datetime(
-                results_df["Date"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
-            )
+            results_df["_sort_helper"] = _parse_transaction_datetime_series(results_df["Date"])
             results_df = results_df.sort_values(by="_sort_helper", ascending=True).drop(
                 columns=["_sort_helper"]
             )

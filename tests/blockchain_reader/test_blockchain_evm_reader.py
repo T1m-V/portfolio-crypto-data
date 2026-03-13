@@ -10,6 +10,7 @@ from blockchain_reader.evm_reader import (
     _derive_start_date,
     _fetch_explorer_data,
     _normalize_results_frame,
+    _parse_transaction_datetime_series,
 )
 
 
@@ -29,6 +30,23 @@ class BlockchainEvmReaderTests(unittest.TestCase):
 
             derived = _derive_start_date(output_path=csv_path, overlap_days=1)
             self.assertEqual(derived, "04/01/2026")
+
+    def test_derive_start_date_handles_minute_precision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            csv_path = Path(tmp_dir) / "tx.csv"
+            pd.DataFrame({"Date": ["01/01/2026 08:00", "05/01/2026 11:30"]}).to_csv(
+                csv_path, index=False
+            )
+
+            derived = _derive_start_date(output_path=csv_path, overlap_days=1)
+            self.assertEqual(derived, "04/01/2026")
+
+    def test_parse_transaction_datetime_series_mixed_formats(self) -> None:
+        series = pd.Series(["05/01/2026 11:30:00", "03/01/2026 09:45", "invalid"])
+        parsed = _parse_transaction_datetime_series(series)
+
+        self.assertEqual(parsed.notna().sum(), 2)
+        self.assertEqual(parsed.max(), pd.Timestamp("2026-01-05 11:30:00"))
 
     def test_normalize_results_frame_enforces_columns(self) -> None:
         raw = pd.DataFrame([{"TX Hash": "0x1", "Date": "01/01/2026 10:00:00", "Fee": 1.2}])
