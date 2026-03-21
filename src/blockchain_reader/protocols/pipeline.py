@@ -4,6 +4,7 @@ from blockchain_reader.protocols.balancer import process_all_balancer_tokens
 from blockchain_reader.protocols.beefy import process_all_beefy_tokens
 from blockchain_reader.protocols.composer import compose_base_ingredients
 from blockchain_reader.protocols.curve import process_all_curve_tokens
+from blockchain_reader.protocols.lp_pricing import generate_protocol_lp_price_files
 
 
 def run_protocol_pipeline(
@@ -25,6 +26,7 @@ def run_protocol_pipeline(
         process_all_aave_tokens(chain=chain, start_date=start_date)
 
     compose_base_ingredients(chain=chain)
+    generate_protocol_lp_price_files(chain=chain)
 
 
 if __name__ == "__main__":

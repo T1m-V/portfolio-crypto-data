@@ -1,4 +1,5 @@
 import csv
+import json
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -7,7 +8,7 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from blockchain_reader.protocols import aave, common, curve
+from blockchain_reader.protocols import aave, common, curve, lp_pricing
 
 
 class DummyProgress:
@@ -508,3 +509,171 @@ class TestBlockchainProtocols:
             aave.process_all_aave_tokens(chain="arbitrum")
 
         exposure_mock.assert_not_called()
+
+    def test_generate_protocol_lp_price_files_merges_and_keeps_canonical_schema(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            protocol_root = root / "protocol_underlying_tokens"
+            prices_root = root / "prices"
+            tokens_root = root / "tokens"
+            (protocol_root / "balancer").mkdir(parents=True, exist_ok=True)
+            prices_root.mkdir(parents=True, exist_ok=True)
+            tokens_root.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {"date": "2024-01-02", "asset_ETH": 1.2, "asset_BTC": 0.5},
+                    {"date": "03/01/2024", "asset_ETH": 1.0, "asset_BTC": 0.25},
+                ]
+            ).to_csv(protocol_root / "balancer" / "arbitrum_LP.csv", index=False)
+
+            pd.DataFrame(
+                [
+                    {"Date": "2024-01-03", "Price": 2000},
+                    {"Date": "2024-01-02", "Price": 1900},
+                ]
+            ).to_csv(prices_root / "ETH.csv", index=False)
+            pd.DataFrame(
+                [
+                    {"Date": "2024-01-03", "Price": 40000},
+                    {"Date": "2024-01-02", "Price": 39000},
+                ]
+            ).to_csv(prices_root / "BTC.csv", index=False)
+            pd.DataFrame([{"Date": "2024-01-04", "Price": 100}]).to_csv(
+                prices_root / "LP.csv",
+                index=False,
+            )
+
+            with open(tokens_root / "arbitrum_tokens.json", "w") as f:
+                json.dump({}, f)
+
+            with (
+                patch(
+                    "blockchain_reader.protocols.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    protocol_root,
+                ),
+                patch("blockchain_reader.protocols.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("blockchain_reader.protocols.lp_pricing.TOKENS_FOLDER", tokens_root),
+            ):
+                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+
+            assert updated == [prices_root / "LP.csv"]
+            result = pd.read_csv(prices_root / "LP.csv")
+            assert list(result.columns) == ["Date", "Price"]
+            assert list(result["Date"]) == ["2024-01-04", "2024-01-03", "2024-01-02"]
+            assert result.loc[result["Date"] == "2024-01-03", "Price"].iloc[0] == 12000.0
+            assert result.loc[result["Date"] == "2024-01-02", "Price"].iloc[0] == 21780.0
+            assert result.loc[result["Date"] == "2024-01-04", "Price"].iloc[0] == 100.0
+
+    def test_generate_protocol_lp_price_files_handles_nested_beefy_lp(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            protocol_root = root / "protocol_underlying_tokens"
+            prices_root = root / "prices"
+            tokens_root = root / "tokens"
+            (protocol_root / "balancer").mkdir(parents=True, exist_ok=True)
+            (protocol_root / "beefy").mkdir(parents=True, exist_ok=True)
+            prices_root.mkdir(parents=True, exist_ok=True)
+            tokens_root.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame([{"date": "2024-01-02", "asset_ETH": 2.0}]).to_csv(
+                protocol_root / "balancer" / "arbitrum_LP.csv",
+                index=False,
+            )
+            pd.DataFrame([{"date": "2024-01-02", "asset_LP": 1.5}]).to_csv(
+                protocol_root / "beefy" / "arbitrum_MOO.csv",
+                index=False,
+            )
+            pd.DataFrame([{"Date": "2024-01-02", "Price": 2000}]).to_csv(
+                prices_root / "ETH.csv",
+                index=False,
+            )
+
+            with open(tokens_root / "arbitrum_tokens.json", "w") as f:
+                json.dump({}, f)
+
+            with (
+                patch(
+                    "blockchain_reader.protocols.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    protocol_root,
+                ),
+                patch("blockchain_reader.protocols.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("blockchain_reader.protocols.lp_pricing.TOKENS_FOLDER", tokens_root),
+            ):
+                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+
+            assert set(updated) == {prices_root / "LP.csv", prices_root / "MOO.csv"}
+            lp_frame = pd.read_csv(prices_root / "LP.csv")
+            moo_frame = pd.read_csv(prices_root / "MOO.csv")
+            assert lp_frame.loc[0, "Price"] == 4000.0
+            assert moo_frame.loc[0, "Price"] == 6000.0
+
+    def test_generate_protocol_lp_price_files_skips_rows_with_unresolved_assets(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            protocol_root = root / "protocol_underlying_tokens"
+            prices_root = root / "prices"
+            tokens_root = root / "tokens"
+            (protocol_root / "curve").mkdir(parents=True, exist_ok=True)
+            prices_root.mkdir(parents=True, exist_ok=True)
+            tokens_root.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame([{"date": "2024-01-02", "asset_UNKNOWN": 1.0}]).to_csv(
+                protocol_root / "curve" / "arbitrum_BAD.csv",
+                index=False,
+            )
+            with open(tokens_root / "arbitrum_tokens.json", "w") as f:
+                json.dump({}, f)
+
+            with (
+                patch(
+                    "blockchain_reader.protocols.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    protocol_root,
+                ),
+                patch("blockchain_reader.protocols.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("blockchain_reader.protocols.lp_pricing.TOKENS_FOLDER", tokens_root),
+            ):
+                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+
+            assert updated == []
+            assert not (prices_root / "BAD.csv").exists()
+
+    def test_generate_protocol_lp_price_files_excludes_aave_inputs(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            protocol_root = root / "protocol_underlying_tokens"
+            prices_root = root / "prices"
+            tokens_root = root / "tokens"
+            (protocol_root / "aave").mkdir(parents=True, exist_ok=True)
+            (protocol_root / "balancer").mkdir(parents=True, exist_ok=True)
+            prices_root.mkdir(parents=True, exist_ok=True)
+            tokens_root.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame([{"date": "2024-01-02", "asset_ETH": 9.0}]).to_csv(
+                protocol_root / "aave" / "arbitrum_AAVEWRAP.csv",
+                index=False,
+            )
+            pd.DataFrame([{"date": "2024-01-02", "asset_ETH": 1.0}]).to_csv(
+                protocol_root / "balancer" / "arbitrum_LP.csv",
+                index=False,
+            )
+            pd.DataFrame([{"Date": "2024-01-02", "Price": 2000}]).to_csv(
+                prices_root / "ETH.csv",
+                index=False,
+            )
+            with open(tokens_root / "arbitrum_tokens.json", "w") as f:
+                json.dump({}, f)
+
+            with (
+                patch(
+                    "blockchain_reader.protocols.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    protocol_root,
+                ),
+                patch("blockchain_reader.protocols.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("blockchain_reader.protocols.lp_pricing.TOKENS_FOLDER", tokens_root),
+            ):
+                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+
+            assert updated == [prices_root / "LP.csv"]
+            assert (prices_root / "LP.csv").exists()
+            assert not (prices_root / "AAVEWRAP.csv").exists()
