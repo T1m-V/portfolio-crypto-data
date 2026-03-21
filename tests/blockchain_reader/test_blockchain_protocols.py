@@ -1,5 +1,4 @@
 import csv
-import unittest
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -141,7 +140,7 @@ class FakeCurveWeb3:
         self.eth = FakeCurveEth(contracts=contracts)
 
 
-class BlockchainProtocolTests(unittest.TestCase):
+class TestBlockchainProtocols:
     def _run_aave_daily_exposure(
         self,
         block_map: dict[str, int],
@@ -190,9 +189,9 @@ class BlockchainProtocolTests(unittest.TestCase):
         minute_value = aave._parse_date_value("25/08/2022 17:35")
         second_value = aave._parse_date_value("03/08/2025 15:32:09")
 
-        self.assertEqual(minute_value, datetime(2022, 8, 25, 17, 35))
-        self.assertEqual(second_value, datetime(2025, 8, 3, 15, 32, 9))
-        self.assertIsNone(aave._parse_date_value("2025-08-03"))
+        assert minute_value == datetime(2022, 8, 25, 17, 35)
+        assert second_value == datetime(2025, 8, 3, 15, 32, 9)
+        assert aave._parse_date_value("2025-08-03") is None
 
     def test_aave_daily_exposure_extends_past_end_until_terminal_zero_day(self) -> None:
         block_map = {
@@ -212,12 +211,13 @@ class BlockchainProtocolTests(unittest.TestCase):
             end_date="2026-01-02",
         )
 
-        self.assertEqual(queried_blocks, [11, 12, 13])
-        self.assertEqual(
-            [row["date"] for row in history],
-            [date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3)],
-        )
-        self.assertEqual(history[-1]["rpc_error_count"], 0)
+        assert queried_blocks == [11, 12, 13]
+        assert [row["date"] for row in history] == [
+            date(2026, 1, 1),
+            date(2026, 1, 2),
+            date(2026, 1, 3),
+        ]
+        assert history[-1]["rpc_error_count"] == 0
 
     def test_aave_terminal_zero_requires_zero_rpc_errors(self) -> None:
         block_map = {
@@ -239,10 +239,10 @@ class BlockchainProtocolTests(unittest.TestCase):
             end_date="2026-01-02",
         )
 
-        self.assertEqual(queried_blocks, [11, 12, 13, 14])
-        self.assertEqual(history[2]["date"], date(2026, 1, 3))
-        self.assertEqual(history[2]["rpc_error_count"], 1)
-        self.assertEqual(history[-1]["date"], date(2026, 1, 4))
+        assert queried_blocks == [11, 12, 13, 14]
+        assert history[2]["date"] == date(2026, 1, 3)
+        assert history[2]["rpc_error_count"] == 1
+        assert history[-1]["date"] == date(2026, 1, 4)
 
     def test_read_curve_pool_tokens_returns_dataclass_list_and_stops_on_revert(self) -> None:
         pool_address = "0xpool"
@@ -262,26 +262,20 @@ class BlockchainProtocolTests(unittest.TestCase):
 
         result = curve._read_curve_pool_tokens(w3=w3, pool_address=pool_address, block_number=123)
 
-        self.assertEqual(pool.coins_calls, [0, 1, 2])
-        self.assertEqual(len(result), 2)
-        self.assertIsInstance(result[0], curve.CurvePoolToken)
-        self.assertEqual(
-            result[0],
-            curve.CurvePoolToken(
-                address=token_a,
-                balance=1000,
-                symbol="USDC",
-                decimals=6,
-            ),
+        assert pool.coins_calls == [0, 1, 2]
+        assert len(result) == 2
+        assert isinstance(result[0], curve.CurvePoolToken)
+        assert result[0] == curve.CurvePoolToken(
+            address=token_a,
+            balance=1000,
+            symbol="USDC",
+            decimals=6,
         )
-        self.assertEqual(
-            result[1],
-            curve.CurvePoolToken(
-                address=token_b,
-                balance=2000,
-                symbol="WETH",
-                decimals=18,
-            ),
+        assert result[1] == curve.CurvePoolToken(
+            address=token_b,
+            balance=2000,
+            symbol="WETH",
+            decimals=18,
         )
 
     def test_get_curve_underlying_uses_curve_pool_token_dataclass(self) -> None:
@@ -309,8 +303,8 @@ class BlockchainProtocolTests(unittest.TestCase):
             )
 
         read_pool_mock.assert_called_once_with(w3=w3, pool_address=pool_address, block_number=123)
-        self.assertEqual(result["USDC"], Decimal("0.001"))
-        self.assertEqual(result["WETH"], Decimal("2"))
+        assert result["USDC"] == Decimal("0.001")
+        assert result["WETH"] == Decimal("2")
 
     def test_resolve_effective_start_date_prefers_existing_output_plus_one(self) -> None:
         with patch(
@@ -324,7 +318,7 @@ class BlockchainProtocolTests(unittest.TestCase):
                 explicit_start_date=None,
                 fallback_start_date="2026-01-01",
             )
-        self.assertEqual(result, "2026-01-06")
+        assert result == "2026-01-06"
 
     def test_resolve_effective_start_date_respects_explicit_start(self) -> None:
         with patch(
@@ -338,7 +332,7 @@ class BlockchainProtocolTests(unittest.TestCase):
                 explicit_start_date="2025-09-01",
                 fallback_start_date="2026-01-01",
             )
-        self.assertEqual(result, "2025-09-01")
+        assert result == "2025-09-01"
 
     def test_resolve_effective_start_date_uses_fallback_without_existing_output(self) -> None:
         with patch(
@@ -352,7 +346,7 @@ class BlockchainProtocolTests(unittest.TestCase):
                 explicit_start_date=None,
                 fallback_start_date="2026-01-01",
             )
-        self.assertEqual(result, "2026-01-01")
+        assert result == "2026-01-01"
 
     def test_resolve_effective_start_date_clamps_to_fallback_floor(self) -> None:
         with patch(
@@ -366,7 +360,7 @@ class BlockchainProtocolTests(unittest.TestCase):
                 explicit_start_date=None,
                 fallback_start_date="2026-01-10",
             )
-        self.assertEqual(result, "2026-01-10")
+        assert result == "2026-01-10"
 
     def test_write_protocol_history_csv_merges_rows_and_keeps_existing_overlap(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -410,23 +404,17 @@ class BlockchainProtocolTests(unittest.TestCase):
                     fieldnames=["date", "block", "asset_A"],
                 )
 
-            self.assertEqual(output, output_path)
+            assert output == output_path
             with open(output_path, mode="r", newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f=f)
                 rows = list(reader)
-                self.assertEqual(
-                    reader.fieldnames,
-                    ["date", "block", "asset_A", "asset_B", "legacy_col"],
-                )
+                assert reader.fieldnames == ["date", "block", "asset_A", "asset_B", "legacy_col"]
 
-            self.assertEqual(
-                [row["date"] for row in rows],
-                ["2026-01-01", "2026-01-02", "2026-01-03"],
-            )
-            self.assertEqual(rows[1]["block"], "20")
-            self.assertEqual(rows[1]["legacy_col"], "keep2")
-            self.assertEqual(rows[2]["block"], "30")
-            self.assertEqual(rows[2]["asset_B"], "33")
+            assert [row["date"] for row in rows] == ["2026-01-01", "2026-01-02", "2026-01-03"]
+            assert rows[1]["block"] == "20"
+            assert rows[1]["legacy_col"] == "keep2"
+            assert rows[2]["block"] == "30"
+            assert rows[2]["asset_B"] == "33"
 
     def test_process_all_curve_tokens_passes_resolved_incremental_start(self) -> None:
         with (
@@ -520,7 +508,3 @@ class BlockchainProtocolTests(unittest.TestCase):
             aave.process_all_aave_tokens(chain="arbitrum")
 
         exposure_mock.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()
