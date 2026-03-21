@@ -701,6 +701,57 @@ class TestBlockchainProtocols:
         assert out["ETH"] == Decimal("2.06")
         assert "wstETH" not in out
 
+    def test_compose_base_ingredients_uses_aave_overlay_and_skips_raw_aave_wrappers(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            snapshots_root = root / "snapshots"
+            protocol_root = root / "protocol_underlying_tokens"
+            tokens_root = root / "tokens"
+            snapshots_root.mkdir(parents=True, exist_ok=True)
+            (protocol_root / "aave").mkdir(parents=True, exist_ok=True)
+            tokens_root.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {"Date": "2026-01-01", "Coin": "aArbUSDC", "Quantity": 5.0},
+                    {"Date": "2026-01-01", "Coin": "ETH", "Quantity": 1.0},
+                ]
+            ).to_csv(snapshots_root / "arbitrum_snapshots.csv", index=False)
+            pd.DataFrame([{"date": "2026-01-01", "net_USDC": 2.5}]).to_csv(
+                protocol_root / "aave" / "arbitrum_aave_daily_exposure.csv",
+                index=False,
+            )
+            with open(tokens_root / "arbitrum_tokens.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "0xaave": {"symbol": "aArbUSDC", "family": "USDC", "protocol": "aave"},
+                        "0xusdc": {"symbol": "USDC"},
+                        "0xeth": {"symbol": "ETH"},
+                    },
+                    f,
+                )
+
+            with (
+                patch(
+                    "blockchain_reader.protocols.composer.BLOCKCHAIN_SNAPSHOT_FOLDER",
+                    snapshots_root,
+                ),
+                patch(
+                    "blockchain_reader.protocols.composer.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    protocol_root,
+                ),
+                patch("blockchain_reader.protocols.composer.TOKENS_FOLDER", tokens_root),
+            ):
+                output_path = composer.compose_base_ingredients(chain="arbitrum")
+
+            assert output_path == protocol_root / "arbitrum_base_ingredients.csv"
+            result = pd.read_csv(output_path)
+            assert list(result.columns) == ["Date", "Coin", "Quantity"]
+            assert set(result["Coin"]) == {"ETH", "USDC"}
+            assert "aArbUSDC" not in set(result["Coin"])
+            assert result.loc[result["Coin"] == "ETH", "Quantity"].iloc[0] == 1.0
+            assert result.loc[result["Coin"] == "USDC", "Quantity"].iloc[0] == 2.5
+
     def test_run_protocol_pipeline_includes_liquid_staking_by_default(self) -> None:
         with (
             patch("blockchain_reader.protocols.pipeline.process_all_beefy_tokens") as beefy_mock,
