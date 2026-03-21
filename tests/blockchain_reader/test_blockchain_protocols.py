@@ -1,5 +1,6 @@
 import csv
 import json
+from collections import defaultdict
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -8,7 +9,15 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from blockchain_reader.protocols import aave, common, curve, lp_pricing
+from blockchain_reader.protocols import (
+    aave,
+    common,
+    composer,
+    curve,
+    liquid_staking,
+    lp_pricing,
+    pipeline,
+)
 
 
 class DummyProgress:
@@ -139,6 +148,51 @@ class FakeCurveEth:
 class FakeCurveWeb3:
     def __init__(self, contracts: dict[str, object]):
         self.eth = FakeCurveEth(contracts=contracts)
+
+
+class FakeRateProviderFunctions:
+    def __init__(self, contract):
+        self.contract = contract
+
+    def getRate(self):
+        def _call(block_identifier):
+            self.contract.rate_call_blocks.append(block_identifier)
+            value = self.contract.rate_by_block[block_identifier]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return FakeCall(_call)
+
+
+class FakeRateProviderContract:
+    def __init__(self, address: str, rate_by_block: dict[int, int | Exception]):
+        self.address = address
+        self.rate_by_block = rate_by_block
+        self.rate_call_blocks: list[int] = []
+        self.functions = FakeRateProviderFunctions(contract=self)
+
+
+class FakeLiquidStakingEth:
+    def __init__(self, contract: FakeRateProviderContract, deployed_blocks: set[int] | None = None):
+        self.contract_obj = contract
+        self.deployed_blocks = deployed_blocks or set()
+
+    def contract(self, address, abi):
+        return self.contract_obj
+
+    def get_code(self, address, block_identifier):
+        if not self.deployed_blocks:
+            return b"\x01"
+        return b"\x01" if block_identifier in self.deployed_blocks else b""
+
+
+class FakeLiquidStakingWeb3:
+    def __init__(self, contract: FakeRateProviderContract, deployed_blocks: set[int] | None = None):
+        self.eth = FakeLiquidStakingEth(contract=contract, deployed_blocks=deployed_blocks)
+
+    def to_checksum_address(self, address: str) -> str:
+        return address
 
 
 class TestBlockchainProtocols:
@@ -509,6 +563,199 @@ class TestBlockchainProtocols:
             aave.process_all_aave_tokens(chain="arbitrum")
 
         exposure_mock.assert_not_called()
+
+    def test_get_liquid_staking_history_writes_scaled_eth_ratio(self) -> None:
+        rate_provider = FakeRateProviderContract(
+            address="0xrateprovider",
+            rate_by_block={
+                11: 1_100_000_000_000_000_000,
+                12: 1_120_000_000_000_000_000,
+            },
+        )
+        fake_w3 = FakeLiquidStakingWeb3(contract=rate_provider)
+        write_mock = Mock(return_value=Path("lst_out.csv"))
+
+        with (
+            patch(
+                "blockchain_reader.protocols.liquid_staking.load_chain_web3",
+                return_value=fake_w3,
+            ),
+            patch(
+                "blockchain_reader.protocols.liquid_staking.load_block_map",
+                return_value={"2026-01-01": 11, "2026-01-02": 12},
+            ),
+            patch(
+                "blockchain_reader.protocols.liquid_staking.write_protocol_history_csv",
+                write_mock,
+            ),
+        ):
+            liquid_staking.get_liquid_staking_history(
+                chain="arbitrum",
+                symbol="wstETH",
+                underlying_symbol="ETH",
+                rate_provider_address="0xrateprovider",
+                start_date="2026-01-01",
+                end_date="2026-01-02",
+            )
+
+        history = write_mock.call_args.kwargs["history_data"]
+        assert rate_provider.rate_call_blocks == [11, 12]
+        assert [row["date"] for row in history] == [date(2026, 1, 1), date(2026, 1, 2)]
+        assert history[0]["lst_balance"] == 1.0
+        assert history[0]["asset_ETH"] == 1.1
+        assert history[1]["asset_ETH"] == 1.12
+
+    def test_process_all_liquid_staking_tokens_passes_resolved_incremental_start(self) -> None:
+        with (
+            patch(
+                "blockchain_reader.protocols.liquid_staking.load_snapshot_ranges",
+                return_value={
+                    "wstETH": {
+                        "start": pd.Timestamp("2024-01-01"),
+                        "end": pd.Timestamp("2024-01-10"),
+                        "qty": 0,
+                    }
+                },
+            ),
+            patch(
+                "blockchain_reader.protocols.liquid_staking.load_block_map",
+                return_value={"2024-01-01": 100},
+            ),
+            patch(
+                "blockchain_reader.protocols.liquid_staking.resolve_effective_start_date",
+                return_value="2024-01-05",
+            ),
+            patch(
+                "blockchain_reader.protocols.liquid_staking.get_liquid_staking_history"
+            ) as history_mock,
+        ):
+            liquid_staking.process_all_liquid_staking_tokens(chain="arbitrum")
+
+        history_mock.assert_called_once_with(
+            chain="arbitrum",
+            symbol="wstETH",
+            underlying_symbol="ETH",
+            rate_provider_address="0xf7c5c26B574063e7b098ed74fAd6779e65E3F836",
+            start_date="2024-01-05",
+            end_date="now",
+            rate_provider_method="getRate",
+            rate_scale=10**18,
+        )
+
+    def test_process_all_liquid_staking_tokens_uses_block_map_fallback_start(self) -> None:
+        with (
+            patch(
+                "blockchain_reader.protocols.liquid_staking.load_snapshot_ranges",
+                return_value={},
+            ),
+            patch(
+                "blockchain_reader.protocols.liquid_staking.load_block_map",
+                return_value={"2024-05-01": 12, "2024-01-15": 2},
+            ),
+            patch(
+                "blockchain_reader.protocols.liquid_staking.resolve_effective_start_date",
+                return_value=None,
+            ) as resolve_start_mock,
+        ):
+            liquid_staking.process_all_liquid_staking_tokens(chain="arbitrum")
+
+        assert resolve_start_mock.call_args.kwargs["fallback_start_date"] == "2024-01-15"
+
+    def test_process_all_liquid_staking_tokens_skips_unsupported_chain(self) -> None:
+        with (
+            patch(
+                "blockchain_reader.protocols.liquid_staking.load_snapshot_ranges"
+            ) as snapshots_mock,
+            patch("blockchain_reader.protocols.liquid_staking.load_block_map") as block_map_mock,
+        ):
+            liquid_staking.process_all_liquid_staking_tokens(chain="ethereum")
+
+        snapshots_mock.assert_not_called()
+        block_map_mock.assert_not_called()
+
+    def test_apply_aave_overlay_expands_lst_exposure_to_eth(self) -> None:
+        lst_rows = pd.DataFrame([{"date": "2026-01-01", "asset_ETH": 1.03}])
+        lst_rows["date"] = pd.to_datetime(lst_rows["date"]).dt.date
+
+        overlay_rows = pd.DataFrame([{"date": "2026-01-01", "net_wstETH": 2.0, "net_UNKNOWN": 1.0}])
+        overlay_rows["date"] = pd.to_datetime(overlay_rows["date"]).dt.date
+
+        ctx = composer.ExpansionContext(
+            chain="arbitrum",
+            protocol_rows={"wstETH": lst_rows},
+            symbol_family={},
+            aave_overlay=overlay_rows,
+            aave_wrapper_symbols=set(),
+            known_symbols={"wstETH", "ETH"},
+        )
+
+        out: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
+        unknown_count, dust_count = composer._apply_aave_overlay(
+            out=out,
+            date=pd.Timestamp("2026-01-02"),
+            ctx=ctx,
+        )
+
+        assert unknown_count == 1
+        assert dust_count == 0
+        assert out["ETH"] == Decimal("2.06")
+        assert "wstETH" not in out
+
+    def test_run_protocol_pipeline_includes_liquid_staking_by_default(self) -> None:
+        with (
+            patch("blockchain_reader.protocols.pipeline.process_all_beefy_tokens") as beefy_mock,
+            patch(
+                "blockchain_reader.protocols.pipeline.process_all_balancer_tokens"
+            ) as balancer_mock,
+            patch("blockchain_reader.protocols.pipeline.process_all_aura_tokens") as aura_mock,
+            patch("blockchain_reader.protocols.pipeline.process_all_curve_tokens") as curve_mock,
+            patch("blockchain_reader.protocols.pipeline.process_all_aave_tokens") as aave_mock,
+            patch(
+                "blockchain_reader.protocols.pipeline.process_all_liquid_staking_tokens"
+            ) as liquid_staking_mock,
+            patch("blockchain_reader.protocols.pipeline.compose_base_ingredients") as compose_mock,
+            patch(
+                "blockchain_reader.protocols.pipeline.generate_protocol_lp_price_files"
+            ) as lp_pricing_mock,
+        ):
+            pipeline.run_protocol_pipeline(chain="arbitrum")
+
+        beefy_mock.assert_called_once_with(chain="arbitrum", start_date=None)
+        balancer_mock.assert_called_once_with(chain="arbitrum", start_date=None)
+        aura_mock.assert_called_once_with(chain="arbitrum", start_date=None)
+        curve_mock.assert_called_once_with(chain="arbitrum", start_date=None)
+        aave_mock.assert_called_once_with(chain="arbitrum", start_date=None)
+        liquid_staking_mock.assert_called_once_with(chain="arbitrum", start_date=None)
+        compose_mock.assert_called_once_with(chain="arbitrum")
+        lp_pricing_mock.assert_called_once_with(chain="arbitrum")
+
+    def test_run_protocol_pipeline_supports_liquid_staking_only_selection(self) -> None:
+        with (
+            patch("blockchain_reader.protocols.pipeline.process_all_beefy_tokens") as beefy_mock,
+            patch(
+                "blockchain_reader.protocols.pipeline.process_all_balancer_tokens"
+            ) as balancer_mock,
+            patch("blockchain_reader.protocols.pipeline.process_all_aura_tokens") as aura_mock,
+            patch("blockchain_reader.protocols.pipeline.process_all_curve_tokens") as curve_mock,
+            patch("blockchain_reader.protocols.pipeline.process_all_aave_tokens") as aave_mock,
+            patch(
+                "blockchain_reader.protocols.pipeline.process_all_liquid_staking_tokens"
+            ) as liquid_staking_mock,
+            patch("blockchain_reader.protocols.pipeline.compose_base_ingredients") as compose_mock,
+            patch(
+                "blockchain_reader.protocols.pipeline.generate_protocol_lp_price_files"
+            ) as lp_pricing_mock,
+        ):
+            pipeline.run_protocol_pipeline(chain="arbitrum", protocols=["liquid_staking"])
+
+        beefy_mock.assert_not_called()
+        balancer_mock.assert_not_called()
+        aura_mock.assert_not_called()
+        curve_mock.assert_not_called()
+        aave_mock.assert_not_called()
+        liquid_staking_mock.assert_called_once_with(chain="arbitrum", start_date=None)
+        compose_mock.assert_called_once_with(chain="arbitrum")
+        lp_pricing_mock.assert_called_once_with(chain="arbitrum")
 
     def test_generate_protocol_lp_price_files_merges_and_keeps_canonical_schema(self) -> None:
         with TemporaryDirectory() as tmp_dir:

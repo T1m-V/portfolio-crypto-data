@@ -159,11 +159,23 @@ def _apply_aave_overlay(
             dust_value_count += 1
             continue
         raw_symbol = column.replace("net_", "", 1)
-        symbol = canonicalize_symbol(raw_symbol, symbol_family=ctx.symbol_family)
-        if not symbol or (ctx.known_symbols and symbol not in ctx.known_symbols):
+        normalized_symbol = sanitize_symbol(raw_symbol)
+        canonical_symbol = canonicalize_symbol(raw_symbol, symbol_family=ctx.symbol_family)
+        if not normalized_symbol:
             unknown_symbol_count += 1
             continue
-        out[symbol] += numeric_value
+        if ctx.known_symbols and (
+            normalized_symbol not in ctx.known_symbols and canonical_symbol not in ctx.known_symbols
+        ):
+            unknown_symbol_count += 1
+            continue
+        _expand_symbol(
+            symbol=normalized_symbol,
+            quantity=numeric_value,
+            date=date,
+            ctx=ctx,
+            out=out,
+        )
 
     return unknown_symbol_count, dust_value_count
 

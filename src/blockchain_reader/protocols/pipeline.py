@@ -4,6 +4,7 @@ from blockchain_reader.protocols.balancer import process_all_balancer_tokens
 from blockchain_reader.protocols.beefy import process_all_beefy_tokens
 from blockchain_reader.protocols.composer import compose_base_ingredients
 from blockchain_reader.protocols.curve import process_all_curve_tokens
+from blockchain_reader.protocols.liquid_staking import process_all_liquid_staking_tokens
 from blockchain_reader.protocols.lp_pricing import generate_protocol_lp_price_files
 
 
@@ -12,7 +13,7 @@ def run_protocol_pipeline(
     protocols: list[str] | None = None,
     start_date: str | None = None,
 ) -> None:
-    selected = set(protocols or ["beefy", "balancer", "aave", "aura", "curve"])
+    selected = set(protocols or ["beefy", "balancer", "aave", "aura", "curve", "liquid_staking"])
 
     if "beefy" in selected:
         process_all_beefy_tokens(chain=chain, start_date=start_date)
@@ -24,6 +25,8 @@ def run_protocol_pipeline(
         process_all_curve_tokens(chain=chain, start_date=start_date)
     if "aave" in selected:
         process_all_aave_tokens(chain=chain, start_date=start_date)
+    if "liquid_staking" in selected:
+        process_all_liquid_staking_tokens(chain=chain, start_date=start_date)
 
     compose_base_ingredients(chain=chain)
     generate_protocol_lp_price_files(chain=chain)
@@ -32,5 +35,5 @@ def run_protocol_pipeline(
 if __name__ == "__main__":
     run_protocol_pipeline(
         chain="arbitrum",
-        protocols=["beefy", "balancer", "aave", "aura", "curve"],
+        protocols=["beefy", "balancer", "aave", "aura", "curve", "liquid_staking"],
     )
