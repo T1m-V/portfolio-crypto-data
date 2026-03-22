@@ -1,3 +1,4 @@
+import functools
 import json
 from collections import defaultdict
 from dataclasses import dataclass
@@ -12,9 +13,19 @@ from blockchain_reader.symbols import (
     canonicalize_symbol,
     sanitize_symbol,
 )
-from file_paths import BLOCKCHAIN_SNAPSHOT_FOLDER, PROTOCOL_UNDERLYING_TOKEN_FOLDER, TOKENS_FOLDER
+from file_paths import (
+    BLOCKCHAIN_SNAPSHOT_FOLDER,
+    PRICES_FOLDER,
+    PROTOCOL_UNDERLYING_TOKEN_FOLDER,
+    TOKENS_FOLDER,
+)
 
 DUST = Decimal("0.000000000001")
+VALUE_DUST_EUR = Decimal("0.01")
+STABLE_PRICE_SYMBOLS: dict[str, Decimal] = {
+    "USDC": Decimal("1"),
+    "USDT": Decimal("1"),
+}
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,148 @@ def _find_row_for_date(df: pd.DataFrame, date: pd.Timestamp) -> pd.Series | None
     return eligible.iloc[-1]
 
 
+@functools.lru_cache(maxsize=None)
+def _load_price_history(symbol: str) -> pd.DataFrame | None:
+    price_path = PRICES_FOLDER / f"{symbol}.csv"
+    if not price_path.exists():
+        return None
+
+    df = pd.read_csv(price_path)
+    if "Date" not in df.columns or "Price" not in df.columns:
+        return None
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    df = df.dropna(subset=["Date", "Price"]).sort_values("Date")
+    if df.empty:
+        return None
+    return df[["Date", "Price"]]
+
+
+def _get_price_on_or_before(symbol: str, date: pd.Timestamp) -> Decimal | None:
+    stable_price = STABLE_PRICE_SYMBOLS.get(symbol)
+    if stable_price is not None:
+        return stable_price
+
+    history = _load_price_history(symbol=symbol)
+    if history is None:
+        return None
+
+    eligible = history[history["Date"] <= date.date()]
+    if eligible.empty:
+        return None
+    return Decimal(str(eligible.iloc[-1]["Price"]))
+
+
+def _estimate_value_eur(
+    *,
+    symbol: str,
+    quantity: Decimal,
+    date: pd.Timestamp,
+    symbol_family: dict[str, str],
+) -> Decimal | None:
+    normalized_symbol = sanitize_symbol(symbol)
+    canonical_symbol = canonicalize_symbol(normalized_symbol, symbol_family=symbol_family)
+
+    candidates: list[str] = []
+    for candidate in (normalized_symbol, canonical_symbol):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        price = _get_price_on_or_before(symbol=candidate, date=date)
+        if price is not None:
+            return abs(quantity) * price
+
+    return None
+
+
+def _build_exception_row(
+    *,
+    date: pd.Timestamp,
+    symbol: str,
+    quantity: Decimal,
+    reason: str,
+    action: str,
+    estimated_value_eur: Decimal | None,
+) -> dict[str, object]:
+    estimated = float(estimated_value_eur) if estimated_value_eur is not None else ""
+    return {
+        "Date": date.date(),
+        "Coin": symbol,
+        "Quantity": float(quantity),
+        "Reason": reason,
+        "EstimatedValueEUR": estimated,
+        "Action": action,
+    }
+
+
+def _filter_composed_quantities(
+    *,
+    out: dict[str, Decimal],
+    date: pd.Timestamp,
+    ctx: ExpansionContext,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    rows: list[dict[str, object]] = []
+    exceptions: list[dict[str, object]] = []
+
+    for symbol, qty in sorted(out.items()):
+        if abs(qty) <= DUST:
+            continue
+
+        normalized_symbol = sanitize_symbol(symbol)
+        canonical_symbol = canonicalize_symbol(normalized_symbol, symbol_family=ctx.symbol_family)
+        output_symbol = canonical_symbol or normalized_symbol
+        if not output_symbol:
+            continue
+
+        estimated_value_eur = _estimate_value_eur(
+            symbol=output_symbol,
+            quantity=qty,
+            date=date,
+            symbol_family=ctx.symbol_family,
+        )
+        is_known = not ctx.known_symbols or (
+            normalized_symbol in ctx.known_symbols or canonical_symbol in ctx.known_symbols
+        )
+
+        if not is_known:
+            if estimated_value_eur is not None and estimated_value_eur < VALUE_DUST_EUR:
+                continue
+            exceptions.append(
+                _build_exception_row(
+                    date=date,
+                    symbol=output_symbol,
+                    quantity=qty,
+                    reason="unknown_symbol_material",
+                    action="add token metadata or protocol mapping",
+                    estimated_value_eur=estimated_value_eur,
+                )
+            )
+            continue
+
+        if estimated_value_eur is not None:
+            if estimated_value_eur < VALUE_DUST_EUR:
+                continue
+        else:
+            if abs(qty) <= DUST:
+                continue
+            exceptions.append(
+                _build_exception_row(
+                    date=date,
+                    symbol=output_symbol,
+                    quantity=qty,
+                    reason="known_symbol_missing_price",
+                    action="add price file or price_source mapping",
+                    estimated_value_eur=estimated_value_eur,
+                )
+            )
+
+        rows.append({"Date": date.date(), "Coin": output_symbol, "Quantity": float(qty)})
+
+    return rows, exceptions
+
+
 def _expand_symbol(
     symbol: str,
     quantity: Decimal,
@@ -136,7 +289,10 @@ def _expand_symbol(
 
 
 def _apply_aave_overlay(
-    out: dict[str, Decimal], date: pd.Timestamp, ctx: ExpansionContext
+    out: dict[str, Decimal],
+    date: pd.Timestamp,
+    ctx: ExpansionContext,
+    exceptions: list[dict[str, object]],
 ) -> tuple[int, int]:
     if ctx.aave_overlay is None:
         return 0, 0
@@ -163,11 +319,39 @@ def _apply_aave_overlay(
         canonical_symbol = canonicalize_symbol(raw_symbol, symbol_family=ctx.symbol_family)
         if not normalized_symbol:
             unknown_symbol_count += 1
+            if abs(numeric_value) > DUST:
+                exceptions.append(
+                    _build_exception_row(
+                        date=date,
+                        symbol=raw_symbol or "<empty>",
+                        quantity=numeric_value,
+                        reason="unknown_aave_overlay_symbol",
+                        action="fix aave overlay header or token metadata",
+                        estimated_value_eur=None,
+                    )
+                )
             continue
         if ctx.known_symbols and (
             normalized_symbol not in ctx.known_symbols and canonical_symbol not in ctx.known_symbols
         ):
             unknown_symbol_count += 1
+            estimated_value_eur = _estimate_value_eur(
+                symbol=normalized_symbol,
+                quantity=numeric_value,
+                date=date,
+                symbol_family=ctx.symbol_family,
+            )
+            if estimated_value_eur is None or estimated_value_eur >= VALUE_DUST_EUR:
+                exceptions.append(
+                    _build_exception_row(
+                        date=date,
+                        symbol=normalized_symbol,
+                        quantity=numeric_value,
+                        reason="unknown_aave_overlay_symbol",
+                        action="fix aave overlay header or token metadata",
+                        estimated_value_eur=estimated_value_eur,
+                    )
+                )
             continue
         _expand_symbol(
             symbol=normalized_symbol,
@@ -181,6 +365,8 @@ def _apply_aave_overlay(
 
 
 def compose_base_ingredients(chain: str) -> Path:
+    _load_price_history.cache_clear()
+
     snapshots_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_snapshots.csv"
     df = pd.read_csv(snapshots_path)
     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
@@ -200,12 +386,18 @@ def compose_base_ingredients(chain: str) -> Path:
     )
 
     rows: list[dict[str, object]] = []
+    exceptions: list[dict[str, object]] = []
     unknown_overlay_symbols = 0
     dust_overlay_values = 0
     grouped = df.groupby("Date")
     for date, group in grouped:
         out: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
-        unknown_count, dust_count = _apply_aave_overlay(out=out, date=date, ctx=ctx)
+        unknown_count, dust_count = _apply_aave_overlay(
+            out=out,
+            date=date,
+            ctx=ctx,
+            exceptions=exceptions,
+        )
         unknown_overlay_symbols += unknown_count
         dust_overlay_values += dust_count
 
@@ -218,15 +410,22 @@ def compose_base_ingredients(chain: str) -> Path:
                 continue
             _expand_symbol(symbol=symbol, quantity=quantity, date=date, ctx=ctx, out=out)
 
-        for symbol, qty in sorted(out.items()):
-            if abs(qty) <= DUST:
-                continue
-            rows.append({"Date": date.date(), "Coin": symbol, "Quantity": float(qty)})
+        kept_rows, row_exceptions = _filter_composed_quantities(out=out, date=date, ctx=ctx)
+        rows.extend(kept_rows)
+        exceptions.extend(row_exceptions)
 
     out_df = pd.DataFrame(rows)
     output_path = PROTOCOL_UNDERLYING_TOKEN_FOLDER / f"{chain}_base_ingredients.csv"
     out_df.to_csv(output_path, index=False)
+
+    exceptions_df = pd.DataFrame(
+        exceptions,
+        columns=["Date", "Coin", "Quantity", "Reason", "EstimatedValueEUR", "Action"],
+    )
+    exceptions_path = PROTOCOL_UNDERLYING_TOKEN_FOLDER / f"{chain}_base_ingredients_exceptions.csv"
+    exceptions_df.to_csv(exceptions_path, index=False)
     print(f"[compose] Saved to {output_path}")
+    print(f"[compose] Exceptions saved to {exceptions_path} ({len(exceptions)} rows)")
     if ctx.aave_overlay is not None:
         print(
             "[compose] Aave overlay skips: "

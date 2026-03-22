@@ -1,11 +1,11 @@
+from blockchain_reader.composition.base_ingredients import compose_base_ingredients
+from blockchain_reader.composition.lp_pricing import generate_protocol_lp_price_files
 from blockchain_reader.protocols.aave import process_all_aave_tokens
 from blockchain_reader.protocols.aura import process_all_aura_tokens
 from blockchain_reader.protocols.balancer import process_all_balancer_tokens
 from blockchain_reader.protocols.beefy import process_all_beefy_tokens
-from blockchain_reader.protocols.composer import compose_base_ingredients
 from blockchain_reader.protocols.curve import process_all_curve_tokens
 from blockchain_reader.protocols.liquid_staking import process_all_liquid_staking_tokens
-from blockchain_reader.protocols.lp_pricing import generate_protocol_lp_price_files
 
 
 def run_protocol_pipeline(

@@ -9,15 +9,9 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from blockchain_reader.protocols import (
-    aave,
-    common,
-    composer,
-    curve,
-    liquid_staking,
-    lp_pricing,
-    pipeline,
-)
+from blockchain_reader import pipeline
+from blockchain_reader.composition import base_ingredients, lp_pricing
+from blockchain_reader.protocols import aave, common, curve, liquid_staking
 
 
 class DummyProgress:
@@ -680,7 +674,7 @@ class TestBlockchainProtocols:
         overlay_rows = pd.DataFrame([{"date": "2026-01-01", "net_wstETH": 2.0, "net_UNKNOWN": 1.0}])
         overlay_rows["date"] = pd.to_datetime(overlay_rows["date"]).dt.date
 
-        ctx = composer.ExpansionContext(
+        ctx = base_ingredients.ExpansionContext(
             chain="arbitrum",
             protocol_rows={"wstETH": lst_rows},
             symbol_family={},
@@ -690,16 +684,19 @@ class TestBlockchainProtocols:
         )
 
         out: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
-        unknown_count, dust_count = composer._apply_aave_overlay(
+        exceptions: list[dict[str, object]] = []
+        unknown_count, dust_count = base_ingredients._apply_aave_overlay(
             out=out,
             date=pd.Timestamp("2026-01-02"),
             ctx=ctx,
+            exceptions=exceptions,
         )
 
         assert unknown_count == 1
         assert dust_count == 0
         assert out["ETH"] == Decimal("2.06")
         assert "wstETH" not in out
+        assert exceptions[0]["Reason"] == "unknown_aave_overlay_symbol"
 
     def test_compose_base_ingredients_uses_aave_overlay_and_skips_raw_aave_wrappers(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -707,9 +704,11 @@ class TestBlockchainProtocols:
             snapshots_root = root / "snapshots"
             protocol_root = root / "protocol_underlying_tokens"
             tokens_root = root / "tokens"
+            prices_root = root / "prices"
             snapshots_root.mkdir(parents=True, exist_ok=True)
             (protocol_root / "aave").mkdir(parents=True, exist_ok=True)
             tokens_root.mkdir(parents=True, exist_ok=True)
+            prices_root.mkdir(parents=True, exist_ok=True)
 
             pd.DataFrame(
                 [
@@ -733,16 +732,17 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.protocols.composer.BLOCKCHAIN_SNAPSHOT_FOLDER",
+                    "blockchain_reader.composition.base_ingredients.BLOCKCHAIN_SNAPSHOT_FOLDER",
                     snapshots_root,
                 ),
                 patch(
-                    "blockchain_reader.protocols.composer.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "blockchain_reader.composition.base_ingredients.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.protocols.composer.TOKENS_FOLDER", tokens_root),
+                patch("blockchain_reader.composition.base_ingredients.TOKENS_FOLDER", tokens_root),
+                patch("blockchain_reader.composition.base_ingredients.PRICES_FOLDER", prices_root),
             ):
-                output_path = composer.compose_base_ingredients(chain="arbitrum")
+                output_path = base_ingredients.compose_base_ingredients(chain="arbitrum")
 
             assert output_path == protocol_root / "arbitrum_base_ingredients.csv"
             result = pd.read_csv(output_path)
@@ -752,22 +752,78 @@ class TestBlockchainProtocols:
             assert result.loc[result["Coin"] == "ETH", "Quantity"].iloc[0] == 1.0
             assert result.loc[result["Coin"] == "USDC", "Quantity"].iloc[0] == 2.5
 
+    def test_compose_base_ingredients_applies_dust_policy_and_writes_exceptions(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            snapshots_root = root / "snapshots"
+            protocol_root = root / "protocol_underlying_tokens"
+            tokens_root = root / "tokens"
+            prices_root = root / "prices"
+            snapshots_root.mkdir(parents=True, exist_ok=True)
+            protocol_root.mkdir(parents=True, exist_ok=True)
+            tokens_root.mkdir(parents=True, exist_ok=True)
+            prices_root.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {"Date": "2026-01-01", "Coin": "USDC", "Quantity": 3.0},
+                    {"Date": "2026-01-01", "Coin": "ETH", "Quantity": 0.000001},
+                    {"Date": "2026-01-01", "Coin": "MISSING", "Quantity": 2.0},
+                    {"Date": "2026-01-01", "Coin": "UNK-0x10", "Quantity": 5.0},
+                ]
+            ).to_csv(snapshots_root / "arbitrum_snapshots.csv", index=False)
+            with open(tokens_root / "arbitrum_tokens.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "0xusdc": {"symbol": "USDC"},
+                        "0xeth": {"symbol": "ETH"},
+                        "0xmissing": {"symbol": "MISSING"},
+                    },
+                    f,
+                )
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 1000.0}]).to_csv(
+                prices_root / "ETH.csv",
+                index=False,
+            )
+
+            with (
+                patch(
+                    "blockchain_reader.composition.base_ingredients.BLOCKCHAIN_SNAPSHOT_FOLDER",
+                    snapshots_root,
+                ),
+                patch(
+                    "blockchain_reader.composition.base_ingredients.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    protocol_root,
+                ),
+                patch("blockchain_reader.composition.base_ingredients.TOKENS_FOLDER", tokens_root),
+                patch("blockchain_reader.composition.base_ingredients.PRICES_FOLDER", prices_root),
+            ):
+                output_path = base_ingredients.compose_base_ingredients(chain="arbitrum")
+
+            result = pd.read_csv(output_path)
+            assert set(result["Coin"]) == {"MISSING", "USDC"}
+            assert "ETH" not in set(result["Coin"])
+            assert "UNK-0x10" not in set(result["Coin"])
+
+            exceptions = pd.read_csv(protocol_root / "arbitrum_base_ingredients_exceptions.csv")
+            assert set(exceptions["Coin"]) == {"MISSING", "UNK-0x10"}
+            assert set(exceptions["Reason"]) == {
+                "known_symbol_missing_price",
+                "unknown_symbol_material",
+            }
+
     def test_run_protocol_pipeline_includes_liquid_staking_by_default(self) -> None:
         with (
-            patch("blockchain_reader.protocols.pipeline.process_all_beefy_tokens") as beefy_mock,
+            patch("blockchain_reader.pipeline.process_all_beefy_tokens") as beefy_mock,
+            patch("blockchain_reader.pipeline.process_all_balancer_tokens") as balancer_mock,
+            patch("blockchain_reader.pipeline.process_all_aura_tokens") as aura_mock,
+            patch("blockchain_reader.pipeline.process_all_curve_tokens") as curve_mock,
+            patch("blockchain_reader.pipeline.process_all_aave_tokens") as aave_mock,
             patch(
-                "blockchain_reader.protocols.pipeline.process_all_balancer_tokens"
-            ) as balancer_mock,
-            patch("blockchain_reader.protocols.pipeline.process_all_aura_tokens") as aura_mock,
-            patch("blockchain_reader.protocols.pipeline.process_all_curve_tokens") as curve_mock,
-            patch("blockchain_reader.protocols.pipeline.process_all_aave_tokens") as aave_mock,
-            patch(
-                "blockchain_reader.protocols.pipeline.process_all_liquid_staking_tokens"
+                "blockchain_reader.pipeline.process_all_liquid_staking_tokens"
             ) as liquid_staking_mock,
-            patch("blockchain_reader.protocols.pipeline.compose_base_ingredients") as compose_mock,
-            patch(
-                "blockchain_reader.protocols.pipeline.generate_protocol_lp_price_files"
-            ) as lp_pricing_mock,
+            patch("blockchain_reader.pipeline.compose_base_ingredients") as compose_mock,
+            patch("blockchain_reader.pipeline.generate_protocol_lp_price_files") as lp_pricing_mock,
         ):
             pipeline.run_protocol_pipeline(chain="arbitrum")
 
@@ -782,20 +838,16 @@ class TestBlockchainProtocols:
 
     def test_run_protocol_pipeline_supports_liquid_staking_only_selection(self) -> None:
         with (
-            patch("blockchain_reader.protocols.pipeline.process_all_beefy_tokens") as beefy_mock,
+            patch("blockchain_reader.pipeline.process_all_beefy_tokens") as beefy_mock,
+            patch("blockchain_reader.pipeline.process_all_balancer_tokens") as balancer_mock,
+            patch("blockchain_reader.pipeline.process_all_aura_tokens") as aura_mock,
+            patch("blockchain_reader.pipeline.process_all_curve_tokens") as curve_mock,
+            patch("blockchain_reader.pipeline.process_all_aave_tokens") as aave_mock,
             patch(
-                "blockchain_reader.protocols.pipeline.process_all_balancer_tokens"
-            ) as balancer_mock,
-            patch("blockchain_reader.protocols.pipeline.process_all_aura_tokens") as aura_mock,
-            patch("blockchain_reader.protocols.pipeline.process_all_curve_tokens") as curve_mock,
-            patch("blockchain_reader.protocols.pipeline.process_all_aave_tokens") as aave_mock,
-            patch(
-                "blockchain_reader.protocols.pipeline.process_all_liquid_staking_tokens"
+                "blockchain_reader.pipeline.process_all_liquid_staking_tokens"
             ) as liquid_staking_mock,
-            patch("blockchain_reader.protocols.pipeline.compose_base_ingredients") as compose_mock,
-            patch(
-                "blockchain_reader.protocols.pipeline.generate_protocol_lp_price_files"
-            ) as lp_pricing_mock,
+            patch("blockchain_reader.pipeline.compose_base_ingredients") as compose_mock,
+            patch("blockchain_reader.pipeline.generate_protocol_lp_price_files") as lp_pricing_mock,
         ):
             pipeline.run_protocol_pipeline(chain="arbitrum", protocols=["liquid_staking"])
 
@@ -847,11 +899,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.protocols.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.protocols.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.protocols.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -892,11 +944,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.protocols.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.protocols.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.protocols.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -925,11 +977,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.protocols.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.protocols.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.protocols.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -964,11 +1016,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.protocols.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.protocols.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.protocols.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 

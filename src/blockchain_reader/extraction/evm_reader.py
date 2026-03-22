@@ -11,8 +11,8 @@ import requests
 from tqdm.asyncio import tqdm_asyncio
 from web3 import Web3
 
-from blockchain_reader.token_manager import TokenManager
-from blockchain_reader.transaction_analyzer import analyze_transaction
+from blockchain_reader.extraction.token_manager import TokenManager
+from blockchain_reader.extraction.transaction_analyzer import analyze_transaction
 from file_paths import BLOCKCHAIN_TRANSACTIONS_FOLDER, CHAIN_INFO_PATH, TOKENS_FOLDER
 
 ctx = Context(prec=78, rounding=ROUND_HALF_UP)

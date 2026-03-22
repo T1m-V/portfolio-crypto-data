@@ -5,7 +5,7 @@ from typing import Any
 
 from web3 import Web3
 
-from blockchain_reader.token_manager import TokenManager
+from blockchain_reader.extraction.token_manager import TokenManager
 
 ctx = Context(prec=78, rounding=ROUND_HALF_UP)
 

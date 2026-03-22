@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from web3 import Web3
 
-from blockchain_reader import transaction_analyzer as ta
+from blockchain_reader.extraction import transaction_analyzer
 
 
 class DummyTokenManager:
@@ -43,7 +43,7 @@ def test_get_token_movements_transfer_in_and_out() -> None:
         ]
     }
 
-    incoming, outgoing, approvals = ta._get_token_movements(
+    incoming, outgoing, approvals = transaction_analyzer._get_token_movements(
         receipt=receipt,
         my_address=my_address,
         token_manager=DummyTokenManager(),
@@ -62,7 +62,7 @@ def test_get_token_movements_transfer_in_and_out() -> None:
 def test_analyze_transaction_formats_utc_date() -> None:
     tx_hash = "0xhash"
     my_address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    tx_context = ta.TransactionContext(
+    tx_context = transaction_analyzer.TransactionContext(
         tx={
             "from": my_address,
             "to": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -73,9 +73,11 @@ def test_analyze_transaction_formats_utc_date() -> None:
         block={"timestamp": 0},
     )
 
-    with patch("blockchain_reader.transaction_analyzer._fetch_transaction_data") as fetch_mock:
+    with patch(
+        "blockchain_reader.extraction.transaction_analyzer._fetch_transaction_data"
+    ) as fetch_mock:
         fetch_mock.return_value = tx_context
-        result = ta.analyze_transaction(
+        result = transaction_analyzer.analyze_transaction(
             tx_hash=tx_hash,
             w3=None,  # mocked
             my_address=my_address,

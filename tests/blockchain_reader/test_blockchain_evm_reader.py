@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from blockchain_reader.evm_reader import (
+from blockchain_reader.extraction.evm_reader import (
     OUTPUT_COLUMNS,
     _derive_start_date,
     _fetch_explorer_data,
@@ -67,7 +67,10 @@ def test_fetch_explorer_data_handles_no_transactions() -> None:
         "result": "No transactions found",
     }
 
-    with patch("blockchain_reader.evm_reader.requests.get", return_value=response) as get_mock:
+    with patch(
+        "blockchain_reader.extraction.evm_reader.requests.get",
+        return_value=response,
+    ) as get_mock:
         data = _fetch_explorer_data(
             api_url="https://example.test",
             params={"action": "txlist"},
