@@ -51,7 +51,7 @@ def load_tokens(chain: str) -> dict[str, dict[str, str]]:
 
 
 def load_snapshot_ranges(chain: str) -> dict[str, dict[str, object]]:
-    snapshots_file_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_snapshots.csv"
+    snapshots_file_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_raw_snapshots.csv"
     if not os.path.exists(snapshots_file_path):
         raise FileNotFoundError(f"Snapshots '{snapshots_file_path}' not found.")
 

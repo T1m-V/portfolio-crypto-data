@@ -709,13 +709,17 @@ class TestBlockchainProtocols:
             (protocol_root / "aave").mkdir(parents=True, exist_ok=True)
             tokens_root.mkdir(parents=True, exist_ok=True)
             prices_root.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 1.0}]).to_csv(
+                prices_root / "USD_EUR.csv",
+                index=False,
+            )
 
             pd.DataFrame(
                 [
                     {"Date": "2026-01-01", "Coin": "aArbUSDC", "Quantity": 5.0},
                     {"Date": "2026-01-01", "Coin": "ETH", "Quantity": 1.0},
                 ]
-            ).to_csv(snapshots_root / "arbitrum_snapshots.csv", index=False)
+            ).to_csv(snapshots_root / "arbitrum_raw_snapshots.csv", index=False)
             pd.DataFrame([{"date": "2026-01-01", "net_USDC": 2.5}]).to_csv(
                 protocol_root / "aave" / "arbitrum_aave_daily_exposure.csv",
                 index=False,
@@ -763,6 +767,10 @@ class TestBlockchainProtocols:
             protocol_root.mkdir(parents=True, exist_ok=True)
             tokens_root.mkdir(parents=True, exist_ok=True)
             prices_root.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 1.0}]).to_csv(
+                prices_root / "USD_EUR.csv",
+                index=False,
+            )
 
             pd.DataFrame(
                 [
@@ -771,7 +779,7 @@ class TestBlockchainProtocols:
                     {"Date": "2026-01-01", "Coin": "MISSING", "Quantity": 2.0},
                     {"Date": "2026-01-01", "Coin": "UNK-0x10", "Quantity": 5.0},
                 ]
-            ).to_csv(snapshots_root / "arbitrum_snapshots.csv", index=False)
+            ).to_csv(snapshots_root / "arbitrum_raw_snapshots.csv", index=False)
             with open(tokens_root / "arbitrum_tokens.json", "w", encoding="utf-8") as f:
                 json.dump(
                     {

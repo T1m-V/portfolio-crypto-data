@@ -2,7 +2,7 @@ from decimal import Decimal
 
 import pandas as pd
 
-from historical_transactions.crypto_snapshots import CryptoTracker
+from blockchain_reader.raw_snapshots import CryptoTracker
 
 
 class TestCryptoSnapshots:

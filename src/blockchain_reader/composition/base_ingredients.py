@@ -1,5 +1,3 @@
-import functools
-import json
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
@@ -7,6 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from blockchain_reader.shared.prices import clear_price_cache, get_price_eur_on_or_before
+from blockchain_reader.shared.token_metadata import load_token_metadata
 from blockchain_reader.symbols import (
     build_known_canonical_symbols,
     build_symbol_family_map,
@@ -22,10 +22,6 @@ from file_paths import (
 
 DUST = Decimal("0.000000000001")
 VALUE_DUST_EUR = Decimal("0.01")
-STABLE_PRICE_SYMBOLS: dict[str, Decimal] = {
-    "USDC": Decimal("1"),
-    "USDT": Decimal("1"),
-}
 
 
 @dataclass(frozen=True)
@@ -36,13 +32,6 @@ class ExpansionContext:
     aave_overlay: pd.DataFrame | None
     aave_wrapper_symbols: set[str]
     known_symbols: set[str]
-
-
-def _load_token_metadata(chain: str) -> dict[str, dict[str, object]]:
-    token_path = TOKENS_FOLDER / f"{chain}_tokens.json"
-    with open(token_path, "r") as f:
-        raw = json.load(f)
-    return {str(addr).lower(): meta for addr, meta in raw.items() if isinstance(meta, dict)}
 
 
 def _load_aave_wrapper_symbols(token_metadata: dict[str, dict[str, object]]) -> set[str]:
@@ -98,39 +87,6 @@ def _find_row_for_date(df: pd.DataFrame, date: pd.Timestamp) -> pd.Series | None
     return eligible.iloc[-1]
 
 
-@functools.lru_cache(maxsize=None)
-def _load_price_history(symbol: str) -> pd.DataFrame | None:
-    price_path = PRICES_FOLDER / f"{symbol}.csv"
-    if not price_path.exists():
-        return None
-
-    df = pd.read_csv(price_path)
-    if "Date" not in df.columns or "Price" not in df.columns:
-        return None
-
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
-    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
-    df = df.dropna(subset=["Date", "Price"]).sort_values("Date")
-    if df.empty:
-        return None
-    return df[["Date", "Price"]]
-
-
-def _get_price_on_or_before(symbol: str, date: pd.Timestamp) -> Decimal | None:
-    stable_price = STABLE_PRICE_SYMBOLS.get(symbol)
-    if stable_price is not None:
-        return stable_price
-
-    history = _load_price_history(symbol=symbol)
-    if history is None:
-        return None
-
-    eligible = history[history["Date"] <= date.date()]
-    if eligible.empty:
-        return None
-    return Decimal(str(eligible.iloc[-1]["Price"]))
-
-
 def _estimate_value_eur(
     *,
     symbol: str,
@@ -147,7 +103,12 @@ def _estimate_value_eur(
             candidates.append(candidate)
 
     for candidate in candidates:
-        price = _get_price_on_or_before(symbol=candidate, date=date)
+        price = get_price_eur_on_or_before(
+            symbol=candidate,
+            as_of_date=date,
+            prices_folder=PRICES_FOLDER,
+            fallback_to_oldest=False,
+        )
         if price is not None:
             return abs(quantity) * price
 
@@ -365,13 +326,16 @@ def _apply_aave_overlay(
 
 
 def compose_base_ingredients(chain: str) -> Path:
-    _load_price_history.cache_clear()
+    clear_price_cache()
 
-    snapshots_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_snapshots.csv"
+    snapshots_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_raw_snapshots.csv"
     df = pd.read_csv(snapshots_path)
     df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
-    token_metadata = _load_token_metadata(chain=chain)
+    token_metadata = load_token_metadata(
+        chain=chain,
+        tokens_folder=TOKENS_FOLDER,
+    )
     symbol_family = build_symbol_family_map(token_metadata=token_metadata)
 
     ctx = ExpansionContext(
