@@ -8,6 +8,11 @@ import pandas as pd
 from blockchain_reader.datetime_utils import format_daily_datetime, parse_daily_datetime
 from blockchain_reader.shared.prices import clear_price_cache, get_price_eur_on_or_before
 from blockchain_reader.shared.token_metadata import load_token_metadata
+from blockchain_reader.shared.valuation_routes import (
+    ValuationRoute,
+    build_symbol_protocol_map,
+    classify_valuation_route,
+)
 from blockchain_reader.symbols import (
     build_known_canonical_symbols,
     build_symbol_family_map,
@@ -23,16 +28,34 @@ from file_paths import (
 
 DUST = Decimal("0.000000000001")
 VALUE_DUST_EUR = Decimal("0.01")
+AAVE_SYMBOL_ALIASES: dict[str, str] = {"USD0": "USDT", "USDT0": "USDT", "USDT": "USDT"}
 
 
 @dataclass(frozen=True)
 class ExpansionContext:
     chain: str
     protocol_rows: dict[str, pd.DataFrame]
+    symbol_protocol: dict[str, str]
+    protocol_derived_symbols: set[str]
     symbol_family: dict[str, str]
     aave_overlay: pd.DataFrame | None
     aave_wrapper_symbols: set[str]
     known_symbols: set[str]
+
+
+def _normalize_aave_symbol(symbol: str) -> str:
+    normalized = sanitize_symbol(symbol)
+    if not normalized:
+        return ""
+    return AAVE_SYMBOL_ALIASES.get(normalized.upper(), normalized)
+
+
+def _resolve_route(symbol: str, ctx: ExpansionContext) -> ValuationRoute:
+    return classify_valuation_route(
+        symbol=symbol,
+        symbol_protocol=ctx.symbol_protocol,
+        protocol_derived_symbols=ctx.protocol_derived_symbols,
+    )
 
 
 def _load_aave_wrapper_symbols(token_metadata: dict[str, dict[str, object]]) -> set[str]:
@@ -60,7 +83,9 @@ def _load_protocol_rows(chain: str) -> dict[str, pd.DataFrame]:
             f"{chain}_base_ingredients.csv",
         ):
             continue
-        symbol = csv_path.stem[len(chain) + 1 :]
+        symbol = sanitize_symbol(csv_path.stem[len(chain) + 1 :])
+        if not symbol:
+            continue
         df = pd.read_csv(csv_path)
         if "date" not in df.columns:
             continue
@@ -96,21 +121,28 @@ def _estimate_value_eur(
     symbol: str,
     quantity: Decimal,
     date: pd.Timestamp,
+    chain: str,
     symbol_family: dict[str, str],
+    route: ValuationRoute,
 ) -> Decimal | None:
     normalized_symbol = sanitize_symbol(symbol)
     canonical_symbol = canonicalize_symbol(normalized_symbol, symbol_family=symbol_family)
 
-    candidates: list[str] = []
-    for candidate in (normalized_symbol, canonical_symbol):
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
+    candidates = [normalized_symbol]
+    if (
+        route == ValuationRoute.DIRECT
+        and canonical_symbol
+        and canonical_symbol != normalized_symbol
+    ):
+        candidates.append(canonical_symbol)
 
     for candidate in candidates:
         price = get_price_eur_on_or_before(
             symbol=candidate,
             as_of_date=date,
             prices_folder=PRICES_FOLDER,
+            chain=chain,
+            use_lp_prices=route == ValuationRoute.PROTOCOL_DERIVED,
             fallback_to_oldest=False,
         )
         if price is not None:
@@ -153,8 +185,11 @@ def _filter_composed_quantities(
             continue
 
         normalized_symbol = sanitize_symbol(symbol)
+        route = _resolve_route(symbol=normalized_symbol, ctx=ctx)
         canonical_symbol = canonicalize_symbol(normalized_symbol, symbol_family=ctx.symbol_family)
-        output_symbol = canonical_symbol or normalized_symbol
+        output_symbol = normalized_symbol
+        if route == ValuationRoute.DIRECT:
+            output_symbol = canonical_symbol or normalized_symbol
         if not output_symbol:
             continue
 
@@ -162,7 +197,9 @@ def _filter_composed_quantities(
             symbol=output_symbol,
             quantity=qty,
             date=date,
+            chain=ctx.chain,
             symbol_family=ctx.symbol_family,
+            route=route,
         )
         is_known = not ctx.known_symbols or (
             normalized_symbol in ctx.known_symbols or canonical_symbol in ctx.known_symbols
@@ -189,13 +226,21 @@ def _filter_composed_quantities(
         else:
             if abs(qty) <= DUST:
                 continue
+            reason = "known_symbol_missing_price"
+            action = "add direct price file or direct symbol metadata"
+            if route == ValuationRoute.PROTOCOL_DERIVED:
+                reason = "protocol_symbol_missing_price"
+                action = "run protocol pipeline or add protocol adapter"
+            if route == ValuationRoute.AAVE:
+                reason = "aave_symbol_missing_overlay_price"
+                action = "fix aave overlay mapping, then rerun aave/composer"
             exceptions.append(
                 _build_exception_row(
                     date=date,
                     symbol=output_symbol,
                     quantity=qty,
-                    reason="known_symbol_missing_price",
-                    action="add price file or price_source mapping",
+                    reason=reason,
+                    action=action,
                     estimated_value_eur=estimated_value_eur,
                 )
             )
@@ -220,8 +265,11 @@ def _expand_symbol(
     depth: int = 0,
 ) -> None:
     normalized_symbol = sanitize_symbol(symbol)
-    terminal_symbol = canonicalize_symbol(normalized_symbol, symbol_family=ctx.symbol_family)
-    terminal_symbol = terminal_symbol or normalized_symbol
+    route = _resolve_route(symbol=normalized_symbol, ctx=ctx)
+    terminal_symbol = normalized_symbol
+    if route == ValuationRoute.DIRECT:
+        terminal_symbol = canonicalize_symbol(normalized_symbol, symbol_family=ctx.symbol_family)
+        terminal_symbol = terminal_symbol or normalized_symbol
 
     if depth > 8:
         if terminal_symbol:
@@ -286,7 +334,7 @@ def _apply_aave_overlay(
             dust_value_count += 1
             continue
         raw_symbol = column.replace("net_", "", 1)
-        normalized_symbol = sanitize_symbol(raw_symbol)
+        normalized_symbol = _normalize_aave_symbol(raw_symbol)
         canonical_symbol = canonicalize_symbol(raw_symbol, symbol_family=ctx.symbol_family)
         if not normalized_symbol:
             unknown_symbol_count += 1
@@ -310,7 +358,9 @@ def _apply_aave_overlay(
                 symbol=normalized_symbol,
                 quantity=numeric_value,
                 date=date,
+                chain=ctx.chain,
                 symbol_family=ctx.symbol_family,
+                route=ValuationRoute.DIRECT,
             )
             if estimated_value_eur is None or estimated_value_eur >= VALUE_DUST_EUR:
                 exceptions.append(
@@ -348,10 +398,13 @@ def compose_base_ingredients(chain: str) -> Path:
         tokens_folder=TOKENS_FOLDER,
     )
     symbol_family = build_symbol_family_map(token_metadata=token_metadata)
+    protocol_rows = _load_protocol_rows(chain=chain)
 
     ctx = ExpansionContext(
         chain=chain,
-        protocol_rows=_load_protocol_rows(chain=chain),
+        protocol_rows=protocol_rows,
+        symbol_protocol=build_symbol_protocol_map(token_metadata=token_metadata),
+        protocol_derived_symbols=set(protocol_rows.keys()),
         symbol_family=symbol_family,
         aave_overlay=_load_aave_overlay(chain=chain),
         aave_wrapper_symbols=_load_aave_wrapper_symbols(token_metadata=token_metadata),

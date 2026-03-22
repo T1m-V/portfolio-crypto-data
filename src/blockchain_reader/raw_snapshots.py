@@ -15,6 +15,11 @@ from blockchain_reader.shared.prices import (
     get_price_eur_on_or_before,
 )
 from blockchain_reader.shared.token_metadata import load_token_metadata
+from blockchain_reader.shared.valuation_routes import (
+    ValuationRoute,
+    build_symbol_protocol_map,
+    classify_valuation_route,
+)
 from blockchain_reader.symbols import canonicalize_symbol, sanitize_symbol
 from file_paths import (
     BLOCKCHAIN_SNAPSHOT_FOLDER,
@@ -27,7 +32,12 @@ from historical_transactions.portfolio_snapshots import get_forex_rate
 MAX_INVALID_DATE_RATIO = 0.1
 
 
-def get_crypto_price(coin: str, date: str) -> float:
+def get_crypto_price(
+    coin: str,
+    date: str,
+    chain: str,
+    use_lp_prices: bool = False,
+) -> float:
     """Retrieves exchange rate of a specific coin on a date.
 
     Args:
@@ -41,6 +51,8 @@ def get_crypto_price(coin: str, date: str) -> float:
         symbol=coin,
         as_of_date=date,
         prices_folder=PRICES_FOLDER,
+        chain=chain,
+        use_lp_prices=use_lp_prices,
         fallback_to_oldest=False,
     )
     if price is not None:
@@ -50,6 +62,8 @@ def get_crypto_price(coin: str, date: str) -> float:
         symbol=coin,
         as_of_date=date,
         prices_folder=PRICES_FOLDER,
+        chain=chain,
+        use_lp_prices=use_lp_prices,
         fallback_to_oldest=True,
     )
     if oldest_price is not None:
@@ -66,6 +80,8 @@ class CryptoPosition:
     """Tracks the running state and calculations of a single crypto position."""
 
     coin: str
+    chain: str
+    valuation_route: ValuationRoute
     quantity: Decimal = Decimal(0)
     principal: float = 0.0
     family_proxy: "CryptoPosition | None" = None
@@ -93,17 +109,32 @@ class CryptoPosition:
 
     def receive(self, amount_received: Decimal, date: str):
         self.quantity += amount_received
-        price = get_crypto_price(self.price_source, date)
+        price = get_crypto_price(
+            coin=self.price_source,
+            date=date,
+            chain=self.chain,
+            use_lp_prices=self.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
+        )
         self.adjust_principal(float(amount_received) * price)
 
     def send(self, amount_sent: Decimal, date: str):
         self.quantity -= amount_sent
-        price = get_crypto_price(self.price_source, date)
+        price = get_crypto_price(
+            coin=self.price_source,
+            date=date,
+            chain=self.chain,
+            use_lp_prices=self.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
+        )
         self.adjust_principal(-(float(amount_sent) * price))
 
     def reward(self, amount_received: Decimal, source_asset: "CryptoPosition", date: str):
         self.quantity += amount_received
-        price = get_crypto_price(self.price_source, date)
+        price = get_crypto_price(
+            coin=self.price_source,
+            date=date,
+            chain=self.chain,
+            use_lp_prices=self.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
+        )
         invested = float(amount_received) * price
         self.adjust_principal(invested)
         source_asset.adjust_principal(-invested)
@@ -133,6 +164,7 @@ class CryptoTracker:
         )
         self.symbol_to_meta: dict[str, dict[str, Any]] = {}
         self.symbol_family: dict[str, str] = {}
+        self.symbol_protocol = build_symbol_protocol_map(token_metadata=self.token_metadata)
 
         for meta in self.token_metadata.values():
             symbol = sanitize_symbol(meta.get("symbol"))
@@ -154,20 +186,33 @@ class CryptoTracker:
         asset_key = normalized_coin or str(coin).strip()
         if asset_key not in self.assets:
             meta = self.symbol_to_meta.get(asset_key)
+            route = classify_valuation_route(
+                symbol=asset_key,
+                symbol_protocol=self.symbol_protocol,
+            )
 
-            price_source = sanitize_symbol(meta.get("price_source")) if meta else ""
+            price_source = ""
+            if route == ValuationRoute.DIRECT and meta:
+                price_source = sanitize_symbol(meta.get("price_source"))
             if not price_source:
                 price_source = asset_key
 
-            family_coin = canonicalize_symbol(
-                meta.get("family") if meta else asset_key,
-                symbol_family=self.symbol_family,
-            )
-            if not family_coin:
-                family_coin = asset_key
+            family_coin = asset_key
+            if route == ValuationRoute.DIRECT:
+                family_coin = canonicalize_symbol(
+                    meta.get("family") if meta else asset_key,
+                    symbol_family=self.symbol_family,
+                )
+                if not family_coin:
+                    family_coin = asset_key
 
-            self.assets[asset_key] = CryptoPosition(coin=asset_key, price_source=price_source)
-            if family_coin != asset_key:
+            self.assets[asset_key] = CryptoPosition(
+                coin=asset_key,
+                chain=self.chain,
+                valuation_route=route,
+                price_source=price_source,
+            )
+            if route == ValuationRoute.DIRECT and family_coin != asset_key:
                 self.assets[asset_key].family_proxy = self.fetch_asset(family_coin)
 
         return self.assets[asset_key]
@@ -186,7 +231,12 @@ class CryptoTracker:
 
         for entry in ins:
             asset = self.fetch_asset(entry.token)
-            price = get_crypto_price(asset.price_source, date)
+            price = get_crypto_price(
+                coin=asset.price_source,
+                date=date,
+                chain=self.chain,
+                use_lp_prices=asset.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
+            )
             val = price * float(entry.quantity)
             total_in_value_eur += val
             entry.val = val
@@ -195,7 +245,12 @@ class CryptoTracker:
         total_out_value_eur = 0.0
         for entry in outs:
             asset = self.fetch_asset(entry.token)
-            price = get_crypto_price(asset.price_source, date)
+            price = get_crypto_price(
+                coin=asset.price_source,
+                date=date,
+                chain=self.chain,
+                use_lp_prices=asset.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
+            )
             val = price * float(entry.quantity)
             total_out_value_eur += val
             entry.val = val
@@ -236,7 +291,12 @@ class CryptoTracker:
 
         for entry_in in rewards:
             asset_in = self.fetch_asset(entry_in.token)
-            price = get_crypto_price(asset_in.price_source, date)
+            price = get_crypto_price(
+                coin=asset_in.price_source,
+                date=date,
+                chain=self.chain,
+                use_lp_prices=asset_in.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
+            )
             invested = float(entry_in.quantity) * price
 
             asset_in.quantity += entry_in.quantity
@@ -281,7 +341,12 @@ class CryptoTracker:
             if fee_qty > 0:
                 fee_asset = self.fetch_asset(str(fee_token))
 
-                fee_price = get_crypto_price(coin=fee_asset.price_source, date=date)
+                fee_price = get_crypto_price(
+                    coin=fee_asset.price_source,
+                    date=date,
+                    chain=self.chain,
+                    use_lp_prices=fee_asset.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
+                )
                 fee_val_eur = float(fee_qty) * fee_price
 
                 # 1. Deduct from Fee Asset (Qty decreases, Principal decreases)

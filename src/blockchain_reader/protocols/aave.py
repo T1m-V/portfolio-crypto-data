@@ -79,6 +79,7 @@ ERC20_ABI = [
 ]
 
 DUST = Decimal("0.000000000001")
+AAVE_UNDERLYING_ALIASES: dict[str, str] = {"USD0": "USDT", "USDT0": "USDT", "USDT": "USDT"}
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,13 @@ def _classify_aave_leg(symbol: str) -> str:
     if symbol.lower().startswith("variabledebt"):
         return "debt"
     return "supply"
+
+
+def _normalize_aave_underlying_symbol(symbol: str) -> str:
+    normalized = sanitize_symbol(symbol)
+    if not normalized:
+        return ""
+    return AAVE_UNDERLYING_ALIASES.get(normalized.upper(), normalized)
 
 
 def _compute_leg_columns(
@@ -165,6 +173,7 @@ def _build_aave_descriptors(
                 underlying_symbol = canonicalize_symbol(
                     raw_underlying_symbol, symbol_family=symbol_family
                 )
+            underlying_symbol = _normalize_aave_underlying_symbol(underlying_symbol)
             if not underlying_symbol:
                 underlying_symbol = f"UNK_{str(underlying_address)[:8]}"
 

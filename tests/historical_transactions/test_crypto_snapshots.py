@@ -8,6 +8,19 @@ from blockchain_reader.raw_snapshots import CryptoTracker
 
 
 class TestCryptoSnapshots:
+    def test_protocol_symbols_do_not_use_family_proxy_in_raw_snapshots(self) -> None:
+        tracker = CryptoTracker(
+            chain="arbitrum",
+            token_metadata={
+                "0xwrap": {"symbol": "WRAP", "family": "ETH", "protocol": "beefy"},
+                "0xeth": {"symbol": "ETH"},
+            },
+        )
+
+        wrap = tracker.fetch_asset("WRAP")
+        assert wrap.family_proxy is None
+        assert wrap.price_source == "WRAP"
+
     def test_plain_reward_does_not_create_fake_reward_asset(self) -> None:
         tracker = CryptoTracker(chain="arbitrum", token_metadata={})
         row = pd.Series(

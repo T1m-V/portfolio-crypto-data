@@ -9,8 +9,19 @@ from typing import Any
 
 import pandas as pd
 
+from blockchain_reader.shared.prices import STABLE_PRICE_SYMBOLS
+from blockchain_reader.shared.valuation_routes import (
+    ValuationRoute,
+    build_symbol_protocol_map,
+    classify_valuation_route,
+)
 from blockchain_reader.symbols import sanitize_symbol
-from file_paths import PRICES_FOLDER, PROTOCOL_UNDERLYING_TOKEN_FOLDER, TOKENS_FOLDER
+from file_paths import (
+    PRICES_FOLDER,
+    PROTOCOL_UNDERLYING_TOKEN_FOLDER,
+    TOKENS_FOLDER,
+    get_lp_price_file_path,
+)
 from price_history.price_data_utils import load_price_csv, merge_price_frames, save_price_csv
 
 DUST = Decimal("0.000000000001")
@@ -21,12 +32,16 @@ MAX_RECURSION_DEPTH = 10
 class SymbolMetadata:
     price_source: str
     family: str
+    protocol: str
 
 
 @dataclass
 class PricingContext:
+    chain: str
     symbol_metadata: dict[str, SymbolMetadata]
+    symbol_protocol: dict[str, str]
     protocol_rows: dict[str, pd.DataFrame]
+    protocol_derived_symbols: set[str]
     price_cache: dict[str, pd.DataFrame]
 
 
@@ -80,18 +95,22 @@ def _build_symbol_metadata(token_metadata: dict[str, dict[str, Any]]) -> dict[st
 
         price_source = sanitize_symbol(meta.get("price_source"))
         family = sanitize_symbol(meta.get("family"))
-        current = merged.get(symbol, {"price_source": "", "family": ""})
+        protocol = sanitize_symbol(meta.get("protocol")).lower()
+        current = merged.get(symbol, {"price_source": "", "family": "", "protocol": ""})
 
         if not current["price_source"] and price_source:
             current["price_source"] = price_source
         if not current["family"] and family:
             current["family"] = family
+        if not current["protocol"] and protocol:
+            current["protocol"] = protocol
         merged[symbol] = current
 
     return {
         symbol: SymbolMetadata(
             price_source=meta["price_source"],
             family=meta["family"],
+            protocol=meta["protocol"],
         )
         for symbol, meta in merged.items()
     }
@@ -131,7 +150,17 @@ def _load_price_history(symbol: str, ctx: PricingContext) -> pd.DataFrame:
     if symbol in ctx.price_cache:
         return ctx.price_cache[symbol]
 
-    frame = load_price_csv(file_path=PRICES_FOLDER / f"{symbol}.csv")
+    if symbol in ctx.protocol_derived_symbols:
+        frame = load_price_csv(
+            file_path=get_lp_price_file_path(
+                chain=ctx.chain,
+                symbol=symbol,
+                prices_folder=PRICES_FOLDER,
+            )
+        )
+    else:
+        frame = load_price_csv(file_path=PRICES_FOLDER / f"{symbol}.csv")
+
     if frame.empty:
         ctx.price_cache[symbol] = frame
         return frame
@@ -144,6 +173,10 @@ def _load_price_history(symbol: str, ctx: PricingContext) -> pd.DataFrame:
 
 
 def _price_from_history(symbol: str, target_date: date, ctx: PricingContext) -> Decimal | None:
+    stable_price = STABLE_PRICE_SYMBOLS.get(symbol)
+    if stable_price is not None:
+        return stable_price
+
     history = _load_price_history(symbol=symbol, ctx=ctx)
     if history.empty:
         return None
@@ -230,9 +263,24 @@ def resolve_symbol_price(
     if depth > MAX_RECURSION_DEPTH:
         return None
 
+    route = classify_valuation_route(
+        symbol=normalized,
+        symbol_protocol=ctx.symbol_protocol,
+        protocol_derived_symbols=ctx.protocol_derived_symbols,
+    )
+
     direct = _price_from_history(symbol=normalized, target_date=target_date, ctx=ctx)
     if direct is not None:
         return direct
+
+    if route == ValuationRoute.PROTOCOL_DERIVED:
+        return _resolve_from_protocol(
+            symbol=normalized,
+            target_date=target_date,
+            ctx=ctx,
+            visited=visited or set(),
+            depth=depth,
+        )
 
     metadata = ctx.symbol_metadata.get(normalized)
     if metadata and metadata.price_source and metadata.price_source != normalized:
@@ -244,7 +292,12 @@ def resolve_symbol_price(
         if source_price is not None:
             return source_price
 
-    if metadata and metadata.family and metadata.family not in {normalized, metadata.price_source}:
+    if (
+        route == ValuationRoute.DIRECT
+        and metadata
+        and metadata.family
+        and metadata.family not in {normalized, metadata.price_source}
+    ):
         family_price = _price_from_history(
             symbol=metadata.family,
             target_date=target_date,
@@ -289,12 +342,16 @@ def generate_protocol_lp_price_files(chain: str) -> list[Path]:
         chain: Chain identifier used for protocol-underlying file discovery.
 
     returns:
-        List of updated price CSV paths in data/prices.
+        List of updated price CSV paths in data/prices/lp_prices/<chain>.
     """
     token_metadata = _load_token_metadata(chain=chain)
+    protocol_rows = _load_protocol_rows(chain=chain)
     ctx = PricingContext(
+        chain=chain,
         symbol_metadata=_build_symbol_metadata(token_metadata=token_metadata),
-        protocol_rows=_load_protocol_rows(chain=chain),
+        symbol_protocol=build_symbol_protocol_map(token_metadata=token_metadata),
+        protocol_rows=protocol_rows,
+        protocol_derived_symbols=set(protocol_rows.keys()),
         price_cache={},
     )
 
@@ -304,7 +361,12 @@ def generate_protocol_lp_price_files(chain: str) -> list[Path]:
         if incoming.empty:
             continue
 
-        output_path = PRICES_FOLDER / f"{symbol}.csv"
+        output_path = get_lp_price_file_path(
+            chain=chain,
+            symbol=symbol,
+            prices_folder=PRICES_FOLDER,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         existing = load_price_csv(file_path=output_path)
         merged = merge_price_frames(existing=existing, incoming=incoming)
         save_price_csv(file_path=output_path, frame=merged)
