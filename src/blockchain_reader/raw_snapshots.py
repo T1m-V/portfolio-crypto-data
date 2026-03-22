@@ -1,10 +1,15 @@
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from blockchain_reader.datetime_utils import (
+    format_daily_datetime,
+    parse_transaction_datetime_series,
+)
 from blockchain_reader.shared.prices import (
     STABLE_PRICE_SYMBOLS,
     get_price_eur_on_or_before,
@@ -18,6 +23,8 @@ from file_paths import (
     TOKENS_FOLDER,
 )
 from historical_transactions.portfolio_snapshots import get_forex_rate
+
+MAX_INVALID_DATE_RATIO = 0.1
 
 
 def get_crypto_price(coin: str, date: str) -> float:
@@ -140,7 +147,7 @@ class CryptoTracker:
         self.assets: dict[str, CryptoPosition] = {}
         self.history: list[dict] = []
         self.daily_coin_cache: dict[str, int] = {}
-        self.current_date: str | None = None
+        self.current_date: date | None = None
 
     def fetch_asset(self, coin: str) -> CryptoPosition:
         normalized_coin = sanitize_symbol(coin)
@@ -418,14 +425,27 @@ class CryptoTracker:
 
     def save_to_csv(self, output_path: Path):
         df = pd.DataFrame(self.history)
-        df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"])
+        df["Date"] = df["Date"].map(format_daily_datetime)
         df.to_csv(output_path, index=False)
         print(f"Portfolio snapshots successfully saved to {output_path}")
 
 
 def generate_raw_snapshots(input_csv: Path, output_csv: Path, chain: str) -> None:
     df = pd.read_csv(input_csv, dtype=str)
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
+    parsed_dates = parse_transaction_datetime_series(df["Date"])
+    invalid_date_count = int(parsed_dates.isna().sum())
+    total_rows = len(df)
+    if total_rows > 0 and (invalid_date_count / total_rows) > MAX_INVALID_DATE_RATIO:
+        raise ValueError(
+            f"Aborting snapshot generation: invalid dates={invalid_date_count}/{total_rows} "
+            f"({invalid_date_count / total_rows:.1%})."
+        )
+    if invalid_date_count:
+        print(f"[raw_snapshots] Dropping {invalid_date_count} rows with invalid Date values.")
+
+    df["Date"] = parsed_dates
     df = df.dropna(subset=["Date"])
     df = df.sort_values(by=["Date"], ascending=True)
 

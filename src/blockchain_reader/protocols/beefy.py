@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from web3 import Web3
 
+from blockchain_reader.datetime_utils import format_daily_datetime
 from blockchain_reader.protocols.common import (
     load_block_map,
     load_chain_web3,
@@ -131,7 +132,7 @@ def get_beefy_history(
 
     current_dt = start_dt
     while current_dt <= end_dt:
-        date_str = current_dt.strftime("%Y-%m-%d")
+        date_str = format_daily_datetime(current_dt)
         if date_str not in block_map:
             current_dt += timedelta(days=1)
             continue
@@ -149,7 +150,7 @@ def get_beefy_history(
             assets = get_beefy_underlying(w3, vault, one_unit, block_num)
 
             row = {
-                "date": current_dt.date(),
+                "date": format_daily_datetime(current_dt),
                 "block": block_num,
                 "moo_balance": 1.0,  # Representing 1 unit of the vault token
             }
@@ -185,7 +186,7 @@ def process_all_beefy_tokens(chain: str, start_date: str | None = None) -> None:
             continue
 
         rng = token_ranges[symbol]
-        fallback_start_date = rng["start"].strftime("%Y-%m-%d")
+        fallback_start_date = format_daily_datetime(rng["start"])
         resolved_start_date = resolve_effective_start_date(
             protocol="beefy",
             chain=chain,
@@ -193,7 +194,7 @@ def process_all_beefy_tokens(chain: str, start_date: str | None = None) -> None:
             explicit_start_date=start_date,
             fallback_start_date=fallback_start_date,
         )
-        end_date = "now" if rng["qty"] > 0 else rng["end"].strftime("%Y-%m-%d")
+        end_date = "now" if rng["qty"] > 0 else format_daily_datetime(rng["end"])
         if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
             print(f"[beefy] Skipping {symbol}: start={resolved_start_date} is after end={end_date}")
             continue

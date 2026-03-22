@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from web3 import Web3
 
+from blockchain_reader.datetime_utils import format_daily_datetime
 from blockchain_reader.protocols.common import (
     load_block_map,
     load_chain_web3,
@@ -186,7 +187,7 @@ def get_balancer_history(
     current_dt = start_dt
     while current_dt <= end_dt:
         # 1. Find Block
-        date_str = current_dt.strftime("%Y-%m-%d")
+        date_str = format_daily_datetime(current_dt)
 
         if date_str in block_map:
             block_num = block_map[date_str]
@@ -215,7 +216,7 @@ def get_balancer_history(
 
             # 3. Save
             row = {
-                "date": current_dt.date(),
+                "date": format_daily_datetime(current_dt),
                 "block": block_num,
                 "bpt_balance": float(Decimal(value=10**bpt_decimals) / Decimal(value=10**18)),
             }
@@ -260,7 +261,7 @@ def process_all_balancer_tokens(chain: str, start_date: str | None = None) -> No
             continue
 
         rng = token_ranges[symbol]
-        fallback_start_date = rng["start"].strftime("%Y-%m-%d")
+        fallback_start_date = format_daily_datetime(rng["start"])
         resolved_start_date = resolve_effective_start_date(
             protocol="balancer",
             chain=chain,
@@ -268,7 +269,7 @@ def process_all_balancer_tokens(chain: str, start_date: str | None = None) -> No
             explicit_start_date=start_date,
             fallback_start_date=fallback_start_date,
         )
-        end_date = "now" if rng["qty"] > 0 else rng["end"].strftime("%Y-%m-%d")
+        end_date = "now" if rng["qty"] > 0 else format_daily_datetime(rng["end"])
         if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
             print(
                 f"[balancer] Skipping {symbol}: start={resolved_start_date} is after end={end_date}"

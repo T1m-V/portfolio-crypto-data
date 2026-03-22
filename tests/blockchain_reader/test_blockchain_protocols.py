@@ -262,9 +262,9 @@ class TestBlockchainProtocols:
 
         assert queried_blocks == [11, 12, 13]
         assert [row["date"] for row in history] == [
-            date(2026, 1, 1),
-            date(2026, 1, 2),
-            date(2026, 1, 3),
+            "2026-01-01 00:00:00",
+            "2026-01-02 00:00:00",
+            "2026-01-03 00:00:00",
         ]
         assert history[-1]["rpc_error_count"] == 0
 
@@ -289,9 +289,9 @@ class TestBlockchainProtocols:
         )
 
         assert queried_blocks == [11, 12, 13, 14]
-        assert history[2]["date"] == date(2026, 1, 3)
+        assert history[2]["date"] == "2026-01-03 00:00:00"
         assert history[2]["rpc_error_count"] == 1
-        assert history[-1]["date"] == date(2026, 1, 4)
+        assert history[-1]["date"] == "2026-01-04 00:00:00"
 
     def test_read_curve_pool_tokens_returns_dataclass_list_and_stops_on_revert(self) -> None:
         pool_address = "0xpool"
@@ -367,7 +367,7 @@ class TestBlockchainProtocols:
                 explicit_start_date=None,
                 fallback_start_date="2026-01-01",
             )
-        assert result == "2026-01-06"
+        assert result == "2026-01-06 00:00:00"
 
     def test_resolve_effective_start_date_respects_explicit_start(self) -> None:
         with patch(
@@ -381,7 +381,7 @@ class TestBlockchainProtocols:
                 explicit_start_date="2025-09-01",
                 fallback_start_date="2026-01-01",
             )
-        assert result == "2025-09-01"
+        assert result == "2025-09-01 00:00:00"
 
     def test_resolve_effective_start_date_uses_fallback_without_existing_output(self) -> None:
         with patch(
@@ -395,7 +395,7 @@ class TestBlockchainProtocols:
                 explicit_start_date=None,
                 fallback_start_date="2026-01-01",
             )
-        assert result == "2026-01-01"
+        assert result == "2026-01-01 00:00:00"
 
     def test_resolve_effective_start_date_clamps_to_fallback_floor(self) -> None:
         with patch(
@@ -409,7 +409,7 @@ class TestBlockchainProtocols:
                 explicit_start_date=None,
                 fallback_start_date="2026-01-10",
             )
-        assert result == "2026-01-10"
+        assert result == "2026-01-10 00:00:00"
 
     def test_write_protocol_history_csv_merges_rows_and_keeps_existing_overlap(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -459,7 +459,11 @@ class TestBlockchainProtocols:
                 rows = list(reader)
                 assert reader.fieldnames == ["date", "block", "asset_A", "asset_B", "legacy_col"]
 
-            assert [row["date"] for row in rows] == ["2026-01-01", "2026-01-02", "2026-01-03"]
+            assert [row["date"] for row in rows] == [
+                "2026-01-01 00:00:00",
+                "2026-01-02 00:00:00",
+                "2026-01-03 00:00:00",
+            ]
             assert rows[1]["block"] == "20"
             assert rows[1]["legacy_col"] == "keep2"
             assert rows[2]["block"] == "30"
@@ -576,7 +580,7 @@ class TestBlockchainProtocols:
             ),
             patch(
                 "blockchain_reader.protocols.liquid_staking.load_block_map",
-                return_value={"2026-01-01": 11, "2026-01-02": 12},
+                return_value={"2026-01-01 00:00:00": 11, "2026-01-02 00:00:00": 12},
             ),
             patch(
                 "blockchain_reader.protocols.liquid_staking.write_protocol_history_csv",
@@ -594,7 +598,10 @@ class TestBlockchainProtocols:
 
         history = write_mock.call_args.kwargs["history_data"]
         assert rate_provider.rate_call_blocks == [11, 12]
-        assert [row["date"] for row in history] == [date(2026, 1, 1), date(2026, 1, 2)]
+        assert [row["date"] for row in history] == [
+            "2026-01-01 00:00:00",
+            "2026-01-02 00:00:00",
+        ]
         assert history[0]["lst_balance"] == 1.0
         assert history[0]["asset_ETH"] == 1.1
         assert history[1]["asset_ETH"] == 1.12
@@ -653,7 +660,7 @@ class TestBlockchainProtocols:
         ):
             liquid_staking.process_all_liquid_staking_tokens(chain="arbitrum")
 
-        assert resolve_start_mock.call_args.kwargs["fallback_start_date"] == "2024-01-15"
+        assert resolve_start_mock.call_args.kwargs["fallback_start_date"] == "2024-01-15 00:00:00"
 
     def test_process_all_liquid_staking_tokens_skips_unsupported_chain(self) -> None:
         with (
@@ -669,10 +676,10 @@ class TestBlockchainProtocols:
 
     def test_apply_aave_overlay_expands_lst_exposure_to_eth(self) -> None:
         lst_rows = pd.DataFrame([{"date": "2026-01-01", "asset_ETH": 1.03}])
-        lst_rows["date"] = pd.to_datetime(lst_rows["date"]).dt.date
+        lst_rows["date"] = pd.to_datetime(lst_rows["date"])
 
         overlay_rows = pd.DataFrame([{"date": "2026-01-01", "net_wstETH": 2.0, "net_UNKNOWN": 1.0}])
-        overlay_rows["date"] = pd.to_datetime(overlay_rows["date"]).dt.date
+        overlay_rows["date"] = pd.to_datetime(overlay_rows["date"])
 
         ctx = base_ingredients.ExpansionContext(
             chain="arbitrum",
@@ -755,6 +762,7 @@ class TestBlockchainProtocols:
             assert "aArbUSDC" not in set(result["Coin"])
             assert result.loc[result["Coin"] == "ETH", "Quantity"].iloc[0] == 1.0
             assert result.loc[result["Coin"] == "USDC", "Quantity"].iloc[0] == 2.5
+            assert result["Date"].str.endswith("00:00:00").all()
 
     def test_compose_base_ingredients_applies_dust_policy_and_writes_exceptions(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -812,6 +820,7 @@ class TestBlockchainProtocols:
             assert set(result["Coin"]) == {"MISSING", "USDC"}
             assert "ETH" not in set(result["Coin"])
             assert "UNK-0x10" not in set(result["Coin"])
+            assert result["Date"].str.endswith("00:00:00").all()
 
             exceptions = pd.read_csv(protocol_root / "arbitrum_base_ingredients_exceptions.csv")
             assert set(exceptions["Coin"]) == {"MISSING", "UNK-0x10"}

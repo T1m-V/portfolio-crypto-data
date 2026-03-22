@@ -27,7 +27,7 @@ def test_derive_start_date_uses_latest_date_with_overlap() -> None:
         ).to_csv(csv_path, index=False)
 
         derived = _derive_start_date(output_path=csv_path, overlap_days=1)
-        assert derived == "04/01/2026"
+        assert derived == "04/01/2026 00:00:00"
 
 
 def test_derive_start_date_handles_minute_precision() -> None:
@@ -38,7 +38,7 @@ def test_derive_start_date_handles_minute_precision() -> None:
         )
 
         derived = _derive_start_date(output_path=csv_path, overlap_days=1)
-        assert derived == "04/01/2026"
+        assert derived == "04/01/2026 00:00:00"
 
 
 def test_parse_transaction_datetime_series_mixed_formats() -> None:

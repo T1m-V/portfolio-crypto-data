@@ -11,12 +11,19 @@ import requests
 from tqdm.asyncio import tqdm_asyncio
 from web3 import Web3
 
+from blockchain_reader.datetime_utils import (
+    TRANSACTION_DATETIME_FORMAT,
+    parse_transaction_datetime,
+)
+from blockchain_reader.datetime_utils import (
+    parse_transaction_datetime_series as parse_transaction_datetime_series_compat,
+)
 from blockchain_reader.extraction.token_manager import TokenManager
 from blockchain_reader.extraction.transaction_analyzer import analyze_transaction
 from file_paths import BLOCKCHAIN_TRANSACTIONS_FOLDER, CHAIN_INFO_PATH, TOKENS_FOLDER
 
 ctx = Context(prec=78, rounding=ROUND_HALF_UP)
-DEFAULT_START_DATE = "01/01/2000"
+DEFAULT_START_DATE = "01/01/2000 00:00:00"
 OUTPUT_COLUMNS = [
     "TX Hash",
     "Date",
@@ -82,9 +89,18 @@ def _fetch_explorer_data(
 
 
 def _parse_input_date_to_utc(date_str: str, end_of_day: bool) -> datetime:
-    parsed = datetime.strptime(date_str, "%d/%m/%Y").replace(tzinfo=timezone.utc)
+    parsed = parse_transaction_datetime(date_str)
+    if parsed is None:
+        raise ValueError(f"Invalid date input: {date_str}")
+
+    text = str(date_str or "").strip()
+    has_explicit_time = " " in text
+    parsed = parsed.replace(tzinfo=timezone.utc)
+
+    if has_explicit_time:
+        return parsed
     if end_of_day:
-        return parsed.replace(hour=23, minute=59, second=59)
+        return parsed.replace(hour=23, minute=59, second=59, microsecond=0)
     return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
@@ -101,25 +117,13 @@ def _derive_start_date(output_path: str, overlap_days: int = 1) -> str:
         start_dt = (latest - timedelta(days=overlap_days)).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        return start_dt.strftime("%d/%m/%Y")
+        return start_dt.strftime(TRANSACTION_DATETIME_FORMAT)
     except (ValueError, KeyError, pd.errors.ParserError):
         return DEFAULT_START_DATE
 
 
 def _parse_transaction_datetime_series(series: pd.Series) -> pd.Series:
-    parsed = pd.to_datetime(series, format="%d/%m/%Y %H:%M:%S", errors="coerce")
-    missing = parsed.isna()
-
-    if missing.any():
-        parsed_alt = pd.to_datetime(series[missing], format="%d/%m/%Y %H:%M", errors="coerce")
-        parsed.loc[missing] = parsed_alt
-
-    missing = parsed.isna()
-    if missing.any():
-        parsed_fallback = pd.to_datetime(series[missing], dayfirst=True, errors="coerce")
-        parsed.loc[missing] = parsed_fallback
-
-    return parsed
+    return parse_transaction_datetime_series_compat(series=series)
 
 
 def _normalize_results_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -217,8 +221,8 @@ async def retrieve_transactions(
 
     args:
         chain: Chain identifier (e.g., 'arbitrum').
-        start_date: Start date (DD/MM/YYYY).
-        end_date: End date (DD/MM/YYYY).
+        start_date: Start date (DD/MM/YYYY HH:MM:SS; legacy formats supported).
+        end_date: End date (DD/MM/YYYY HH:MM:SS; legacy formats supported).
     """
     print(f"--- START PROCESSING: {chain.upper()} ---")
 
@@ -253,7 +257,7 @@ async def retrieve_transactions(
 
     # Determine dates if not provided
     if end_date is None:
-        end_date = datetime.now(tz=timezone.utc).strftime("%d/%m/%Y")
+        end_date = datetime.now(tz=timezone.utc).strftime(TRANSACTION_DATETIME_FORMAT)
 
     if start_date is None:
         start_date = _derive_start_date(output_path=output_path, overlap_days=1)

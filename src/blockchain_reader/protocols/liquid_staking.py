@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
 
+from blockchain_reader.datetime_utils import format_daily_datetime
 from blockchain_reader.protocols.common import (
     load_block_map,
     load_chain_web3,
@@ -50,9 +51,9 @@ def _resolve_fallback_start_date(
 ) -> str | None:
     rng = token_ranges.get(symbol)
     if rng is not None:
-        return rng["start"].strftime("%Y-%m-%d")
+        return format_daily_datetime(rng["start"])
     if block_map:
-        return min(block_map.keys())
+        return format_daily_datetime(min(block_map.keys()))
     return None
 
 
@@ -78,7 +79,7 @@ def get_liquid_staking_history(
 
     current_dt = start_dt
     while current_dt <= end_dt:
-        date_str = current_dt.strftime("%Y-%m-%d")
+        date_str = format_daily_datetime(current_dt)
         block_num = block_map.get(date_str)
         if block_num is None:
             current_dt += timedelta(days=1)
@@ -94,7 +95,7 @@ def get_liquid_staking_history(
             )
             ratio = Decimal(rate_raw) / Decimal(rate_scale)
             row: dict[str, object] = {
-                "date": current_dt.date(),
+                "date": format_daily_datetime(current_dt),
                 "block": block_num,
                 "lst_balance": 1.0,
                 f"asset_{underlying_symbol}": float(ratio),

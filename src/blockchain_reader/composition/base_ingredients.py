@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from blockchain_reader.datetime_utils import format_daily_datetime, parse_daily_datetime
 from blockchain_reader.shared.prices import clear_price_cache, get_price_eur_on_or_before
 from blockchain_reader.shared.token_metadata import load_token_metadata
 from blockchain_reader.symbols import (
@@ -63,7 +64,8 @@ def _load_protocol_rows(chain: str) -> dict[str, pd.DataFrame]:
         df = pd.read_csv(csv_path)
         if "date" not in df.columns:
             continue
-        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df["date"] = pd.to_datetime(df["date"].map(parse_daily_datetime), errors="coerce")
+        df = df.dropna(subset=["date"])
         protocol_rows[symbol] = df.sort_values("date")
     return protocol_rows
 
@@ -76,12 +78,14 @@ def _load_aave_overlay(chain: str) -> pd.DataFrame | None:
     df = pd.read_csv(overlay_path)
     if "date" not in df.columns:
         return None
-    df["date"] = pd.to_datetime(df["date"]).dt.date
+    df["date"] = pd.to_datetime(df["date"].map(parse_daily_datetime), errors="coerce")
+    df = df.dropna(subset=["date"])
     return df.sort_values("date")
 
 
 def _find_row_for_date(df: pd.DataFrame, date: pd.Timestamp) -> pd.Series | None:
-    eligible = df[df["date"] <= date.date()]
+    target = pd.to_datetime(date).normalize()
+    eligible = df[df["date"] <= target]
     if eligible.empty:
         return None
     return eligible.iloc[-1]
@@ -126,7 +130,7 @@ def _build_exception_row(
 ) -> dict[str, object]:
     estimated = float(estimated_value_eur) if estimated_value_eur is not None else ""
     return {
-        "Date": date.date(),
+        "Date": format_daily_datetime(date),
         "Coin": symbol,
         "Quantity": float(quantity),
         "Reason": reason,
@@ -196,7 +200,13 @@ def _filter_composed_quantities(
                 )
             )
 
-        rows.append({"Date": date.date(), "Coin": output_symbol, "Quantity": float(qty)})
+        rows.append(
+            {
+                "Date": format_daily_datetime(date),
+                "Coin": output_symbol,
+                "Quantity": float(qty),
+            }
+        )
 
     return rows, exceptions
 
@@ -330,7 +340,8 @@ def compose_base_ingredients(chain: str) -> Path:
 
     snapshots_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_raw_snapshots.csv"
     df = pd.read_csv(snapshots_path)
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True)
+    df["Date"] = pd.to_datetime(df["Date"].map(parse_daily_datetime), errors="coerce")
+    df = df.dropna(subset=["Date"])
     df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
     token_metadata = load_token_metadata(
         chain=chain,

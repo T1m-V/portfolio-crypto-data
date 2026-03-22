@@ -8,6 +8,11 @@ import pandas as pd
 from tqdm import tqdm
 from web3 import Web3
 
+from blockchain_reader.datetime_utils import (
+    TRANSACTION_DATETIME_FORMAT,
+    format_daily_datetime,
+    parse_daily_datetime,
+)
 from blockchain_reader.protocols.common import (
     load_block_map,
     load_chain_config,
@@ -184,20 +189,36 @@ def _build_aave_descriptors(
 
 
 def _sorted_block_days(block_map: dict[str, int]) -> list[tuple[str, int]]:
-    return sorted(block_map.items(), key=lambda x: x[0])
+    normalized: list[tuple[str, int]] = []
+    for raw_date, block_number in block_map.items():
+        parsed = parse_daily_datetime(raw_date)
+        if parsed is None:
+            continue
+        normalized.append((format_daily_datetime(parsed), block_number))
+    return sorted(normalized, key=lambda x: x[0])
 
 
 def _is_on_or_after_start_date(date_str: str, start_date: str | None = None) -> bool:
-    if start_date and date_str < start_date:
+    if start_date is None:
+        return True
+
+    current = parse_daily_datetime(date_str)
+    start = parse_daily_datetime(start_date)
+    if current is None or start is None:
         return False
-    return True
+    return current >= start
 
 
 def _parse_date_value(date_value: str) -> datetime | None:
     raw_value = str(date_value or "").strip()
     if not raw_value:
         return None
-    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+
+    for fmt in (
+        TRANSACTION_DATETIME_FORMAT,
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+    ):
         try:
             return datetime.strptime(raw_value, fmt)
         except ValueError:
@@ -270,8 +291,8 @@ def _derive_aave_bounds_from_transactions(chain: str) -> tuple[str | None, str |
             if latest is None or dt > latest:
                 latest = dt
 
-    start_date = earliest.strftime("%Y-%m-%d") if earliest else None
-    end_date = latest.strftime("%Y-%m-%d") if latest else None
+    start_date = format_daily_datetime(earliest) if earliest else None
+    end_date = format_daily_datetime(latest) if latest else None
 
     return start_date, end_date
 
@@ -279,6 +300,11 @@ def _derive_aave_bounds_from_transactions(chain: str) -> tuple[str | None, str |
 def get_aave_daily_exposure(
     chain: str, start_date: str | None = None, end_date: str | None = None
 ) -> None:
+    normalized_start_date = format_daily_datetime(start_date) if start_date else None
+    normalized_end_date = (
+        format_daily_datetime(end_date) if end_date and str(end_date).lower() != "now" else None
+    )
+
     cfg = load_chain_config(chain=chain)
     w3 = load_chain_web3(chain=chain)
     wallet = w3.to_checksum_address(cfg["my_address"])
@@ -307,7 +333,7 @@ def get_aave_daily_exposure(
     day_items = [
         (date_str, block_num)
         for date_str, block_num in _sorted_block_days(block_map=block_map)
-        if _is_on_or_after_start_date(date_str=date_str, start_date=start_date)
+        if _is_on_or_after_start_date(date_str=date_str, start_date=normalized_start_date)
     ]
 
     history: list[dict[str, object]] = []
@@ -362,7 +388,7 @@ def get_aave_daily_exposure(
             non_zero_net_days += 1
 
         row: dict[str, object] = {
-            "date": datetime.strptime(date_str, "%Y-%m-%d").date(),
+            "date": format_daily_datetime(date_str),
             "block": block_num,
             "queried_token_count": queried_token_count,
             "missing_contract_count": missing_contract_count,
@@ -379,7 +405,7 @@ def get_aave_daily_exposure(
         missing_contract_total += missing_contract_count
         day_progress.update(1)
 
-        is_post_end_day = end_date is not None and date_str > end_date
+        is_post_end_day = normalized_end_date is not None and date_str > normalized_end_date
         should_stop_after_day = (
             is_post_end_day
             and rpc_error_count == 0

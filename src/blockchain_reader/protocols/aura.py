@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from web3 import Web3
 
+from blockchain_reader.datetime_utils import format_daily_datetime
 from blockchain_reader.protocols.balancer import BALANCER_VAULT_ADDR, get_balancer_underlying
 from blockchain_reader.protocols.common import (
     load_block_map,
@@ -171,7 +172,7 @@ def get_aura_history(chain: str, token_address: str, start_date: str, end_date: 
 
     current_dt = start_dt
     while current_dt <= end_dt:
-        date_str = current_dt.strftime("%Y-%m-%d")
+        date_str = format_daily_datetime(current_dt)
         block_num = block_map.get(date_str)
         if block_num is None:
             current_dt += timedelta(days=1)
@@ -189,7 +190,7 @@ def get_aura_history(chain: str, token_address: str, start_date: str, end_date: 
                 block_number=block_num,
             )
             row: dict[str, object] = {
-                "date": current_dt.date(),
+                "date": format_daily_datetime(current_dt),
                 "block": block_num,
                 "aura_balance": 1.0,
             }
@@ -220,7 +221,7 @@ def process_all_aura_tokens(chain: str, start_date: str | None = None) -> None:
             continue
 
         rng = token_ranges[symbol]
-        fallback_start_date = rng["start"].strftime("%Y-%m-%d")
+        fallback_start_date = format_daily_datetime(rng["start"])
         resolved_start_date = resolve_effective_start_date(
             protocol="aura",
             chain=chain,
@@ -228,7 +229,7 @@ def process_all_aura_tokens(chain: str, start_date: str | None = None) -> None:
             explicit_start_date=start_date,
             fallback_start_date=fallback_start_date,
         )
-        end_date = "now" if rng["qty"] > 0 else rng["end"].strftime("%Y-%m-%d")
+        end_date = "now" if rng["qty"] > 0 else format_daily_datetime(rng["end"])
         if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
             print(f"[aura] Skipping {symbol}: start={resolved_start_date} is after end={end_date}")
             continue

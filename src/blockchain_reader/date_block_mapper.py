@@ -6,6 +6,11 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 from web3 import Web3
 
+from blockchain_reader.datetime_utils import (
+    format_daily_datetime,
+    parse_daily_datetime,
+    parse_transaction_datetime_series,
+)
 from file_paths import BLOCKCHAIN_BLOCK_MAP_FOLDER, BLOCKCHAIN_TRANSACTIONS_FOLDER, CHAIN_INFO_PATH
 
 
@@ -51,7 +56,7 @@ def get_earliest_tx_date(chain: str) -> datetime | None:
     try:
         df = pd.read_csv(filepath_or_buffer=tx_path)
         if "Date" in df.columns and not df.empty:
-            df["Date"] = pd.to_datetime(arg=df["Date"], dayfirst=True)
+            df["Date"] = parse_transaction_datetime_series(df["Date"])
             earliest = df["Date"].min()
             if pd.notna(earliest):
                 return earliest.to_pydatetime()
@@ -67,8 +72,8 @@ def map_blocks(chain: str, start_date: str | None = None, end_date: str | None =
 
     args:
         chain: The blockchain network name.
-        start_date: Start date (DD/MM/YYYY).
-        end_date: End date (DD/MM/YYYY).
+        start_date: Start date (second-precision datetime; legacy formats supported).
+        end_date: End date (second-precision datetime; legacy formats supported).
     """
     print(f"--- Starting Block Mapper for {chain} ---")
 
@@ -109,30 +114,45 @@ def map_blocks(chain: str, start_date: str | None = None, end_date: str | None =
         with open(file=map_file_path, mode="r") as f:
             reader = csv.DictReader(f=f)
             for row in reader:
-                block_map[row["date"]] = int(row["block"])
+                try:
+                    normalized = format_daily_datetime(row["date"])
+                    block_map[normalized] = int(row["block"])
+                except (TypeError, ValueError):
+                    continue
 
     # 3. Determine Date Range
     if end_date:
-        end_dt = datetime.strptime(end_date, "%d/%m/%Y").replace(
-            hour=23, minute=59, second=59, tzinfo=timezone.utc
-        )
+        parsed_end = parse_daily_datetime(end_date)
+        if parsed_end is None:
+            raise ValueError(f"Invalid end_date: {end_date}")
+        has_explicit_time = " " in str(end_date or "").strip()
+        if not has_explicit_time:
+            parsed_end = parsed_end.replace(hour=23, minute=59, second=59)
+        end_dt = parsed_end.replace(tzinfo=timezone.utc)
     else:
         end_dt = datetime.now(tz=timezone.utc)
 
     if start_date:
-        start_dt = datetime.strptime(start_date, "%d/%m/%Y").replace(
-            hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
-        )
+        parsed_start = parse_daily_datetime(start_date)
+        if parsed_start is None:
+            raise ValueError(f"Invalid start_date: {start_date}")
+        has_explicit_time = " " in str(start_date or "").strip()
+        if not has_explicit_time:
+            parsed_start = parsed_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_dt = parsed_start.replace(tzinfo=timezone.utc)
     elif block_map:
         # Default to oldest in map, or earliest tx, or hard default
         min_date_str = min(block_map.keys())
-        start_dt = datetime.strptime(min_date_str, "%Y-%m-%d").replace(
+        parsed_start = parse_daily_datetime(min_date_str)
+        if parsed_start is None:
+            raise ValueError(f"Invalid block-map date: {min_date_str}")
+        start_dt = parsed_start.replace(
             hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
         )
     else:
         derived_start = get_earliest_tx_date(chain=chain)
         if not derived_start:
-            derived_start = datetime.strptime("01/01/2000", "%d/%m/%Y")
+            derived_start = datetime.strptime("01/01/2000 00:00:00", "%d/%m/%Y %H:%M:%S")
 
         if derived_start.tzinfo is None:
             derived_start = derived_start.replace(tzinfo=timezone.utc)
@@ -144,13 +164,13 @@ def map_blocks(chain: str, start_date: str | None = None, end_date: str | None =
 
     # Optimization: Initialize search_low from existing map if possible
     # Find the highest block number for any date before start_dt
-    start_date_str = start_dt.strftime(format="%Y-%m-%d")
+    start_date_str = format_daily_datetime(start_dt)
     prev_blocks = [block for date, block in block_map.items() if date < start_date_str]
     if prev_blocks:
         search_low = max(prev_blocks)
 
     while current_dt <= end_dt:
-        date_str = current_dt.strftime(format="%Y-%m-%d")
+        date_str = format_daily_datetime(current_dt)
 
         if date_str in block_map:
             search_low = block_map[date_str]
@@ -162,8 +182,8 @@ def map_blocks(chain: str, start_date: str | None = None, end_date: str | None =
 
             # Optimization: Narrow search range based on recent history
             current_search_high = search_high
-            yesterday_str = (current_dt - timedelta(days=1)).strftime(format="%Y-%m-%d")
-            two_days_ago_str = (current_dt - timedelta(days=2)).strftime(format="%Y-%m-%d")
+            yesterday_str = format_daily_datetime(current_dt - timedelta(days=1))
+            two_days_ago_str = format_daily_datetime(current_dt - timedelta(days=2))
 
             if yesterday_str in block_map and two_days_ago_str in block_map:
                 diff = block_map[yesterday_str] - block_map[two_days_ago_str]
