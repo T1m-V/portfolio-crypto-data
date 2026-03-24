@@ -247,6 +247,27 @@ class TestBlockchainProtocols:
         assert aave._normalize_aave_underlying_symbol("USDT") == "USDT"
         assert aave._normalize_aave_underlying_symbol("wstETH") == "wstETH"
 
+    def test_merge_disappeared_symbol_zeroes_emits_one_day_clear_markers(self) -> None:
+        result = aave._merge_disappeared_symbol_zeroes(
+            leg_columns={
+                "supply_USDC": Decimal("3"),
+                "debt_USDC": Decimal("0"),
+                "net_USDC": Decimal("3"),
+            },
+            current_symbols={"USDC"},
+            previous_active_symbols={"USDC", "WBTC", "LINK"},
+            current_state_known=True,
+        )
+
+        assert result["supply_USDC"] == Decimal("3")
+        assert result["net_USDC"] == Decimal("3")
+        assert result["supply_WBTC"] == Decimal("0")
+        assert result["debt_WBTC"] == Decimal("0")
+        assert result["net_WBTC"] == Decimal("0")
+        assert result["supply_LINK"] == Decimal("0")
+        assert result["debt_LINK"] == Decimal("0")
+        assert result["net_LINK"] == Decimal("0")
+
     def test_aave_daily_exposure_extends_past_end_until_terminal_zero_day(self) -> None:
         block_map = {
             "2026-01-01": 11,
@@ -272,6 +293,9 @@ class TestBlockchainProtocols:
             "2026-01-03 00:00:00",
         ]
         assert history[-1]["rpc_error_count"] == 0
+        assert history[-1]["supply_USDC"] == 0.0
+        assert history[-1]["debt_USDC"] == 0.0
+        assert history[-1]["net_USDC"] == 0.0
 
     def test_aave_terminal_zero_requires_zero_rpc_errors(self) -> None:
         block_map = {
@@ -297,6 +321,9 @@ class TestBlockchainProtocols:
         assert history[2]["date"] == "2026-01-03 00:00:00"
         assert history[2]["rpc_error_count"] == 1
         assert history[-1]["date"] == "2026-01-04 00:00:00"
+        assert history[-1]["supply_USDC"] == 0.0
+        assert history[-1]["debt_USDC"] == 0.0
+        assert history[-1]["net_USDC"] == 0.0
 
     def test_read_curve_pool_tokens_returns_dataclass_list_and_stops_on_revert(self) -> None:
         pool_address = "0xpool"

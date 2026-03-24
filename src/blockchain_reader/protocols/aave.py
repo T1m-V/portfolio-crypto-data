@@ -119,6 +119,34 @@ def _compute_leg_columns(
     return columns
 
 
+def _build_zero_leg_columns(symbols: set[str]) -> dict[str, Decimal]:
+    columns: dict[str, Decimal] = {}
+    for symbol in sorted(symbols):
+        columns[f"supply_{symbol}"] = Decimal(0)
+        columns[f"debt_{symbol}"] = Decimal(0)
+        columns[f"net_{symbol}"] = Decimal(0)
+    return columns
+
+
+def _merge_disappeared_symbol_zeroes(
+    *,
+    leg_columns: dict[str, Decimal],
+    current_symbols: set[str],
+    previous_active_symbols: set[str],
+    current_state_known: bool,
+) -> dict[str, Decimal]:
+    if not current_state_known:
+        return leg_columns
+
+    disappeared_symbols = previous_active_symbols - current_symbols
+    if not disappeared_symbols:
+        return leg_columns
+
+    merged = dict(leg_columns)
+    merged.update(_build_zero_leg_columns(symbols=disappeared_symbols))
+    return merged
+
+
 def _build_aave_field_order(history: list[dict[str, object]]) -> list[str]:
     base = ["date", "block", "queried_token_count", "missing_contract_count", "rpc_error_count"]
     symbols = set()
@@ -351,6 +379,7 @@ def get_aave_daily_exposure(
     missing_contract_total = 0
     first_processed_day: str | None = None
     last_processed_day: str | None = None
+    previous_active_symbols: set[str] = set()
 
     day_progress = tqdm(
         total=len(day_items),
@@ -390,6 +419,14 @@ def get_aave_daily_exposure(
             supply_by_symbol=supply_by_symbol,
             debt_by_symbol=debt_by_symbol,
         )
+        current_symbols = set(supply_by_symbol.keys()) | set(debt_by_symbol.keys())
+        current_state_known = rpc_error_count == 0
+        leg_columns = _merge_disappeared_symbol_zeroes(
+            leg_columns=leg_columns,
+            current_symbols=current_symbols,
+            previous_active_symbols=previous_active_symbols,
+            current_state_known=current_state_known,
+        )
         has_non_zero_net = any(
             abs(value) > DUST for key, value in leg_columns.items() if key.startswith("net_")
         )
@@ -412,6 +449,8 @@ def get_aave_daily_exposure(
 
         rpc_error_total += rpc_error_count
         missing_contract_total += missing_contract_count
+        if current_state_known:
+            previous_active_symbols = set(current_symbols)
         day_progress.update(1)
 
         is_post_end_day = normalized_end_date is not None and date_str > normalized_end_date
