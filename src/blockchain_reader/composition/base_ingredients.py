@@ -385,14 +385,116 @@ def _apply_aave_overlay(
     return unknown_symbol_count, dust_value_count
 
 
+def _normalize_snapshot_df(df: pd.DataFrame) -> pd.DataFrame:
+    normalized = df.copy()
+    normalized["Date"] = pd.to_datetime(
+        normalized["Date"].map(parse_daily_datetime),
+        errors="coerce",
+    )
+    normalized = normalized.dropna(subset=["Date"])
+    normalized["Date"] = normalized["Date"].dt.normalize()
+    normalized["Quantity"] = pd.to_numeric(normalized["Quantity"], errors="coerce").fillna(0)
+    return normalized.sort_values(["Date", "Coin"])
+
+
+def _collect_composition_dates(
+    *,
+    snapshots: pd.DataFrame,
+    ctx: ExpansionContext,
+) -> list[pd.Timestamp]:
+    if snapshots.empty:
+        return []
+
+    min_date = snapshots["Date"].min()
+    max_date = snapshots["Date"].max()
+    dates = set(pd.to_datetime(snapshots["Date"]).dt.normalize())
+    for protocol_df in ctx.protocol_rows.values():
+        if protocol_df.empty:
+            continue
+        for date in pd.to_datetime(protocol_df["date"]).dropna().dt.normalize():
+            if min_date <= date <= max_date:
+                dates.add(date)
+
+    if ctx.aave_overlay is not None and not ctx.aave_overlay.empty:
+        for date in pd.to_datetime(ctx.aave_overlay["date"]).dropna().dt.normalize():
+            if min_date <= date <= max_date:
+                dates.add(date)
+
+    return sorted(dates)
+
+
+def _build_snapshot_groups(df: pd.DataFrame) -> dict[pd.Timestamp, pd.DataFrame]:
+    grouped: dict[pd.Timestamp, pd.DataFrame] = {}
+    for date, group in df.groupby("Date"):
+        grouped[pd.Timestamp(date).normalize()] = group
+    return grouped
+
+
+def _should_carry_protocol_position(symbol: str, ctx: ExpansionContext) -> bool:
+    normalized_symbol = sanitize_symbol(symbol)
+    if not normalized_symbol:
+        return False
+    return normalized_symbol in ctx.protocol_rows
+
+
+def _update_snapshot_state(
+    current_quantities: dict[str, Decimal],
+    group: pd.DataFrame | None,
+) -> None:
+    if group is None:
+        return
+
+    for _, snap in group.iterrows():
+        symbol = sanitize_symbol(str(snap["Coin"]))
+        if not symbol:
+            continue
+        current_quantities[symbol] = Decimal(str(snap["Quantity"]))
+
+
+def _expand_carried_protocol_positions(
+    *,
+    date: pd.Timestamp,
+    current_quantities: dict[str, Decimal],
+    ctx: ExpansionContext,
+    out: dict[str, Decimal],
+) -> None:
+    for symbol, quantity in current_quantities.items():
+        if abs(quantity) <= DUST:
+            continue
+        if symbol in ctx.aave_wrapper_symbols:
+            continue
+        if not _should_carry_protocol_position(symbol=symbol, ctx=ctx):
+            continue
+        _expand_symbol(symbol=symbol, quantity=quantity, date=date, ctx=ctx, out=out)
+
+
+def _expand_snapshot_rows_for_date(
+    *,
+    date: pd.Timestamp,
+    group: pd.DataFrame | None,
+    ctx: ExpansionContext,
+    out: dict[str, Decimal],
+) -> None:
+    if group is None:
+        return
+
+    for _, snap in group.iterrows():
+        symbol = sanitize_symbol(str(snap["Coin"]))
+        if not symbol or symbol in ctx.aave_wrapper_symbols:
+            continue
+        quantity = Decimal(str(snap["Quantity"]))
+        if abs(quantity) <= DUST:
+            continue
+        if _should_carry_protocol_position(symbol=symbol, ctx=ctx):
+            continue
+        _expand_symbol(symbol=symbol, quantity=quantity, date=date, ctx=ctx, out=out)
+
+
 def compose_base_ingredients(chain: str) -> Path:
     clear_price_cache()
 
     snapshots_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_raw_snapshots.csv"
-    df = pd.read_csv(snapshots_path)
-    df["Date"] = pd.to_datetime(df["Date"].map(parse_daily_datetime), errors="coerce")
-    df = df.dropna(subset=["Date"])
-    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
+    df = _normalize_snapshot_df(pd.read_csv(snapshots_path))
     token_metadata = load_token_metadata(
         chain=chain,
         tokens_folder=TOKENS_FOLDER,
@@ -417,8 +519,13 @@ def compose_base_ingredients(chain: str) -> Path:
     exceptions: list[dict[str, object]] = []
     unknown_overlay_symbols = 0
     dust_overlay_values = 0
-    grouped = df.groupby("Date")
-    for date, group in grouped:
+    composition_dates = _collect_composition_dates(snapshots=df, ctx=ctx)
+    snapshot_groups = _build_snapshot_groups(df=df)
+    current_quantities: dict[str, Decimal] = {}
+
+    for date in composition_dates:
+        group = snapshot_groups.get(date)
+        _update_snapshot_state(current_quantities=current_quantities, group=group)
         out: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
         unknown_count, dust_count = _apply_aave_overlay(
             out=out,
@@ -429,14 +536,18 @@ def compose_base_ingredients(chain: str) -> Path:
         unknown_overlay_symbols += unknown_count
         dust_overlay_values += dust_count
 
-        for _, snap in group.iterrows():
-            symbol = sanitize_symbol(str(snap["Coin"]))
-            if symbol in ctx.aave_wrapper_symbols:
-                continue
-            quantity = Decimal(str(snap["Quantity"]))
-            if abs(quantity) <= DUST:
-                continue
-            _expand_symbol(symbol=symbol, quantity=quantity, date=date, ctx=ctx, out=out)
+        _expand_carried_protocol_positions(
+            date=date,
+            current_quantities=current_quantities,
+            ctx=ctx,
+            out=out,
+        )
+        _expand_snapshot_rows_for_date(
+            date=date,
+            group=group,
+            ctx=ctx,
+            out=out,
+        )
 
         kept_rows, row_exceptions = _filter_composed_quantities(out=out, date=date, ctx=ctx)
         rows.extend(kept_rows)
