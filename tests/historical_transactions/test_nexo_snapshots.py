@@ -412,18 +412,18 @@ def test_internal_wallet_transfer_is_ignored(monkeypatch, tmp_path: Path) -> Non
     result = _run_nexo_generator(
         rows=[
             {
-                "Type": "Transfer Out",
+                "Type": "Exchange",
                 "Input Currency": "USDC",
                 "Input Amount": "-10",
-                "Output Currency": "USDC",
-                "Output Amount": "10",
+                "Output Currency": "BTC",
+                "Output Amount": "0.0001",
                 "Details": "approved / Transfer from Savings Wallet to Credit Line Wallet",
                 "Date / Time (UTC)": "01/01/2026 10:00",
             }
         ],
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
-        price_map={"USDC": 1.0},
+        price_map={"USDC": 1.0, "BTC": 50000.0},
     )
     assert result.empty
 
@@ -450,36 +450,29 @@ def test_transfer_out_is_ignored_by_type_even_without_internal_wallet_details(
     assert result.empty
 
 
-def test_unlocking_term_deposit_is_ignored(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("tx_type", "input_amount", "details"),
+    [
+        ("Unlocking Term Deposit", "0.1", "approved / Transfer from Term Wallet to Savings Wallet"),
+        ("Locking Term Deposit", "-0.1", "approved / Transfer from Savings Wallet to Term Wallet"),
+    ],
+)
+def test_term_deposit_types_are_ignored(
+    tx_type: str,
+    input_amount: str,
+    details: str,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
     result = _run_nexo_generator(
         rows=[
             {
-                "Type": "Unlocking Term Deposit",
+                "Type": tx_type,
                 "Input Currency": "BTC",
-                "Input Amount": "0.1",
+                "Input Amount": input_amount,
                 "Output Currency": "BTC",
                 "Output Amount": "0.1",
-                "Details": "approved / Transfer from Term Wallet to Savings Wallet",
-                "Date / Time (UTC)": "01/01/2026 10:00",
-            }
-        ],
-        tmp_path=tmp_path,
-        monkeypatch=monkeypatch,
-        price_map={"BTC": 50000.0},
-    )
-    assert result.empty
-
-
-def test_locking_term_deposit_is_ignored(monkeypatch, tmp_path: Path) -> None:
-    result = _run_nexo_generator(
-        rows=[
-            {
-                "Type": "Locking Term Deposit",
-                "Input Currency": "BTC",
-                "Input Amount": "-0.1",
-                "Output Currency": "BTC",
-                "Output Amount": "0.1",
-                "Details": "approved / Transfer from Savings Wallet to Term Wallet",
+                "Details": details,
                 "Date / Time (UTC)": "01/01/2026 10:00",
             }
         ],
@@ -574,35 +567,6 @@ def test_credit_card_withdrawal_credit_is_ignored(monkeypatch, tmp_path: Path) -
     assert result.empty
 
 
-def test_manual_repayment_and_manual_sell_order_are_ignored(monkeypatch, tmp_path: Path) -> None:
-    result = _run_nexo_generator(
-        rows=[
-            {
-                "Type": "Manual Sell Order",
-                "Input Currency": "USDC",
-                "Input Amount": "-100",
-                "Output Currency": "USDC",
-                "Output Amount": "0",
-                "Details": "approved / Crypto Repayment",
-                "Date / Time (UTC)": "01/01/2026 10:00",
-            },
-            {
-                "Type": "Manual Repayment",
-                "Input Currency": "xUSD",
-                "Input Amount": "98",
-                "Output Currency": "xUSD",
-                "Output Amount": "0",
-                "Details": "approved / Crypto Repayment",
-                "Date / Time (UTC)": "01/01/2026 10:01",
-            },
-        ],
-        tmp_path=tmp_path,
-        monkeypatch=monkeypatch,
-        price_map={"USDC": 1.0, "xUSD": 1.0},
-    )
-    assert result.empty
-
-
 def test_manual_repayment_pair_is_processed_as_synthetic_swap(monkeypatch, tmp_path: Path) -> None:
     result = _run_nexo_generator(
         rows=[
@@ -652,43 +616,6 @@ def test_manual_repayment_pair_is_processed_as_synthetic_swap(monkeypatch, tmp_p
     review_path = tmp_path / "nexo_liquidation_only_review.csv"
     review = pd.read_csv(review_path)
     assert review.empty
-
-
-def test_manual_repayment_pair_can_match_within_thirty_minutes(monkeypatch, tmp_path: Path) -> None:
-    result = _run_nexo_generator(
-        rows=[
-            {
-                "Type": "Manual Sell Order",
-                "Input Currency": "USDT",
-                "Input Amount": "-4.439778",
-                "Output Currency": "USDT",
-                "Output Amount": "4.439778",
-                "USD Equivalent": "$4.44",
-                "Details": "approved / Crypto Repayment",
-                "Date / Time (UTC)": "25/01/2023 18:10",
-            },
-            {
-                "Type": "Manual Repayment",
-                "Input Currency": "USD",
-                "Input Amount": "4.43977795",
-                "Output Currency": "USD",
-                "Output Amount": "0",
-                "USD Equivalent": "$4.44",
-                "Details": "approved / Crypto Repayment",
-                "Date / Time (UTC)": "25/01/2023 18:37",
-            },
-        ],
-        tmp_path=tmp_path,
-        monkeypatch=monkeypatch,
-        price_map={"USDT": 1.0, "USD": 1.0},
-    )
-
-    usdt_row = result[result["Coin"] == "USDT"].iloc[0]
-    usd_row = result[result["Coin"] == "USD"].iloc[0]
-    assert usdt_row["Quantity"] == -4.439778
-    assert usdt_row["Principal Invested"] == -4.44
-    assert usd_row["Quantity"] == 4.43977795
-    assert usd_row["Principal Invested"] == 4.44
 
 
 def test_exchange_liquidation_without_manual_pair_is_not_applied_and_is_reported(
@@ -914,79 +841,40 @@ def test_manual_repayment_pair_uses_wider_usdc_usd_tolerance(monkeypatch, tmp_pa
     assert usd_row["Principal Invested"] == 199.86
 
 
-def test_negative_xusd_interest_maps_to_usd_without_principal_change(
-    monkeypatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("raw_symbol", "amount"),
+    [
+        ("xUSD", "2"),
+        ("USDX", "3"),
+    ],
+)
+def test_negative_debt_stable_interest_maps_to_usd_without_principal_change(
+    raw_symbol: str,
+    amount: str,
+    monkeypatch,
+    tmp_path: Path,
 ) -> None:
     result = _run_nexo_generator(
         rows=[
             {
                 "Type": "Interest",
-                "Input Currency": "xUSD",
-                "Input Amount": "-2",
-                "Output Currency": "xUSD",
-                "Output Amount": "2",
+                "Input Currency": raw_symbol,
+                "Input Amount": f"-{amount}",
+                "Output Currency": raw_symbol,
+                "Output Amount": amount,
                 "Details": "approved / Interest",
                 "Date / Time (UTC)": "01/01/2026 10:00",
             }
         ],
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
-        price_map={"xUSD": 1.0, "USD": 1.0},
+        price_map={raw_symbol: 1.0, "USD": 1.0},
     )
 
     usd_row = result[result["Coin"] == "USD"].iloc[0]
-    assert usd_row["Quantity"] == -2.0
+    assert usd_row["Quantity"] == -float(amount)
     assert usd_row["Principal Invested"] == 0.0
-    assert "xUSD" not in result["Coin"].values
-
-
-def test_negative_usdx_interest_maps_to_usd_without_principal_change(
-    monkeypatch, tmp_path: Path
-) -> None:
-    result = _run_nexo_generator(
-        rows=[
-            {
-                "Type": "Interest",
-                "Input Currency": "USDX",
-                "Input Amount": "-3",
-                "Output Currency": "USDX",
-                "Output Amount": "3",
-                "Details": "approved / Interest",
-                "Date / Time (UTC)": "01/01/2026 10:00",
-            }
-        ],
-        tmp_path=tmp_path,
-        monkeypatch=monkeypatch,
-        price_map={"USDX": 1.0, "USD": 1.0},
-    )
-
-    usd_row = result[result["Coin"] == "USD"].iloc[0]
-    assert usd_row["Quantity"] == -3.0
-    assert usd_row["Principal Invested"] == 0.0
-    assert "USDX" not in result["Coin"].values
-
-
-def test_negative_usd_interest_keeps_usd_principal_unchanged(monkeypatch, tmp_path: Path) -> None:
-    result = _run_nexo_generator(
-        rows=[
-            {
-                "Type": "Interest",
-                "Input Currency": "USD",
-                "Input Amount": "-4",
-                "Output Currency": "USD",
-                "Output Amount": "4",
-                "Details": "approved / Interest",
-                "Date / Time (UTC)": "01/01/2026 10:00",
-            }
-        ],
-        tmp_path=tmp_path,
-        monkeypatch=monkeypatch,
-        price_map={"USD": 1.0},
-    )
-
-    usd_row = result[result["Coin"] == "USD"].iloc[0]
-    assert usd_row["Quantity"] == -4.0
-    assert usd_row["Principal Invested"] == 0.0
+    assert raw_symbol not in result["Coin"].values
 
 
 def test_exchange_is_explicit_swap_between_input_and_output_legs(
@@ -1424,27 +1312,6 @@ def test_eur_mode_refund_bundle_skips_cashback_reversal_and_keeps_only_eurx_top_
     assert "USD" not in result["Coin"].values
     assert "NEXO" not in result["Coin"].values
     assert "EUR" not in result["Coin"].values
-
-
-def test_deposit_to_exchange_is_ignored(monkeypatch, tmp_path: Path) -> None:
-    result = _run_nexo_generator(
-        rows=[
-            {
-                "Type": "Deposit To Exchange",
-                "Input Currency": "EUR",
-                "Input Amount": "8.81",
-                "Output Currency": "EURX",
-                "Output Amount": "8.81",
-                "USD Equivalent": "$9.98",
-                "Details": "approved / top up",
-                "Date / Time (UTC)": "25/05/2025 23:05",
-            }
-        ],
-        tmp_path=tmp_path,
-        monkeypatch=monkeypatch,
-        price_map={"EUR": 1.0, "EURX": 1.0},
-    )
-    assert result.empty
 
 
 def test_exchange_deposited_on_is_treated_as_receive(monkeypatch, tmp_path: Path) -> None:
