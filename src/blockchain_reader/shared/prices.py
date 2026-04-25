@@ -14,8 +14,24 @@ from file_paths import (
 from historical_transactions.portfolio_snapshots import get_forex_rate
 
 STABLE_PRICE_SYMBOLS: dict[str, Decimal] = {
+    "EUR": Decimal("1"),
+    "EURX": Decimal("1"),
+    "USD": Decimal("1"),
     "USDC": Decimal("1"),
+    "DAI": Decimal("1"),
     "USDT": Decimal("1"),
+    "USDX": Decimal("1"),
+    "xUSD": Decimal("1"),
+}
+PRICE_CURRENCY_OVERRIDES: dict[str, str] = {
+    "EUR": "EUR",
+    "EURX": "EUR",
+    "USD": "USD",
+    "USDC": "USD",
+    "USDT": "USD",
+    "DAI": "USD",
+    "USDX": "USD",
+    "xUSD": "USD",
 }
 
 
@@ -130,6 +146,9 @@ def get_price_eur_on_or_before(
         return None
 
     metadata = currency_metadata or CURRENCY_METADATA
-    currency = str(metadata.get(symbol, {}).get("currency", "USD"))
+    currency = PRICE_CURRENCY_OVERRIDES.get(
+        symbol,
+        str(metadata.get(symbol, {}).get("currency", "USD")),
+    )
     fx_rate = Decimal(str(get_forex_rate(currency=currency, date=str(_normalize_date(as_of_date)))))
     return price * fx_rate

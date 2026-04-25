@@ -724,19 +724,22 @@ class TestBlockchainProtocols:
             known_symbols={"wstETH", "ETH"},
         )
 
-        out: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
         exceptions: list[dict[str, object]] = []
-        unknown_count, dust_count = base_ingredients._apply_aave_overlay(
-            out=out,
+        exposures: dict[str, base_ingredients.AggregatedExposure] = defaultdict(
+            base_ingredients.AggregatedExposure
+        )
+        base_ingredients._apply_aave_overlay(
+            exposures=exposures,
             date=pd.Timestamp("2026-01-02"),
             ctx=ctx,
             exceptions=exceptions,
         )
 
-        assert unknown_count == 1
-        assert dust_count == 0
-        assert out["ETH"] == Decimal("2.06")
-        assert "wstETH" not in out
+        assert exposures["ETH"].quantity == Decimal("2.06")
+        assert exposures["ETH"].has_direct_exposure is False
+        assert exposures["ETH"].has_protocol_exposure is True
+        assert exposures["ETH"].has_aave_exposure is True
+        assert "wstETH" not in exposures
         assert exceptions[0]["Reason"] == "unknown_aave_overlay_symbol"
 
     def test_compose_base_ingredients_uses_aave_overlay_and_skips_raw_aave_wrappers(self) -> None:
@@ -752,6 +755,10 @@ class TestBlockchainProtocols:
             prices_root.mkdir(parents=True, exist_ok=True)
             pd.DataFrame([{"Date": "2026-01-01", "Price": 1.0}]).to_csv(
                 prices_root / "USD_EUR.csv",
+                index=False,
+            )
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 2000.0}]).to_csv(
+                prices_root / "ETH.csv",
                 index=False,
             )
 
@@ -787,16 +794,188 @@ class TestBlockchainProtocols:
                 patch("blockchain_reader.composition.base_ingredients.TOKENS_FOLDER", tokens_root),
                 patch("blockchain_reader.composition.base_ingredients.PRICES_FOLDER", prices_root),
             ):
-                output_path = base_ingredients.compose_base_ingredients(chain="arbitrum")
+                output_path = base_ingredients.compose_base_ingredients(
+                    chain="arbitrum",
+                    as_of_date="2026-01-01",
+                )
 
             assert output_path == protocol_root / "arbitrum_base_ingredients.csv"
-            result = pd.read_csv(output_path)
-            assert list(result.columns) == ["Date", "Coin", "Quantity"]
+            result = pd.read_csv(output_path).sort_values(["Date", "Coin"]).reset_index(drop=True)
+            assert list(result.columns) == base_ingredients.BASE_INGREDIENT_COLUMNS
             assert set(result["Coin"]) == {"ETH", "USDC"}
             assert "aArbUSDC" not in set(result["Coin"])
-            assert result.loc[result["Coin"] == "ETH", "Quantity"].iloc[0] == 1.0
-            assert result.loc[result["Coin"] == "USDC", "Quantity"].iloc[0] == 2.5
             assert result["Date"].str.endswith("00:00:00").all()
+
+            eth_row = result[result["Coin"] == "ETH"].iloc[0]
+            assert eth_row["Quantity"] == 1.0
+            assert eth_row["ValuationRoute"] == "DIRECT"
+            assert eth_row["PriceSymbol"] == "ETH"
+            assert eth_row["PriceEUR"] > 0
+            assert eth_row["EstimatedValueEUR"] == eth_row["PriceEUR"]
+            assert bool(eth_row["HasDirectExposure"]) is True
+            assert bool(eth_row["HasProtocolExposure"]) is False
+            assert bool(eth_row["HasAaveExposure"]) is False
+
+            usdc_row = result[result["Coin"] == "USDC"].iloc[0]
+            assert usdc_row["Quantity"] == 2.5
+            assert usdc_row["ValuationRoute"] == "DIRECT"
+            assert usdc_row["PriceSymbol"] == "USDC"
+            assert usdc_row["PriceEUR"] > 0
+            assert usdc_row["EstimatedValueEUR"] == usdc_row["Quantity"] * usdc_row["PriceEUR"]
+            assert bool(usdc_row["HasDirectExposure"]) is False
+            assert bool(usdc_row["HasProtocolExposure"]) is False
+            assert bool(usdc_row["HasAaveExposure"]) is True
+
+    def test_compose_base_ingredients_carries_direct_assets_daily(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            snapshots_root = root / "snapshots"
+            protocol_root = root / "protocol_underlying_tokens"
+            tokens_root = root / "tokens"
+            prices_root = root / "prices"
+            snapshots_root.mkdir(parents=True, exist_ok=True)
+            protocol_root.mkdir(parents=True, exist_ok=True)
+            tokens_root.mkdir(parents=True, exist_ok=True)
+            prices_root.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 1.0}]).to_csv(
+                prices_root / "USD_EUR.csv",
+                index=False,
+            )
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 2000.0}]).to_csv(
+                prices_root / "ETH.csv",
+                index=False,
+            )
+
+            pd.DataFrame(
+                [
+                    {"Date": "2026-01-01", "Coin": "ETH", "Quantity": 1.0},
+                    {"Date": "2026-01-03", "Coin": "USDC", "Quantity": 2.0},
+                ]
+            ).to_csv(snapshots_root / "arbitrum_raw_snapshots.csv", index=False)
+            with open(tokens_root / "arbitrum_tokens.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "0xeth": {"symbol": "ETH"},
+                        "0xusdc": {"symbol": "USDC"},
+                    },
+                    f,
+                )
+
+            with (
+                patch(
+                    "blockchain_reader.composition.base_ingredients.BLOCKCHAIN_SNAPSHOT_FOLDER",
+                    snapshots_root,
+                ),
+                patch(
+                    "blockchain_reader.composition.base_ingredients.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    protocol_root,
+                ),
+                patch("blockchain_reader.composition.base_ingredients.TOKENS_FOLDER", tokens_root),
+                patch("blockchain_reader.composition.base_ingredients.PRICES_FOLDER", prices_root),
+            ):
+                output_path = base_ingredients.compose_base_ingredients(
+                    chain="arbitrum",
+                    as_of_date="2026-01-05",
+                )
+
+            result = pd.read_csv(output_path).sort_values(["Date", "Coin"]).reset_index(drop=True)
+            assert result[["Date", "Coin", "Quantity"]].to_dict("records") == [
+                {"Date": "2026-01-01 00:00:00", "Coin": "ETH", "Quantity": 1.0},
+                {"Date": "2026-01-02 00:00:00", "Coin": "ETH", "Quantity": 1.0},
+                {"Date": "2026-01-03 00:00:00", "Coin": "ETH", "Quantity": 1.0},
+                {"Date": "2026-01-03 00:00:00", "Coin": "USDC", "Quantity": 2.0},
+                {"Date": "2026-01-04 00:00:00", "Coin": "ETH", "Quantity": 1.0},
+                {"Date": "2026-01-04 00:00:00", "Coin": "USDC", "Quantity": 2.0},
+                {"Date": "2026-01-05 00:00:00", "Coin": "ETH", "Quantity": 1.0},
+                {"Date": "2026-01-05 00:00:00", "Coin": "USDC", "Quantity": 2.0},
+            ]
+            eth_rows = result[result["Coin"] == "ETH"].reset_index(drop=True)
+            assert set(eth_rows["ValuationRoute"]) == {"DIRECT"}
+            assert set(eth_rows["PriceSymbol"]) == {"ETH"}
+            assert eth_rows["PriceEUR"].gt(0).all()
+            assert (eth_rows["EstimatedValueEUR"] == eth_rows["PriceEUR"]).all()
+            assert eth_rows["HasDirectExposure"].all()
+            assert not eth_rows["HasProtocolExposure"].any()
+            assert not eth_rows["HasAaveExposure"].any()
+
+            usdc_row = result[result["Coin"] == "USDC"].iloc[0]
+            assert usdc_row["ValuationRoute"] == "DIRECT"
+            assert usdc_row["PriceSymbol"] == "USDC"
+            assert usdc_row["PriceEUR"] > 0
+            assert usdc_row["EstimatedValueEUR"] == usdc_row["Quantity"] * usdc_row["PriceEUR"]
+            assert bool(usdc_row["HasDirectExposure"]) is True
+            assert bool(usdc_row["HasProtocolExposure"]) is False
+            assert bool(usdc_row["HasAaveExposure"]) is False
+
+    def test_compose_base_ingredients_canonicalizes_wbtc_to_btc_via_metadata(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            snapshots_root = root / "snapshots"
+            protocol_root = root / "protocol_underlying_tokens"
+            tokens_root = root / "tokens"
+            prices_root = root / "prices"
+            snapshots_root.mkdir(parents=True, exist_ok=True)
+            protocol_root.mkdir(parents=True, exist_ok=True)
+            tokens_root.mkdir(parents=True, exist_ok=True)
+            prices_root.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 1.0}]).to_csv(
+                prices_root / "USD_EUR.csv",
+                index=False,
+            )
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 40000.0}]).to_csv(
+                prices_root / "BTC.csv",
+                index=False,
+            )
+
+            pd.DataFrame(
+                [
+                    {"Date": "2026-01-01", "Coin": "WBTC", "Quantity": 0.5},
+                ]
+            ).to_csv(snapshots_root / "arbitrum_raw_snapshots.csv", index=False)
+            with open(tokens_root / "arbitrum_tokens.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "0xwbtc": {
+                            "symbol": "WBTC",
+                            "family": "BTC",
+                            "price_source": "BTC",
+                        },
+                    },
+                    f,
+                )
+
+            with (
+                patch(
+                    "blockchain_reader.composition.base_ingredients.BLOCKCHAIN_SNAPSHOT_FOLDER",
+                    snapshots_root,
+                ),
+                patch(
+                    "blockchain_reader.composition.base_ingredients.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    protocol_root,
+                ),
+                patch("blockchain_reader.composition.base_ingredients.TOKENS_FOLDER", tokens_root),
+                patch("blockchain_reader.composition.base_ingredients.PRICES_FOLDER", prices_root),
+            ):
+                output_path = base_ingredients.compose_base_ingredients(
+                    chain="arbitrum",
+                    as_of_date="2026-01-01",
+                )
+
+            result = pd.read_csv(output_path)
+            assert result[["Date", "Coin", "Quantity"]].to_dict("records") == [
+                {"Date": "2026-01-01 00:00:00", "Coin": "BTC", "Quantity": 0.5},
+            ]
+            row = result.iloc[0]
+            assert row["ValuationRoute"] == "DIRECT"
+            assert row["PriceSymbol"] == "BTC"
+            assert row["PriceEUR"] > 0
+            assert row["EstimatedValueEUR"] == row["Quantity"] * row["PriceEUR"]
+            assert bool(row["HasDirectExposure"]) is True
+            assert bool(row["HasProtocolExposure"]) is False
+            assert bool(row["HasAaveExposure"]) is False
+
+            exceptions = pd.read_csv(protocol_root / "arbitrum_base_ingredients_exceptions.csv")
+            assert exceptions.empty
 
     def test_compose_base_ingredients_applies_dust_policy_and_writes_exceptions(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -848,13 +1027,21 @@ class TestBlockchainProtocols:
                 patch("blockchain_reader.composition.base_ingredients.TOKENS_FOLDER", tokens_root),
                 patch("blockchain_reader.composition.base_ingredients.PRICES_FOLDER", prices_root),
             ):
-                output_path = base_ingredients.compose_base_ingredients(chain="arbitrum")
+                output_path = base_ingredients.compose_base_ingredients(
+                    chain="arbitrum",
+                    as_of_date="2026-01-01",
+                )
 
             result = pd.read_csv(output_path)
-            assert set(result["Coin"]) == {"MISSING", "USDC"}
+            assert set(result["Coin"]) == {"MISSING", "UNK-0x10", "USDC"}
             assert "ETH" not in set(result["Coin"])
-            assert "UNK-0x10" not in set(result["Coin"])
             assert result["Date"].str.endswith("00:00:00").all()
+            missing_row = result[result["Coin"] == "MISSING"].iloc[0]
+            unknown_row = result[result["Coin"] == "UNK-0x10"].iloc[0]
+            assert pd.isna(missing_row["PriceEUR"])
+            assert pd.isna(missing_row["EstimatedValueEUR"])
+            assert pd.isna(unknown_row["PriceEUR"])
+            assert pd.isna(unknown_row["EstimatedValueEUR"])
 
             exceptions = pd.read_csv(protocol_root / "arbitrum_base_ingredients_exceptions.csv")
             assert set(exceptions["Coin"]) == {"MISSING", "UNK-0x10"}
@@ -909,10 +1096,19 @@ class TestBlockchainProtocols:
                 patch("blockchain_reader.composition.base_ingredients.TOKENS_FOLDER", tokens_root),
                 patch("blockchain_reader.composition.base_ingredients.PRICES_FOLDER", prices_root),
             ):
-                output_path = base_ingredients.compose_base_ingredients(chain="arbitrum")
+                output_path = base_ingredients.compose_base_ingredients(
+                    chain="arbitrum",
+                    as_of_date="2026-01-05",
+                )
 
             result = pd.read_csv(output_path)
             assert set(result["Coin"]) == {"PROTO"}
+            proto_row = result.iloc[0]
+            assert proto_row["ValuationRoute"] == "PROTOCOL_DERIVED"
+            assert pd.isna(proto_row["PriceEUR"])
+            assert bool(proto_row["HasDirectExposure"]) is False
+            assert bool(proto_row["HasProtocolExposure"]) is True
+            assert bool(proto_row["HasAaveExposure"]) is False
 
             exceptions = pd.read_csv(protocol_root / "arbitrum_base_ingredients_exceptions.csv")
             assert set(exceptions["Coin"]) == {"PROTO"}
@@ -931,6 +1127,10 @@ class TestBlockchainProtocols:
             prices_root.mkdir(parents=True, exist_ok=True)
             pd.DataFrame([{"Date": "2026-01-01", "Price": 1.0}]).to_csv(
                 prices_root / "USD_EUR.csv",
+                index=False,
+            )
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 2000.0}]).to_csv(
+                prices_root / "ETH.csv",
                 index=False,
             )
 
@@ -969,14 +1169,34 @@ class TestBlockchainProtocols:
                 patch("blockchain_reader.composition.base_ingredients.TOKENS_FOLDER", tokens_root),
                 patch("blockchain_reader.composition.base_ingredients.PRICES_FOLDER", prices_root),
             ):
-                output_path = base_ingredients.compose_base_ingredients(chain="arbitrum")
+                output_path = base_ingredients.compose_base_ingredients(
+                    chain="arbitrum",
+                    as_of_date="2026-01-05",
+                )
 
             result = pd.read_csv(output_path).sort_values(["Date", "Coin"]).reset_index(drop=True)
-            assert result.to_dict("records") == [
+            assert result[["Date", "Coin", "Quantity"]].to_dict("records") == [
                 {"Date": "2026-01-01 00:00:00", "Coin": "ETH", "Quantity": 1.0},
                 {"Date": "2026-01-01 00:00:00", "Coin": "USDC", "Quantity": 2.0},
                 {"Date": "2026-01-02 00:00:00", "Coin": "USDC", "Quantity": 3.0},
+                {"Date": "2026-01-03 00:00:00", "Coin": "USDC", "Quantity": 3.0},
+                {"Date": "2026-01-04 00:00:00", "Coin": "USDC", "Quantity": 3.0},
+                {"Date": "2026-01-05 00:00:00", "Coin": "USDC", "Quantity": 3.0},
             ]
+            eth_row = result[result["Coin"] == "ETH"].iloc[0]
+            assert eth_row["PriceSymbol"] == "ETH"
+            assert eth_row["PriceEUR"] > 0
+            assert eth_row["EstimatedValueEUR"] == eth_row["PriceEUR"]
+
+            usdc_rows = result[result["Coin"] == "USDC"].reset_index(drop=True)
+            assert usdc_rows["PriceSymbol"].tolist() == ["USDC"] * 5
+            assert usdc_rows["PriceEUR"].gt(0).all()
+            assert (
+                usdc_rows["EstimatedValueEUR"] == usdc_rows["Quantity"] * usdc_rows["PriceEUR"]
+            ).all()
+            assert not usdc_rows["HasDirectExposure"].any()
+            assert usdc_rows["HasProtocolExposure"].all()
+            assert not usdc_rows["HasAaveExposure"].any()
 
     def test_compose_base_ingredients_revalues_aave_overlay_daily_without_wrapper_snapshots(
         self,
@@ -995,18 +1215,24 @@ class TestBlockchainProtocols:
                 prices_root / "USD_EUR.csv",
                 index=False,
             )
+            pd.DataFrame([{"Date": "2026-01-01", "Price": 2000.0}]).to_csv(
+                prices_root / "ETH.csv",
+                index=False,
+            )
 
             pd.DataFrame(
                 [
                     {"Date": "2026-01-01", "Coin": "aArbUSDC", "Quantity": 5.0},
                     {"Date": "2026-01-01", "Coin": "ETH", "Quantity": 1.0},
                     {"Date": "2026-01-02", "Coin": "ETH", "Quantity": 0.0},
+                    {"Date": "2026-01-03", "Coin": "aArbUSDC", "Quantity": 0.0},
                 ]
             ).to_csv(snapshots_root / "arbitrum_raw_snapshots.csv", index=False)
             pd.DataFrame(
                 [
                     {"date": "2026-01-01", "net_USDC": 2.5},
                     {"date": "2026-01-02", "net_USDC": 3.0},
+                    {"date": "2026-01-03", "net_USDC": 0.0},
                 ]
             ).to_csv(protocol_root / "aave" / "arbitrum_aave_daily_exposure.csv", index=False)
             with open(tokens_root / "arbitrum_tokens.json", "w", encoding="utf-8") as f:
@@ -1031,14 +1257,34 @@ class TestBlockchainProtocols:
                 patch("blockchain_reader.composition.base_ingredients.TOKENS_FOLDER", tokens_root),
                 patch("blockchain_reader.composition.base_ingredients.PRICES_FOLDER", prices_root),
             ):
-                output_path = base_ingredients.compose_base_ingredients(chain="arbitrum")
+                output_path = base_ingredients.compose_base_ingredients(
+                    chain="arbitrum",
+                    as_of_date="2026-01-05",
+                )
 
             result = pd.read_csv(output_path).sort_values(["Date", "Coin"]).reset_index(drop=True)
-            assert result.to_dict("records") == [
+            assert result[["Date", "Coin", "Quantity"]].to_dict("records") == [
                 {"Date": "2026-01-01 00:00:00", "Coin": "ETH", "Quantity": 1.0},
                 {"Date": "2026-01-01 00:00:00", "Coin": "USDC", "Quantity": 2.5},
                 {"Date": "2026-01-02 00:00:00", "Coin": "USDC", "Quantity": 3.0},
             ]
+            eth_row = result[result["Coin"] == "ETH"].iloc[0]
+            assert eth_row["PriceSymbol"] == "ETH"
+            assert eth_row["PriceEUR"] > 0
+            assert eth_row["EstimatedValueEUR"] == eth_row["PriceEUR"]
+
+            usdc_rows = result[result["Coin"] == "USDC"].reset_index(drop=True)
+            assert usdc_rows["PriceSymbol"].tolist() == ["USDC", "USDC"]
+            assert usdc_rows["PriceEUR"].gt(0).all()
+            assert (
+                usdc_rows["EstimatedValueEUR"] == usdc_rows["Quantity"] * usdc_rows["PriceEUR"]
+            ).all()
+            assert not usdc_rows["HasDirectExposure"].any()
+            assert not usdc_rows["HasProtocolExposure"].any()
+            assert usdc_rows["HasAaveExposure"].all()
+            assert "2026-01-03 00:00:00" not in set(result["Date"])
+            assert "2026-01-04 00:00:00" not in set(result["Date"])
+            assert "2026-01-05 00:00:00" not in set(result["Date"])
 
     def test_run_protocol_pipeline_includes_liquid_staking_by_default(self) -> None:
         with (
