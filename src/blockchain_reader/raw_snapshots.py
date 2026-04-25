@@ -290,27 +290,85 @@ class CryptoTracker:
             return
 
         for entry_in in rewards:
-            asset_in = self.fetch_asset(entry_in.token)
-            price = get_crypto_price(
-                coin=asset_in.price_source,
-                date=date,
-                chain=self.chain,
-                use_lp_prices=asset_in.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
-            )
-            invested = float(entry_in.quantity) * price
-
-            asset_in.quantity += entry_in.quantity
-            asset_in.adjust_principal(invested)
-            touched_coins.add(asset_in.coin)
-
             if allocate_reward_to:
-                share = invested / len(allocate_reward_to)
-                for source_coin in allocate_reward_to:
-                    source_asset = self.fetch_asset(source_coin.upper())
-                    source_asset.adjust_principal(-share)
-                    touched_coins.add(source_asset.coin)
+                allocations = [(source_coin.upper(), 1.0) for source_coin in allocate_reward_to]
             else:
-                asset_in.adjust_principal(-invested)
+                allocations = [(None, 1.0)]
+
+            self.apply_reward_with_allocations(
+                reward_token=entry_in.token,
+                reward_quantity=entry_in.quantity,
+                date=date,
+                allocations=allocations,
+                touched_coins=touched_coins,
+            )
+
+    def apply_reward_with_allocations(
+        self,
+        *,
+        reward_token: str,
+        reward_quantity: Decimal,
+        date: str,
+        allocations: list[tuple[str | None, float]] | None,
+        touched_coins: set[str],
+    ) -> None:
+        """
+        Applies a reward quantity and reallocates principal by weighted source buckets.
+
+        args:
+            reward_token: Token received as reward.
+            reward_quantity: Reward quantity.
+            date: Reward datetime.
+            allocations: Weighted principal source buckets where None means free allocation.
+            touched_coins: Coin set touched by this operation.
+        """
+        if reward_quantity <= 0:
+            return
+
+        asset_in = self.fetch_asset(reward_token)
+        price = get_crypto_price(
+            coin=asset_in.price_source,
+            date=date,
+            chain=self.chain,
+            use_lp_prices=asset_in.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
+        )
+        invested = float(reward_quantity) * price
+
+        asset_in.quantity += reward_quantity
+        asset_in.adjust_principal(invested)
+        touched_coins.add(asset_in.coin)
+
+        normalized_allocations: list[tuple[str | None, float]] = []
+        for source_coin, weight in allocations or []:
+            if weight <= 0:
+                continue
+            normalized_source = sanitize_symbol(source_coin) if source_coin else None
+            normalized_allocations.append((normalized_source, weight))
+
+        if not normalized_allocations:
+            asset_in.adjust_principal(-invested)
+            return
+
+        total_weight = sum(weight for _, weight in normalized_allocations)
+        if total_weight <= 0:
+            asset_in.adjust_principal(-invested)
+            return
+
+        remaining_value = invested
+        for idx, (source_coin, weight) in enumerate(normalized_allocations):
+            if idx == len(normalized_allocations) - 1:
+                share = remaining_value
+            else:
+                share = invested * (weight / total_weight)
+                remaining_value -= share
+
+            if source_coin is None:
+                asset_in.adjust_principal(-share)
+                continue
+
+            source_asset = self.fetch_asset(source_coin)
+            source_asset.adjust_principal(-share)
+            touched_coins.add(source_asset.coin)
 
     def _parse_reward_sources(self, tx_type_lower: str) -> list[str]:
         if "|" not in tx_type_lower:
