@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
 import blockchain_reader.accounting as accounting
+import blockchain_reader.rebuild_arbitrum_derived as rebuild
 import blockchain_reader.update as update
 from blockchain_reader.dashboard_artifacts import ArbitrumDashboardArtifactPaths
 
@@ -107,7 +109,13 @@ def test_update_blockchain_data_runs_stages_in_dependency_order(monkeypatch, tmp
             }
         ).to_csv(paths["transactions"] / f"{chain}_transactions.csv", index=False)
 
-    def fake_generate_raw_snapshots(input_csv: Path, output_csv: Path, chain: str) -> None:
+    def fake_generate_raw_snapshots(
+        input_csv: Path,
+        output_csv: Path,
+        chain: str,
+        principal_events_csv: Path | None = None,
+        principal_daily_csv: Path | None = None,
+    ) -> None:
         calls.append("snapshots")
         pd.DataFrame(
             {
@@ -117,6 +125,26 @@ def test_update_blockchain_data_runs_stages_in_dependency_order(monkeypatch, tmp
                 "Principal Invested": [100],
             }
         ).to_csv(output_csv, index=False)
+        if principal_events_csv is not None:
+            pd.DataFrame(
+                columns=[
+                    "Date",
+                    "TX Hash",
+                    "Action",
+                    "Source",
+                    "BaseCoin",
+                    "PrincipalDeltaEUR",
+                    "PrincipalBalanceEUR",
+                ]
+            ).to_csv(principal_events_csv, index=False)
+        if principal_daily_csv is not None:
+            pd.DataFrame(
+                {
+                    "Date": ["2025-01-02"],
+                    "Coin": ["ETH"],
+                    "PrincipalInvestedEUR": [100],
+                }
+            ).to_csv(principal_daily_csv, index=False)
 
     def fake_protocol(name: str):
         def _run(
@@ -196,6 +224,71 @@ def test_update_blockchain_data_runs_stages_in_dependency_order(monkeypatch, tmp
         "accounting:2025-01-03",
         "dashboard",
     ]
+
+
+def test_rebuild_arbitrum_derived_runs_only_snapshot_accounting_and_dashboard(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    paths = _patch_update_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(rebuild, "BLOCKCHAIN_TRANSACTIONS_FOLDER", paths["transactions"])
+    monkeypatch.setattr(rebuild, "BLOCKCHAIN_SNAPSHOT_FOLDER", paths["snapshots"])
+    monkeypatch.setattr(accounting, "BLOCKCHAIN_ACCOUNTING_FOLDER", paths["accounting"])
+    calls: list[str] = []
+    pd.DataFrame({"Date": ["01/01/2025 10:00:00"]}).to_csv(
+        paths["transactions"] / "arbitrum_transactions.csv",
+        index=False,
+    )
+
+    def fake_generate_raw_snapshots(
+        input_csv: Path,
+        output_csv: Path,
+        chain: str,
+        principal_events_csv: Path | None = None,
+        principal_daily_csv: Path | None = None,
+    ) -> None:
+        calls.append(f"snapshots:{input_csv.name}:{chain}")
+        pd.DataFrame(
+            {
+                "Date": ["2025-01-01"],
+                "Coin": ["ETH"],
+                "Quantity": [1],
+                "Principal Invested": [0],
+            }
+        ).to_csv(output_csv, index=False)
+        pd.DataFrame(columns=["Date"]).to_csv(principal_events_csv, index=False)
+        pd.DataFrame(
+            {"Date": ["2025-01-01"], "Coin": ["ETH"], "PrincipalInvestedEUR": [1000]}
+        ).to_csv(principal_daily_csv, index=False)
+
+    def fake_build_accounting_artifacts(chain: str, as_of_date=None) -> object:
+        calls.append(f"accounting:{chain}:{as_of_date}")
+        return SimpleNamespace(rows_written={"issues": 0}, errors=[])
+
+    def fake_dashboard(chain: str) -> ArbitrumDashboardArtifactPaths:
+        calls.append(f"dashboard:{chain}")
+        root = paths["dashboard"] / chain
+        return ArbitrumDashboardArtifactPaths(
+            asset_daily=root / "asset_daily.csv",
+            timeseries_daily=root / "timeseries_daily.csv",
+            composition_daily=root / "composition_daily.csv",
+            source_daily=root / "source_daily.csv",
+            transactions_dashboard=root / "transactions_dashboard.csv",
+            assets=root / "assets.csv",
+        )
+
+    monkeypatch.setattr(rebuild, "generate_raw_snapshots", fake_generate_raw_snapshots)
+    monkeypatch.setattr(rebuild, "build_accounting_artifacts", fake_build_accounting_artifacts)
+    monkeypatch.setattr(rebuild, "build_arbitrum_dashboard_artifacts", fake_dashboard)
+
+    result = rebuild.rebuild_arbitrum_derived(as_of_date="2026-05-09")
+
+    assert calls == [
+        "snapshots:arbitrum_transactions.csv:arbitrum",
+        "accounting:arbitrum:2026-05-09",
+        "dashboard:arbitrum",
+    ]
+    assert result["chain"] == "arbitrum"
 
 
 def test_update_blockchain_data_from_snapshots_skips_transactions(monkeypatch, tmp_path) -> None:

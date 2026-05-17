@@ -312,6 +312,13 @@ class ExposureExpander:
             target_date=date_value,
         )
         if row is None:
+            row = self._future_single_family_row(
+                symbol=normalized_symbol,
+                date_value=date_value,
+                seen={normalized_symbol},
+                depth=depth,
+            )
+        if row is None:
             self._add_exposure(
                 exposures=exposures,
                 symbol=terminal_symbol,
@@ -353,6 +360,106 @@ class ExposureExpander:
             has_direct_exposure=current_has_direct,
             has_protocol_exposure=current_has_protocol,
             has_aave_exposure=has_aave_exposure,
+        )
+
+    def _future_single_family_row(
+        self,
+        *,
+        symbol: str,
+        date_value: object,
+        seen: set[str],
+        depth: int,
+    ) -> pd.Series | None:
+        if depth > MAX_EXPANSION_DEPTH:
+            return None
+
+        frame = self.ctx.protocol_rows.get(symbol)
+        if frame is None or frame.empty:
+            return None
+
+        row = frame.iloc[0]
+        terminal_families = self._terminal_families_for_row(
+            row=row,
+            date_value=date_value,
+            seen=seen,
+            depth=depth + 1,
+        )
+        if len(terminal_families) == 1:
+            return row
+        return None
+
+    def _terminal_families_for_row(
+        self,
+        *,
+        row: pd.Series,
+        date_value: object,
+        seen: set[str],
+        depth: int,
+    ) -> set[str]:
+        families: set[str] = set()
+        for column in row.index:
+            if not isinstance(column, str) or not column.startswith("asset_"):
+                continue
+            if pd.isna(row[column]):
+                continue
+            per_unit = _to_decimal(row[column])
+            if abs(per_unit) <= DUST:
+                continue
+            families.update(
+                self._terminal_families_for_symbol(
+                    symbol=column.replace("asset_", "", 1),
+                    date_value=date_value,
+                    seen=seen,
+                    depth=depth,
+                )
+            )
+        return families
+
+    def _terminal_families_for_symbol(
+        self,
+        *,
+        symbol: str,
+        date_value: object,
+        seen: set[str],
+        depth: int,
+    ) -> set[str]:
+        normalized_symbol = sanitize_symbol(symbol)
+        if not normalized_symbol:
+            return set()
+
+        terminal_symbol = canonicalize_symbol(
+            normalized_symbol,
+            symbol_family=self.ctx.symbol_family,
+        )
+        terminal_symbol = (
+            price_proxy_symbol(terminal_symbol) or terminal_symbol or normalized_symbol
+        )
+        if terminal_symbol != normalized_symbol or depth > MAX_EXPANSION_DEPTH:
+            return {terminal_symbol}
+
+        if normalized_symbol in seen:
+            return {terminal_symbol}
+
+        row = find_protocol_row(
+            protocol_rows=self.ctx.protocol_rows,
+            symbol=normalized_symbol,
+            target_date=date_value,
+        )
+        next_seen = {*seen, normalized_symbol}
+        if row is None:
+            row = self._future_single_family_row(
+                symbol=normalized_symbol,
+                date_value=date_value,
+                seen=next_seen,
+                depth=depth,
+            )
+        if row is None:
+            return {terminal_symbol}
+        return self._terminal_families_for_row(
+            row=row,
+            date_value=date_value,
+            seen=next_seen,
+            depth=depth + 1,
         )
 
     def _add_exposure(

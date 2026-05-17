@@ -12,6 +12,7 @@ from blockchain_reader.datetime_utils import (
     format_daily_datetime,
     parse_transaction_datetime_series,
 )
+from blockchain_reader.principal_ledger import EconomicPrincipalLedger, PrincipalResolver
 from blockchain_reader.shared.prices import (
     STABLE_PRICE_SYMBOLS,
     get_price_eur_on_or_before,
@@ -339,6 +340,15 @@ class PortfolioLedger:
         self.symbol_family: dict[str, str] = {}
         self.symbol_protocol = build_symbol_protocol_map(token_metadata=self.token_metadata)
         self.protocol_components = _load_protocol_components(chain=chain)
+        self.use_dual_principal = chain == "arbitrum"
+        self.principal_ledger = EconomicPrincipalLedger(
+            resolver=PrincipalResolver(
+                chain=chain,
+                token_metadata=self.token_metadata,
+                protocol_root=PROTOCOL_UNDERLYING_TOKEN_FOLDER,
+                prices_folder=PRICES_FOLDER,
+            )
+        )
 
         for meta in self.token_metadata.values():
             symbol = sanitize_symbol(meta.get("symbol"))
@@ -457,22 +467,35 @@ class PortfolioLedger:
             if not price_source:
                 price_source = asset_key
 
-            family_coin = self._principal_proxy_symbol(
-                asset_key=asset_key,
-                route=route,
-                meta=meta,
-            )
-
             self.assets[asset_key] = CryptoPosition(
                 coin=asset_key,
                 chain=self.chain,
                 valuation_route=route,
                 price_source=price_source,
             )
-            if family_coin and family_coin != asset_key:
-                self.assets[asset_key].family_proxy = self.fetch_asset(family_coin)
 
         return self.assets[asset_key]
+
+    def adjust_principal(
+        self,
+        *,
+        asset: CryptoPosition,
+        amount_eur: float,
+        date_value: object,
+        action: str,
+        tx_hash: str = "",
+    ) -> None:
+        if not self.use_dual_principal:
+            asset.adjust_principal(amount_eur)
+            return
+
+        self.principal_ledger.adjust(
+            symbol=asset.coin,
+            amount_eur=amount_eur,
+            date_value=date_value,
+            action=action,
+            tx_hash=tx_hash,
+        )
 
     def collect_snapshots(self, *, asset: CryptoPosition, date_value: str) -> list[dict]:
         snapshots = [asset.to_snapshot(date_value)]
@@ -540,15 +563,41 @@ class TransactionApplier:
             return 0.0
         return price
 
-    def receive(self, *, asset: CryptoPosition, amount_received: Decimal, date_value: str):
+    def receive(
+        self,
+        *,
+        asset: CryptoPosition,
+        amount_received: Decimal,
+        date_value: str,
+        tx_hash: str = "",
+    ):
         asset.quantity += amount_received
         price = self._price_for_asset(asset=asset, date_value=date_value, action="receive")
-        asset.adjust_principal(float(amount_received) * price)
+        self.ledger.adjust_principal(
+            asset=asset,
+            amount_eur=float(amount_received) * price,
+            date_value=date_value,
+            action="receive",
+            tx_hash=tx_hash,
+        )
 
-    def send(self, *, asset: CryptoPosition, amount_sent: Decimal, date_value: str):
+    def send(
+        self,
+        *,
+        asset: CryptoPosition,
+        amount_sent: Decimal,
+        date_value: str,
+        tx_hash: str = "",
+    ):
         asset.quantity -= amount_sent
         price = self._price_for_asset(asset=asset, date_value=date_value, action="send")
-        asset.adjust_principal(-(float(amount_sent) * price))
+        self.ledger.adjust_principal(
+            asset=asset,
+            amount_eur=-(float(amount_sent) * price),
+            date_value=date_value,
+            action="send",
+            tx_hash=tx_hash,
+        )
 
     def _process_swap(
         self,
@@ -557,6 +606,7 @@ class TransactionApplier:
         outs: list[TxEntry],
         date_value: str,
         touched_coins: set[str],
+        tx_hash: str = "",
     ) -> None:
         total_in_value_eur = 0.0
         for entry in ins:
@@ -586,7 +636,13 @@ class TransactionApplier:
         for entry, principal_addition in zip(ins, incoming_principal, strict=True):
             asset_in = self.ledger.fetch_asset(entry.token)
             asset_in.quantity += entry.quantity
-            asset_in.adjust_principal(principal_addition)
+            self.ledger.adjust_principal(
+                asset=asset_in,
+                amount_eur=principal_addition,
+                date_value=date_value,
+                action="swap_in",
+                tx_hash=tx_hash,
+            )
             touched_coins.add(asset_in.coin)
 
         if not outs:
@@ -600,7 +656,13 @@ class TransactionApplier:
             asset_out = self.ledger.fetch_asset(entry.token)
             principal_reduction = principal_transfer_value_eur * share_of_out
             asset_out.quantity -= entry.quantity
-            asset_out.adjust_principal(-principal_reduction)
+            self.ledger.adjust_principal(
+                asset=asset_out,
+                amount_eur=-principal_reduction,
+                date_value=date_value,
+                action="swap_out",
+                tx_hash=tx_hash,
+            )
             touched_coins.add(asset_out.coin)
 
     def _process_reward(
@@ -610,6 +672,7 @@ class TransactionApplier:
         allocate_reward_to: list[str],
         date_value: str,
         touched_coins: set[str],
+        tx_hash: str = "",
     ) -> None:
         if not rewards:
             return
@@ -626,6 +689,7 @@ class TransactionApplier:
                 date_value=date_value,
                 allocations=allocations,
                 touched_coins=touched_coins,
+                tx_hash=tx_hash,
             )
 
     def apply_reward_with_allocations(
@@ -636,6 +700,7 @@ class TransactionApplier:
         date_value: str,
         allocations: list[tuple[str | None, float]] | None,
         touched_coins: set[str],
+        tx_hash: str = "",
     ) -> None:
         """
         Applies a reward quantity and reallocates principal by weighted source buckets.
@@ -655,7 +720,6 @@ class TransactionApplier:
         invested = float(reward_quantity) * price
 
         asset_in.quantity += reward_quantity
-        asset_in.adjust_principal(invested)
         touched_coins.add(asset_in.coin)
 
         normalized_allocations: list[tuple[str | None, float]] = []
@@ -666,13 +730,19 @@ class TransactionApplier:
             normalized_allocations.append((normalized_source, weight))
 
         if not normalized_allocations:
-            asset_in.adjust_principal(-invested)
             return
 
         total_weight = sum(weight for _, weight in normalized_allocations)
         if total_weight <= 0:
-            asset_in.adjust_principal(-invested)
             return
+
+        self.ledger.adjust_principal(
+            asset=asset_in,
+            amount_eur=invested,
+            date_value=date_value,
+            action="reward",
+            tx_hash=tx_hash,
+        )
 
         remaining_value = invested
         for idx, (source_coin, weight) in enumerate(normalized_allocations):
@@ -683,11 +753,23 @@ class TransactionApplier:
                 remaining_value -= share
 
             if source_coin is None:
-                asset_in.adjust_principal(-share)
+                self.ledger.adjust_principal(
+                    asset=asset_in,
+                    amount_eur=-share,
+                    date_value=date_value,
+                    action="reward_unallocated",
+                    tx_hash=tx_hash,
+                )
                 continue
 
             source_asset = self.ledger.fetch_asset(source_coin)
-            source_asset.adjust_principal(-share)
+            self.ledger.adjust_principal(
+                asset=source_asset,
+                amount_eur=-share,
+                date_value=date_value,
+                action="reward_source",
+                tx_hash=tx_hash,
+            )
             touched_coins.add(source_asset.coin)
 
     def handle_fees(
@@ -699,6 +781,7 @@ class TransactionApplier:
         outs: list[TxEntry],
         tx_type_lower: str,
         touched_coins: set[str],
+        tx_hash: str = "",
     ) -> None:
         fee_str = row.get("Fee")
         fee_token = row.get("Fee Token")
@@ -724,17 +807,30 @@ class TransactionApplier:
             target_entries = outs
 
         if target_entries:
-            fee_asset.adjust_principal(-fee_val_eur)
+            self.ledger.adjust_principal(
+                asset=fee_asset,
+                amount_eur=-fee_val_eur,
+                date_value=date_value,
+                action="fee",
+                tx_hash=tx_hash,
+            )
             share_val_eur = fee_val_eur / len(target_entries)
             for entry in target_entries:
                 target_asset = self.ledger.fetch_asset(entry.token)
-                target_asset.adjust_principal(share_val_eur)
+                self.ledger.adjust_principal(
+                    asset=target_asset,
+                    amount_eur=share_val_eur,
+                    date_value=date_value,
+                    action="fee_allocation",
+                    tx_hash=tx_hash,
+                )
                 touched_coins.add(target_asset.coin)
 
     def process_transaction(self, row: pd.Series):
         tx_type: str = row["Type"]
         tx_type_lower = tx_type.lower()
         date_value = row["Date"]
+        tx_hash = "" if pd.isna(row.get("TX Hash", "")) else str(row.get("TX Hash", ""))
 
         ins = self.parser.parse_entries(qty_val=row.get("Qty in"), token_val=row.get("Token in"))
         outs = self.parser.parse_entries(
@@ -748,11 +844,14 @@ class TransactionApplier:
             entry_out = outs[0]
 
             asset_in = self.ledger.fetch_asset(entry_in.token)
-            asset_in.buy(
-                amount_bought=entry_in.quantity,
-                fiat_spent=entry_out.quantity,
-                currency=entry_out.token,
-                date=date_value,
+            asset_in.quantity += entry_in.quantity
+            rate = get_forex_rate(currency=entry_out.token, date=date_value)
+            self.ledger.adjust_principal(
+                asset=asset_in,
+                amount_eur=float(entry_out.quantity) * rate,
+                date_value=date_value,
+                action="buy",
+                tx_hash=tx_hash,
             )
             touched_coins.add(asset_in.coin)
 
@@ -763,6 +862,7 @@ class TransactionApplier:
                     asset=asset_in,
                     amount_received=entry.quantity,
                     date_value=date_value,
+                    tx_hash=tx_hash,
                 )
                 touched_coins.add(asset_in.coin)
 
@@ -771,18 +871,26 @@ class TransactionApplier:
             entry_out = outs[0]
 
             asset_out = self.ledger.fetch_asset(entry_out.token)
-            asset_out.sell(
-                amount_sold=entry_out.quantity,
-                fiat_received=entry_in.quantity,
-                currency=entry_in.token,
-                date=date_value,
+            asset_out.quantity -= entry_out.quantity
+            rate = get_forex_rate(currency=entry_in.token, date=date_value)
+            self.ledger.adjust_principal(
+                asset=asset_out,
+                amount_eur=-(float(entry_in.quantity) * rate),
+                date_value=date_value,
+                action="sell",
+                tx_hash=tx_hash,
             )
             touched_coins.add(asset_out.coin)
 
         elif tx_type_lower == "send":
             for entry in outs:
                 asset_out = self.ledger.fetch_asset(entry.token)
-                self.send(asset=asset_out, amount_sent=entry.quantity, date_value=date_value)
+                self.send(
+                    asset=asset_out,
+                    amount_sent=entry.quantity,
+                    date_value=date_value,
+                    tx_hash=tx_hash,
+                )
                 touched_coins.add(asset_out.coin)
 
         elif tx_type_lower == "swap":
@@ -791,6 +899,7 @@ class TransactionApplier:
                 outs=outs,
                 date_value=date_value,
                 touched_coins=touched_coins,
+                tx_hash=tx_hash,
             )
 
         elif tx_type_lower.startswith("reward"):
@@ -800,6 +909,7 @@ class TransactionApplier:
                 allocate_reward_to=allocate_reward_to,
                 date_value=date_value,
                 touched_coins=touched_coins,
+                tx_hash=tx_hash,
             )
 
         elif tx_type_lower.startswith("approve"):
@@ -819,6 +929,7 @@ class TransactionApplier:
             outs=outs,
             tx_type_lower=tx_type_lower,
             touched_coins=touched_coins,
+            tx_hash=tx_hash,
         )
 
         self.ledger.update_snapshots(touched_coins=touched_coins, date_value=date_value)
@@ -832,6 +943,12 @@ class SnapshotWriter:
         df["Date"] = df["Date"].map(format_daily_datetime)
         df.to_csv(output_path, index=False)
         print(f"Portfolio snapshots successfully saved to {output_path}")
+
+    def save_principal(self, *, tracker: CryptoTracker, events_path: Path, daily_path: Path):
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        daily_path.parent.mkdir(parents=True, exist_ok=True)
+        tracker.ledger.principal_ledger.events_frame().to_csv(events_path, index=False)
+        tracker.ledger.principal_ledger.daily_frame().to_csv(daily_path, index=False)
 
 
 class CryptoTracker:
@@ -978,8 +1095,17 @@ class CryptoTracker:
     def save_to_csv(self, output_path: Path):
         self.writer.save(history=self.history, output_path=output_path)
 
+    def save_principal_to_csv(self, *, events_path: Path, daily_path: Path):
+        self.writer.save_principal(tracker=self, events_path=events_path, daily_path=daily_path)
 
-def generate_raw_snapshots(input_csv: Path, output_csv: Path, chain: str) -> None:
+
+def generate_raw_snapshots(
+    input_csv: Path,
+    output_csv: Path,
+    chain: str,
+    principal_events_csv: Path | None = None,
+    principal_daily_csv: Path | None = None,
+) -> None:
     df = pd.read_csv(input_csv, dtype=str)
     parsed_dates = parse_transaction_datetime_series(df["Date"])
     invalid_date_count = int(parsed_dates.isna().sum())
@@ -1001,5 +1127,10 @@ def generate_raw_snapshots(input_csv: Path, output_csv: Path, chain: str) -> Non
         tracker.process_transaction(row)
 
     tracker.save_to_csv(output_csv)
+    if principal_events_csv is not None and principal_daily_csv is not None:
+        tracker.save_principal_to_csv(
+            events_path=principal_events_csv,
+            daily_path=principal_daily_csv,
+        )
     if tracker.unresolved_prices:
         print(f"[raw_snapshots] Unresolved price events: {len(tracker.unresolved_prices)}")

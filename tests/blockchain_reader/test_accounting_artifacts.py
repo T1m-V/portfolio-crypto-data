@@ -28,6 +28,15 @@ def _patch_accounting_paths(monkeypatch, tmp_path: Path) -> dict[str, Path]:
     return paths
 
 
+def _write_principal_daily(paths: dict[str, Path], rows: list[dict[str, object]]) -> None:
+    root = paths["accounting"] / "arbitrum"
+    root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows, columns=["Date", "Coin", "PrincipalInvestedEUR"]).to_csv(
+        root / "principal_daily.csv",
+        index=False,
+    )
+
+
 def test_accounting_canonicalizes_btc_wrappers_to_base_asset(monkeypatch, tmp_path) -> None:
     paths = _patch_accounting_paths(monkeypatch, tmp_path)
     monkeypatch.setattr(shared_prices, "get_forex_rate", lambda **_: 1.0)
@@ -51,11 +60,15 @@ def test_accounting_canonicalizes_btc_wrappers_to_base_asset(monkeypatch, tmp_pa
                 "Date": "2025-01-01",
                 "Coin": coin,
                 "Quantity": 1.0,
-                "Principal Invested": 40000.0,
+                "Principal Invested": 0.0,
             }
             for coin in ("WBTC", "tBTC", "renBTC")
         ]
     ).to_csv(paths["snapshots"] / "arbitrum_raw_snapshots.csv", index=False)
+    _write_principal_daily(
+        paths,
+        [{"Date": "2025-01-01", "Coin": "BTC", "PrincipalInvestedEUR": 120000.0}],
+    )
 
     result = accounting.build_accounting_artifacts(chain="arbitrum", as_of_date="2025-01-01")
 
@@ -64,6 +77,7 @@ def test_accounting_canonicalizes_btc_wrappers_to_base_asset(monkeypatch, tmp_pa
     assert base["Coin"].tolist() == ["BTC"]
     assert base.iloc[0]["Quantity"] == 3.0
     assert base.iloc[0]["MarketValueEUR"] == 120000.0
+    assert base.iloc[0]["PrincipalInvestedEUR"] == 120000.0
 
 
 def test_accounting_missing_material_price_creates_blocking_issue(monkeypatch, tmp_path) -> None:
@@ -124,7 +138,7 @@ def test_accounting_combines_aave_wsteth_quantity_with_eth_principal_proxy(
                 "Date": "2025-03-15",
                 "Coin": "ETH",
                 "Quantity": 0.0,
-                "Principal Invested": 1000.0,
+                "Principal Invested": 0.0,
             },
             {
                 "Date": "2025-03-15",
@@ -134,6 +148,10 @@ def test_accounting_combines_aave_wsteth_quantity_with_eth_principal_proxy(
             },
         ]
     ).to_csv(paths["snapshots"] / "arbitrum_raw_snapshots.csv", index=False)
+    _write_principal_daily(
+        paths,
+        [{"Date": "2025-03-15", "Coin": "ETH", "PrincipalInvestedEUR": 1000.0}],
+    )
 
     result = accounting.build_accounting_artifacts(chain="arbitrum", as_of_date="2025-03-15")
 
@@ -149,7 +167,56 @@ def test_accounting_combines_aave_wsteth_quantity_with_eth_principal_proxy(
     source = pd.read_csv(result.paths.source_base_daily)
     aave_eth = source[(source["Source"] == "Aave") & (source["BaseCoin"] == "ETH")].iloc[0]
     assert aave_eth["MarketValueEUR"] == 1000.0
-    assert aave_eth["PrincipalInvestedEUR"] == 0.0
+    assert aave_eth["PrincipalInvestedEUR"] == 1000.0
+
+
+def test_accounting_uses_future_single_family_composition_for_base_identity(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    paths = _patch_accounting_paths(monkeypatch, tmp_path)
+    monkeypatch.setattr(shared_prices, "get_forex_rate", lambda **_: 1.0)
+    (paths["tokens"] / "arbitrum_tokens.json").write_text(
+        json.dumps(
+            {
+                "0xeth": {"symbol": "ETH"},
+                "0xwsteth": {"symbol": "wstETH", "protocol": "liquid_staking"},
+            }
+        )
+    )
+    pd.DataFrame([{"Date": "2025-01-01", "Price": 1000.0}]).to_csv(
+        paths["prices"] / "ETH.csv",
+        index=False,
+    )
+    liquid_staking = paths["protocol"] / "liquid_staking"
+    liquid_staking.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"date": "2025-01-02", "asset_ETH": 1.1}]).to_csv(
+        liquid_staking / "arbitrum_wstETH.csv",
+        index=False,
+    )
+    pd.DataFrame(
+        [
+            {
+                "Date": "2025-01-01",
+                "Coin": "wstETH",
+                "Quantity": 1.0,
+                "Principal Invested": 0.0,
+            },
+        ]
+    ).to_csv(paths["snapshots"] / "arbitrum_raw_snapshots.csv", index=False)
+    _write_principal_daily(
+        paths,
+        [{"Date": "2025-01-01", "Coin": "ETH", "PrincipalInvestedEUR": 1100.0}],
+    )
+
+    result = accounting.build_accounting_artifacts(chain="arbitrum", as_of_date="2025-01-01")
+
+    assert result.errors == []
+    base = pd.read_csv(result.paths.base_daily)
+    assert base["Coin"].tolist() == ["ETH"]
+    assert base.iloc[0]["Quantity"] == 1.1
+    assert base.iloc[0]["MarketValueEUR"] == 1100.0
+    assert base.iloc[0]["PrincipalInvestedEUR"] == 1100.0
 
 
 def test_accounting_nested_eth_wrapper_to_aave_does_not_create_pnl_cliff(
@@ -222,7 +289,7 @@ def test_accounting_nested_eth_wrapper_to_aave_does_not_create_pnl_cliff(
                 "Date": "2024-12-17",
                 "Coin": "ETH",
                 "Quantity": 0.0,
-                "Principal Invested": 2000.0,
+                "Principal Invested": 0.0,
             },
             {
                 "Date": "2024-12-17",
@@ -234,7 +301,7 @@ def test_accounting_nested_eth_wrapper_to_aave_does_not_create_pnl_cliff(
                 "Date": "2024-12-18",
                 "Coin": "ETH",
                 "Quantity": 0.0,
-                "Principal Invested": 2000.0,
+                "Principal Invested": 0.0,
             },
             {
                 "Date": "2024-12-18",
@@ -250,6 +317,13 @@ def test_accounting_nested_eth_wrapper_to_aave_does_not_create_pnl_cliff(
             },
         ]
     ).to_csv(paths["snapshots"] / "arbitrum_raw_snapshots.csv", index=False)
+    _write_principal_daily(
+        paths,
+        [
+            {"Date": "2024-12-17", "Coin": "ETH", "PrincipalInvestedEUR": 2000.0},
+            {"Date": "2024-12-18", "Coin": "ETH", "PrincipalInvestedEUR": 2000.0},
+        ],
+    )
 
     result = accounting.build_accounting_artifacts(chain="arbitrum", as_of_date="2024-12-18")
 
