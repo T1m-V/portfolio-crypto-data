@@ -10,6 +10,7 @@ from blockchain_reader.extraction.evm_reader import (
     _fetch_explorer_data,
     _normalize_results_frame,
     _parse_transaction_datetime_series,
+    should_fetch_metadata_for_transaction,
 )
 
 
@@ -78,3 +79,8 @@ def test_fetch_explorer_data_handles_no_transactions() -> None:
 
     assert data == []
     get_mock.assert_called_once()
+
+
+def test_passive_transactions_do_not_fetch_metadata() -> None:
+    assert should_fetch_metadata_for_transaction(is_standard_transaction=True) is True
+    assert should_fetch_metadata_for_transaction(is_standard_transaction=False) is False

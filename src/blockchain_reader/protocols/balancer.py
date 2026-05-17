@@ -4,6 +4,7 @@ from decimal import Decimal
 from web3 import Web3
 
 from blockchain_reader.datetime_utils import format_daily_datetime
+from blockchain_reader.pipeline_logging import PipelineLogger
 from blockchain_reader.protocols.common import (
     load_block_map,
     load_chain_web3,
@@ -11,6 +12,7 @@ from blockchain_reader.protocols.common import (
     load_tokens,
     resolve_date_window,
     resolve_effective_start_date,
+    resolve_protocol_end_date,
     should_skip_date_window,
     write_protocol_history_csv,
 )
@@ -119,7 +121,12 @@ def get_balancer_underlying(
     pool_id = bpt_contract.functions.getPoolId().call(block_identifier=block_number)
 
     # 2. Get Total Supply (Handling Phantom BPTs)
-    total_supply = bpt_contract.functions.getActualSupply().call(block_identifier=block_number)
+    try:
+        total_supply = bpt_contract.functions.getActualSupply().call(block_identifier=block_number)
+    except Exception:
+        total_supply = bpt_contract.functions.totalSupply().call(block_identifier=block_number)
+    if total_supply == 0:
+        return {}
 
     # 3. Get User's Share
     # (User Balance / Total Circulating Supply)
@@ -161,6 +168,8 @@ def get_balancer_history(
     start_date: str,
     end_date: str,
     vault_address: str = BALANCER_VAULT_ADDR,
+    replace_from_date: str | None = None,
+    logger: PipelineLogger | None = None,
 ) -> None:
     """
     Main execution loop for fetching Balancer history.
@@ -172,6 +181,7 @@ def get_balancer_history(
         end_date: End date string (YYYY-MM-DD or 'now').
         vault_address: The address of the Balancer Vault (defaults to standard V2 Vault).
     """
+    logger = logger or PipelineLogger()
     w3 = load_chain_web3(chain=chain)
     start_dt, end_dt = resolve_date_window(start_date=start_date, end_date=end_date)
     block_map = load_block_map(chain=chain)
@@ -185,23 +195,31 @@ def get_balancer_history(
     bpt_symbol = bpt_contract.functions.symbol().call()
 
     current_dt = start_dt
+    total_days = max((end_dt.date() - start_dt.date()).days + 1, 1)
+    day_index = 0
     while current_dt <= end_dt:
+        day_index += 1
         # 1. Find Block
         date_str = format_daily_datetime(current_dt)
 
         if date_str in block_map:
             block_num = block_map[date_str]
         else:
-            print(f"Skipping {date_str}: Block not found in map.")
             current_dt += timedelta(days=1)
             continue
 
-        print(f"Date: {date_str} | Block: {block_num}")
+        logger.protocol_day(
+            "balancer",
+            bpt_symbol,
+            date_str=date_str,
+            block_number=block_num,
+            day_index=day_index,
+            total_days=total_days,
+        )
 
         try:
             # Check if contract exists at this block
             if len(w3.eth.get_code(bpt, block_identifier=block_num)) == 0:
-                print("  -> Contract not deployed yet.")
                 current_dt += timedelta(days=1)
                 continue
 
@@ -229,12 +247,12 @@ def get_balancer_history(
         except Exception as e:
             err_str = str(e)
             if "missing trie node" in err_str or "not available" in err_str:
-                print(
+                logger.info(
                     f"Error on {current_dt.date()}: Missing historical state. "
                     f"Ensure your RPC URL for '{chain}' supports Archive Node mode."
                 )
             else:
-                print(f"Error on {current_dt.date()}: {e}")
+                logger.info(f"[balancer] Error on {current_dt.date()} for {bpt_symbol}: {e}")
 
         current_dt += timedelta(days=1)
 
@@ -243,12 +261,19 @@ def get_balancer_history(
         chain=chain,
         symbol=bpt_symbol,
         history_data=history_data,
+        replace_from_date=replace_from_date,
     )
     if output:
-        print(f"[balancer] Saved to {output}")
+        logger.protocol_end("balancer", bpt_symbol, output)
 
 
-def process_all_balancer_tokens(chain: str, start_date: str | None = None) -> None:
+def process_all_balancer_tokens(
+    chain: str,
+    start_date: str | None = None,
+    replace_from_date: str | None = None,
+    logger: PipelineLogger | None = None,
+) -> None:
+    logger = logger or PipelineLogger()
     tokens = load_tokens(chain=chain)
     token_ranges = load_snapshot_ranges(chain=chain)
     for address, info in tokens.items():
@@ -257,7 +282,7 @@ def process_all_balancer_tokens(chain: str, start_date: str | None = None) -> No
 
         symbol = info.get("symbol", address)
         if symbol not in token_ranges:
-            print(f"[balancer] Skipping {symbol}: no snapshot data found.")
+            logger.protocol_skip("balancer", symbol, "no snapshot data found")
             continue
 
         rng = token_ranges[symbol]
@@ -269,24 +294,24 @@ def process_all_balancer_tokens(chain: str, start_date: str | None = None) -> No
             explicit_start_date=start_date,
             fallback_start_date=fallback_start_date,
         )
-        end_date = "now" if rng["qty"] > 0 else format_daily_datetime(rng["end"])
+        end_date = resolve_protocol_end_date(rng)
         if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
-            print(
-                f"[balancer] Skipping {symbol}: start={resolved_start_date} is after end={end_date}"
+            logger.protocol_skip(
+                "balancer",
+                symbol,
+                f"start={resolved_start_date} is after end={end_date}",
             )
             continue
 
         if resolved_start_date is None:
             continue
 
-        print(f"[balancer] Processing {symbol} ({resolved_start_date} -> {end_date})")
+        logger.protocol_start("balancer", symbol, resolved_start_date, end_date)
         get_balancer_history(
             chain=chain,
             pool_address=address,
             start_date=resolved_start_date,
             end_date=end_date,
+            replace_from_date=replace_from_date,
+            logger=logger,
         )
-
-
-if __name__ == "__main__":
-    process_all_balancer_tokens(chain="arbitrum")

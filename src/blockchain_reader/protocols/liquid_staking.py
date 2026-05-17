@@ -3,12 +3,14 @@ from datetime import timedelta
 from decimal import Decimal
 
 from blockchain_reader.datetime_utils import format_daily_datetime
+from blockchain_reader.pipeline_logging import PipelineLogger
 from blockchain_reader.protocols.common import (
     load_block_map,
     load_chain_web3,
     load_snapshot_ranges,
     resolve_date_window,
     resolve_effective_start_date,
+    resolve_protocol_end_date,
     should_skip_date_window,
     write_protocol_history_csv,
 )
@@ -66,7 +68,10 @@ def get_liquid_staking_history(
     end_date: str,
     rate_provider_method: str = "getRate",
     rate_scale: int = 10**18,
+    replace_from_date: str | None = None,
+    logger: PipelineLogger | None = None,
 ) -> None:
+    logger = logger or PipelineLogger()
     w3 = load_chain_web3(chain=chain)
     start_dt, end_dt = resolve_date_window(start_date=start_date, end_date=end_date)
     block_map = load_block_map(chain=chain)
@@ -78,13 +83,24 @@ def get_liquid_staking_history(
     history_data: list[dict[str, object]] = []
 
     current_dt = start_dt
+    total_days = max((end_dt.date() - start_dt.date()).days + 1, 1)
+    day_index = 0
     while current_dt <= end_dt:
+        day_index += 1
         date_str = format_daily_datetime(current_dt)
         block_num = block_map.get(date_str)
         if block_num is None:
             current_dt += timedelta(days=1)
             continue
 
+        logger.protocol_day(
+            "liquid_staking",
+            symbol,
+            date_str=date_str,
+            block_number=block_num,
+            day_index=day_index,
+            total_days=total_days,
+        )
         try:
             if len(w3.eth.get_code(rate_provider.address, block_identifier=block_num)) == 0:
                 current_dt += timedelta(days=1)
@@ -102,7 +118,7 @@ def get_liquid_staking_history(
             }
             history_data.append(row)
         except Exception as e:
-            print(f"[liquid_staking] Error on {current_dt.date()} for {symbol}: {e}")
+            logger.info(f"[liquid_staking] Error on {current_dt.date()} for {symbol}: {e}")
 
         current_dt += timedelta(days=1)
 
@@ -112,12 +128,19 @@ def get_liquid_staking_history(
         symbol=symbol,
         history_data=history_data,
         fieldnames=["date", "block", "lst_balance", f"asset_{underlying_symbol}"],
+        replace_from_date=replace_from_date,
     )
     if output:
-        print(f"[liquid_staking] Saved to {output}")
+        logger.protocol_end("liquid_staking", symbol, output)
 
 
-def process_all_liquid_staking_tokens(chain: str, start_date: str | None = None) -> None:
+def process_all_liquid_staking_tokens(
+    chain: str,
+    start_date: str | None = None,
+    replace_from_date: str | None = None,
+    logger: PipelineLogger | None = None,
+) -> None:
+    logger = logger or PipelineLogger()
     chain_configs = LIQUID_STAKING_TOKENS.get(chain, [])
     if not chain_configs:
         return
@@ -141,19 +164,21 @@ def process_all_liquid_staking_tokens(chain: str, start_date: str | None = None)
             explicit_start_date=start_date,
             fallback_start_date=fallback_start_date,
         )
-        end_date = "now"
+        rng = token_ranges.get(config.symbol)
+        end_date = resolve_protocol_end_date(rng)
         if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
-            print(
-                "[liquid_staking] Skipping "
-                f"{config.symbol}: start={resolved_start_date} is after end={end_date}"
+            logger.protocol_skip(
+                "liquid_staking",
+                config.symbol,
+                f"start={resolved_start_date} is after end={end_date}",
             )
             continue
 
         if resolved_start_date is None:
-            print(f"[liquid_staking] Skipping {config.symbol}: no fallback start date found.")
+            logger.protocol_skip("liquid_staking", config.symbol, "no fallback start date found")
             continue
 
-        print(f"[liquid_staking] Processing {config.symbol} ({resolved_start_date} -> {end_date})")
+        logger.protocol_start("liquid_staking", config.symbol, resolved_start_date, end_date)
         get_liquid_staking_history(
             chain=chain,
             symbol=config.symbol,
@@ -163,8 +188,6 @@ def process_all_liquid_staking_tokens(chain: str, start_date: str | None = None)
             end_date=end_date,
             rate_provider_method=config.rate_provider_method,
             rate_scale=config.rate_scale,
+            replace_from_date=replace_from_date,
+            logger=logger,
         )
-
-
-if __name__ == "__main__":
-    process_all_liquid_staking_tokens(chain="arbitrum")

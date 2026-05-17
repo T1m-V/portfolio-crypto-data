@@ -2,6 +2,12 @@ import re
 from typing import Any
 
 _SYMBOL_SANITIZE_PATTERN = re.compile(r"[^0-9A-Za-z._-]+")
+PRICE_SYMBOL_ALIASES: dict[str, str] = {
+    "WETH": "ETH",
+    "WBTC": "BTC",
+    "tBTC": "BTC",
+    "renBTC": "BTC",
+}
 
 
 def sanitize_symbol(symbol: str | None) -> str:
@@ -34,6 +40,13 @@ def canonicalize_symbol(symbol: str | None, symbol_family: dict[str, str]) -> st
     if not normalized:
         return ""
     return symbol_family.get(normalized, normalized)
+
+
+def price_proxy_symbol(symbol: str | None) -> str:
+    normalized = sanitize_symbol(symbol)
+    if not normalized:
+        return ""
+    return PRICE_SYMBOL_ALIASES.get(normalized, "")
 
 
 def build_address_symbol_map(

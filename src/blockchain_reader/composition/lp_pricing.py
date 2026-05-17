@@ -1,21 +1,21 @@
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
 
 import pandas as pd
 
-from blockchain_reader.shared.prices import STABLE_PRICE_SYMBOLS
-from blockchain_reader.shared.valuation_routes import (
-    ValuationRoute,
-    build_symbol_protocol_map,
-    classify_valuation_route,
+from blockchain_reader.composition.core import (
+    CompositionContext,
+    PriceResolver,
+    ProtocolStore,
+    SymbolMetadata,
+    build_symbol_metadata,
 )
-from blockchain_reader.symbols import sanitize_symbol
+from blockchain_reader.shared.token_metadata import load_token_metadata
+from blockchain_reader.shared.valuation_routes import build_symbol_protocol_map
+from blockchain_reader.symbols import build_symbol_family_map
 from file_paths import (
     PRICES_FOLDER,
     PROTOCOL_UNDERLYING_TOKEN_FOLDER,
@@ -24,230 +24,25 @@ from file_paths import (
 )
 from price_history.price_data_utils import load_price_csv, merge_price_frames, save_price_csv
 
-DUST = Decimal("0.000000000001")
-MAX_RECURSION_DEPTH = 10
+PricingContext = CompositionContext
 
 
-@dataclass(frozen=True)
-class SymbolMetadata:
-    price_source: str
-    family: str
-    protocol: str
+def _load_token_metadata(chain: str) -> dict[str, dict[str, object]]:
+    return load_token_metadata(chain=chain, tokens_folder=TOKENS_FOLDER)
 
 
-@dataclass
-class PricingContext:
-    chain: str
-    symbol_metadata: dict[str, SymbolMetadata]
-    symbol_protocol: dict[str, str]
-    protocol_rows: dict[str, pd.DataFrame]
-    protocol_derived_symbols: set[str]
-    price_cache: dict[str, pd.DataFrame]
-
-
-def _parse_protocol_date(raw_value: object) -> date | None:
-    if isinstance(raw_value, datetime):
-        return raw_value.date()
-    if isinstance(raw_value, date):
-        return raw_value
-
-    value = str(raw_value or "").strip()
-    if not value:
-        return None
-
-    for fmt in (
-        "%Y-%m-%d",
-        "%Y-%m-%d %H:%M:%S",
-        "%d/%m/%Y",
-        "%d/%m/%Y %H:%M:%S",
-        "%d/%m/%Y %H:%M",
-    ):
-        try:
-            return datetime.strptime(value, fmt).date()
-        except ValueError:
-            continue
-
-    parsed = pd.to_datetime(value, errors="coerce", dayfirst=False)
-    if pd.isna(parsed):
-        parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
-    if pd.isna(parsed):
-        return None
-    return parsed.date()
-
-
-def _load_token_metadata(chain: str) -> dict[str, dict[str, Any]]:
-    token_path = TOKENS_FOLDER / f"{chain}_tokens.json"
-    if not token_path.exists():
-        return {}
-
-    with open(token_path, "r") as f:
-        raw = json.load(f)
-    return {str(addr).lower(): meta for addr, meta in raw.items() if isinstance(meta, dict)}
-
-
-def _build_symbol_metadata(token_metadata: dict[str, dict[str, Any]]) -> dict[str, SymbolMetadata]:
-    merged: dict[str, dict[str, str]] = {}
-
-    for meta in token_metadata.values():
-        symbol = sanitize_symbol(meta.get("symbol"))
-        if not symbol:
-            continue
-
-        price_source = sanitize_symbol(meta.get("price_source"))
-        family = sanitize_symbol(meta.get("family"))
-        protocol = sanitize_symbol(meta.get("protocol")).lower()
-        current = merged.get(symbol, {"price_source": "", "family": "", "protocol": ""})
-
-        if not current["price_source"] and price_source:
-            current["price_source"] = price_source
-        if not current["family"] and family:
-            current["family"] = family
-        if not current["protocol"] and protocol:
-            current["protocol"] = protocol
-        merged[symbol] = current
-
-    return {
-        symbol: SymbolMetadata(
-            price_source=meta["price_source"],
-            family=meta["family"],
-            protocol=meta["protocol"],
-        )
-        for symbol, meta in merged.items()
-    }
+def _build_symbol_metadata(
+    token_metadata: dict[str, dict[str, object]],
+) -> dict[str, SymbolMetadata]:
+    return build_symbol_metadata(token_metadata=token_metadata)
 
 
 def _load_protocol_rows(chain: str) -> dict[str, pd.DataFrame]:
-    rows: dict[str, pd.DataFrame] = {}
-    root = PROTOCOL_UNDERLYING_TOKEN_FOLDER
-    if not root.exists():
-        return rows
-
-    for csv_path in root.rglob(f"{chain}_*.csv"):
-        if csv_path.parent.name == "aave":
-            continue
-        if csv_path.name == f"{chain}_base_ingredients.csv":
-            continue
-
-        symbol = sanitize_symbol(csv_path.stem[len(chain) + 1 :])
-        if not symbol:
-            continue
-
-        df = pd.read_csv(csv_path)
-        if "date" not in df.columns:
-            continue
-
-        df["date"] = df["date"].map(_parse_protocol_date)
-        df = df.dropna(subset=["date"]).sort_values("date")
-        if df.empty:
-            continue
-
-        rows[symbol] = df
-
-    return rows
-
-
-def _load_price_history(symbol: str, ctx: PricingContext) -> pd.DataFrame:
-    if symbol in ctx.price_cache:
-        return ctx.price_cache[symbol]
-
-    if symbol in ctx.protocol_derived_symbols:
-        frame = load_price_csv(
-            file_path=get_lp_price_file_path(
-                chain=ctx.chain,
-                symbol=symbol,
-                prices_folder=PRICES_FOLDER,
-            )
-        )
-    else:
-        frame = load_price_csv(file_path=PRICES_FOLDER / f"{symbol}.csv")
-
-    if frame.empty:
-        ctx.price_cache[symbol] = frame
-        return frame
-
-    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce").dt.date
-    frame["Price"] = pd.to_numeric(frame["Price"], errors="coerce")
-    frame = frame.dropna(subset=["Date", "Price"])[["Date", "Price"]].sort_values("Date")
-    ctx.price_cache[symbol] = frame
-    return frame
-
-
-def _price_from_history(symbol: str, target_date: date, ctx: PricingContext) -> Decimal | None:
-    stable_price = STABLE_PRICE_SYMBOLS.get(symbol)
-    if stable_price is not None:
-        return stable_price
-
-    history = _load_price_history(symbol=symbol, ctx=ctx)
-    if history.empty:
-        return None
-
-    eligible = history[history["Date"] <= target_date]
-    if eligible.empty:
-        return None
-
-    return Decimal(str(eligible.iloc[-1]["Price"]))
-
-
-def _find_protocol_row(symbol: str, target_date: date, ctx: PricingContext) -> pd.Series | None:
-    df = ctx.protocol_rows.get(symbol)
-    if df is None or df.empty:
-        return None
-
-    eligible = df[df["date"] <= target_date]
-    if eligible.empty:
-        return None
-
-    return eligible.iloc[-1]
-
-
-def _resolve_from_protocol(
-    symbol: str,
-    target_date: date,
-    ctx: PricingContext,
-    visited: set[str],
-    depth: int,
-) -> Decimal | None:
-    if depth > MAX_RECURSION_DEPTH or symbol in visited:
-        return None
-
-    row = _find_protocol_row(symbol=symbol, target_date=target_date, ctx=ctx)
-    if row is None:
-        return None
-
-    asset_columns = [col for col in row.index if isinstance(col, str) and col.startswith("asset_")]
-    if not asset_columns:
-        return None
-
-    total = Decimal(0)
-    next_visited = set(visited)
-    next_visited.add(symbol)
-
-    for column in asset_columns:
-        quantity_raw = row[column]
-        if pd.isna(quantity_raw):
-            return None
-
-        quantity = Decimal(str(quantity_raw))
-        if abs(quantity) <= DUST:
-            continue
-
-        component_symbol = sanitize_symbol(column.replace("asset_", "", 1))
-        if not component_symbol:
-            return None
-
-        component_price = resolve_symbol_price(
-            symbol=component_symbol,
-            target_date=target_date,
-            ctx=ctx,
-            visited=next_visited,
-            depth=depth + 1,
-        )
-        if component_price is None:
-            return None
-
-        total += quantity * component_price
-
-    return total
+    return ProtocolStore.load(
+        chain=chain,
+        root=PROTOCOL_UNDERLYING_TOKEN_FOLDER,
+        include_aave=False,
+    ).rows
 
 
 def resolve_symbol_price(
@@ -257,72 +52,24 @@ def resolve_symbol_price(
     visited: set[str] | None = None,
     depth: int = 0,
 ) -> Decimal | None:
-    normalized = sanitize_symbol(symbol)
-    if not normalized:
-        return None
-    if depth > MAX_RECURSION_DEPTH:
-        return None
-
-    route = classify_valuation_route(
-        symbol=normalized,
-        symbol_protocol=ctx.symbol_protocol,
-        protocol_derived_symbols=ctx.protocol_derived_symbols,
-    )
-
-    direct = _price_from_history(symbol=normalized, target_date=target_date, ctx=ctx)
-    if direct is not None:
-        return direct
-
-    if route == ValuationRoute.PROTOCOL_DERIVED:
-        return _resolve_from_protocol(
-            symbol=normalized,
-            target_date=target_date,
-            ctx=ctx,
-            visited=visited or set(),
-            depth=depth,
-        )
-
-    metadata = ctx.symbol_metadata.get(normalized)
-    if metadata and metadata.price_source and metadata.price_source != normalized:
-        source_price = _price_from_history(
-            symbol=metadata.price_source,
-            target_date=target_date,
-            ctx=ctx,
-        )
-        if source_price is not None:
-            return source_price
-
-    if (
-        route == ValuationRoute.DIRECT
-        and metadata
-        and metadata.family
-        and metadata.family not in {normalized, metadata.price_source}
-    ):
-        family_price = _price_from_history(
-            symbol=metadata.family,
-            target_date=target_date,
-            ctx=ctx,
-        )
-        if family_price is not None:
-            return family_price
-
-    return _resolve_from_protocol(
-        symbol=normalized,
+    resolution = PriceResolver(ctx=ctx, prices_folder=PRICES_FOLDER, mode="native").resolve(
+        symbol=symbol,
         target_date=target_date,
-        ctx=ctx,
-        visited=visited or set(),
+        visited=visited,
         depth=depth,
     )
+    return resolution.price
 
 
-def _build_incoming_prices(symbol: str, df: pd.DataFrame, ctx: PricingContext) -> pd.DataFrame:
+def _build_incoming_prices(
+    symbol: str,
+    df: pd.DataFrame,
+    price_resolver: PriceResolver,
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for _, row in df.sort_values("date").iterrows():
-        target_date = row["date"]
-        if not isinstance(target_date, date):
-            continue
-
-        price = resolve_symbol_price(symbol=symbol, target_date=target_date, ctx=ctx)
+        target_date = pd.Timestamp(row["date"]).date()
+        price = price_resolver.resolve(symbol=symbol, target_date=target_date).price
         if price is None:
             continue
 
@@ -346,18 +93,24 @@ def generate_protocol_lp_price_files(chain: str) -> list[Path]:
     """
     token_metadata = _load_token_metadata(chain=chain)
     protocol_rows = _load_protocol_rows(chain=chain)
+    symbol_family = build_symbol_family_map(token_metadata=token_metadata)
     ctx = PricingContext(
         chain=chain,
-        symbol_metadata=_build_symbol_metadata(token_metadata=token_metadata),
-        symbol_protocol=build_symbol_protocol_map(token_metadata=token_metadata),
         protocol_rows=protocol_rows,
+        symbol_protocol=build_symbol_protocol_map(token_metadata=token_metadata),
         protocol_derived_symbols=set(protocol_rows.keys()),
-        price_cache={},
+        symbol_family=symbol_family,
+        symbol_metadata=_build_symbol_metadata(token_metadata=token_metadata),
     )
+    price_resolver = PriceResolver(ctx=ctx, prices_folder=PRICES_FOLDER, mode="native")
 
     updated_files: list[Path] = []
     for symbol, df in sorted(ctx.protocol_rows.items(), key=lambda item: item[0]):
-        incoming = _build_incoming_prices(symbol=symbol, df=df, ctx=ctx)
+        incoming = _build_incoming_prices(
+            symbol=symbol,
+            df=df,
+            price_resolver=price_resolver,
+        )
         if incoming.empty:
             continue
 

@@ -19,17 +19,19 @@ def isolate_blockchain_io(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     snapshots_root.mkdir(parents=True, exist_ok=True)
     tokens_root.mkdir(parents=True, exist_ok=True)
 
-    from blockchain_reader.composition import base_ingredients, lp_pricing
+    import blockchain_reader.accounting as accounting
+    from blockchain_reader.composition import lp_pricing
     from price_history.price_data_utils import save_price_csv as _save_price_csv
 
     monkeypatch.setattr(lp_pricing, "PRICES_FOLDER", prices_root)
     monkeypatch.setattr(lp_pricing, "PROTOCOL_UNDERLYING_TOKEN_FOLDER", protocol_root)
     monkeypatch.setattr(lp_pricing, "TOKENS_FOLDER", tokens_root)
 
-    monkeypatch.setattr(base_ingredients, "PRICES_FOLDER", prices_root)
-    monkeypatch.setattr(base_ingredients, "PROTOCOL_UNDERLYING_TOKEN_FOLDER", protocol_root)
-    monkeypatch.setattr(base_ingredients, "BLOCKCHAIN_SNAPSHOT_FOLDER", snapshots_root)
-    monkeypatch.setattr(base_ingredients, "TOKENS_FOLDER", tokens_root)
+    monkeypatch.setattr(accounting, "PRICES_FOLDER", prices_root)
+    monkeypatch.setattr(accounting, "PROTOCOL_UNDERLYING_TOKEN_FOLDER", protocol_root)
+    monkeypatch.setattr(accounting, "BLOCKCHAIN_SNAPSHOT_FOLDER", snapshots_root)
+    monkeypatch.setattr(accounting, "TOKENS_FOLDER", tokens_root)
+    monkeypatch.setattr(accounting, "BLOCKCHAIN_ACCOUNTING_FOLDER", tmp_path / "accounting")
 
     repo_data_root = (Path(__file__).resolve().parents[2] / "data").resolve()
 

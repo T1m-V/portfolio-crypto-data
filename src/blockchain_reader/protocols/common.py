@@ -2,6 +2,7 @@ import csv
 import json
 import os
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +19,8 @@ from file_paths import (
     PROTOCOL_UNDERLYING_TOKEN_FOLDER,
     TOKENS_FOLDER,
 )
+
+ACTIVE_PROTOCOL_QUANTITY_THRESHOLD = Decimal("0.00000001")
 
 
 def load_chain_config(chain: str) -> dict[str, str]:
@@ -193,6 +196,33 @@ def should_skip_date_window(start_date: str | None, end_date: str | None) -> boo
     return start > end
 
 
+def is_material_protocol_quantity(quantity: object) -> bool:
+    try:
+        value = Decimal(str(quantity))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return abs(value) > ACTIVE_PROTOCOL_QUANTITY_THRESHOLD
+
+
+def is_active_protocol_quantity(quantity: object) -> bool:
+    try:
+        value = Decimal(str(quantity))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return value > ACTIVE_PROTOCOL_QUANTITY_THRESHOLD
+
+
+def resolve_protocol_end_date(range_info: dict[str, object] | None) -> str:
+    if range_info is None:
+        return "now"
+
+    # Tiny positive balances are common dust after closing protocol positions; only
+    # a material positive balance should extend non-Aave protocol queries to today.
+    if is_active_protocol_quantity(range_info.get("qty")):
+        return "now"
+    return format_daily_datetime(range_info["end"])
+
+
 def _normalize_history_row(row: dict[str, object]) -> tuple[str | None, dict[str, object]]:
     normalized = dict(row)
     date_key = _normalize_history_date(raw_value=normalized.get("date"))
@@ -216,18 +246,26 @@ def write_protocol_history_csv(
     symbol: str,
     history_data: list[dict[str, object]],
     fieldnames: list[str] | None = None,
+    replace_from_date: str | datetime | None = None,
 ) -> Path | None:
-    if not history_data:
-        return None
-
     output_file = protocol_history_output_path(protocol=protocol, chain=chain, symbol=symbol)
     os.makedirs(output_file.parent, exist_ok=True)
+    replacement_start = _parse_history_date(raw_value=replace_from_date)
+    if not history_data and replacement_start is None:
+        return None
 
     existing_rows = _read_existing_history_rows(output_file=output_file)
     existing_by_date: dict[str, dict[str, object]] = {}
     for row in existing_rows:
         date_key, normalized_row = _normalize_history_row(row=row)
         if date_key is None:
+            continue
+        parsed_date = _parse_history_date(raw_value=date_key)
+        if (
+            replacement_start is not None
+            and parsed_date is not None
+            and parsed_date >= replacement_start
+        ):
             continue
         # Existing rows win when incoming data overlaps on the same date.
         existing_by_date.setdefault(date_key, normalized_row)
@@ -245,6 +283,8 @@ def write_protocol_history_csv(
             merged_by_date[date_key] = row
 
     if not merged_by_date:
+        if replacement_start is not None and output_file.exists():
+            output_file.unlink()
         return None
 
     merged_rows = [merged_by_date[date_key] for date_key in sorted(merged_by_date)]

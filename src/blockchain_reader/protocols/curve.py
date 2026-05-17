@@ -5,6 +5,7 @@ from decimal import Decimal
 from web3 import Web3
 
 from blockchain_reader.datetime_utils import format_daily_datetime
+from blockchain_reader.pipeline_logging import PipelineLogger
 from blockchain_reader.protocols.common import (
     load_block_map,
     load_chain_web3,
@@ -12,6 +13,7 @@ from blockchain_reader.protocols.common import (
     load_tokens,
     resolve_date_window,
     resolve_effective_start_date,
+    resolve_protocol_end_date,
     should_skip_date_window,
     write_protocol_history_csv,
 )
@@ -147,7 +149,10 @@ def get_curve_underlying(
 ) -> dict[str, Decimal]:
     lp = w3.eth.contract(address=lp_token_address, abi=LP_TOKEN_ABI)
     total_supply = lp.functions.totalSupply().call(block_identifier=block_number)
-    pool_address = lp.functions.minter().call(block_identifier=block_number)
+    try:
+        pool_address = lp.functions.minter().call(block_identifier=block_number)
+    except Exception:
+        pool_address = lp_token_address
     pool_tokens = _read_curve_pool_tokens(
         w3=w3, pool_address=pool_address, block_number=block_number
     )
@@ -159,7 +164,15 @@ def get_curve_underlying(
     )
 
 
-def get_curve_history(chain: str, token_address: str, start_date: str, end_date: str) -> None:
+def get_curve_history(
+    chain: str,
+    token_address: str,
+    start_date: str,
+    end_date: str,
+    replace_from_date: str | None = None,
+    logger: PipelineLogger | None = None,
+) -> None:
+    logger = logger or PipelineLogger()
     w3 = load_chain_web3(chain=chain)
     start_dt, end_dt = resolve_date_window(start_date=start_date, end_date=end_date)
     block_map = load_block_map(chain=chain)
@@ -170,13 +183,24 @@ def get_curve_history(chain: str, token_address: str, start_date: str, end_date:
     history_data: list[dict[str, object]] = []
 
     current_dt = start_dt
+    total_days = max((end_dt.date() - start_dt.date()).days + 1, 1)
+    day_index = 0
     while current_dt <= end_dt:
+        day_index += 1
         date_str = format_daily_datetime(current_dt)
         block_num = block_map.get(date_str)
         if block_num is None:
             current_dt += timedelta(days=1)
             continue
 
+        logger.protocol_day(
+            "curve",
+            token_symbol,
+            date_str=date_str,
+            block_number=block_num,
+            day_index=day_index,
+            total_days=total_days,
+        )
         try:
             if len(w3.eth.get_code(token.address, block_identifier=block_num)) == 0:
                 current_dt += timedelta(days=1)
@@ -197,18 +221,28 @@ def get_curve_history(chain: str, token_address: str, start_date: str, end_date:
                 row[f"asset_{sym}"] = float(amount)
             history_data.append(row)
         except Exception as e:
-            print(f"[curve] Error on {current_dt.date()} for {token_symbol}: {e}")
+            logger.info(f"[curve] Error on {current_dt.date()} for {token_symbol}: {e}")
 
         current_dt += timedelta(days=1)
 
     output = write_protocol_history_csv(
-        protocol="curve", chain=chain, symbol=token_symbol, history_data=history_data
+        protocol="curve",
+        chain=chain,
+        symbol=token_symbol,
+        history_data=history_data,
+        replace_from_date=replace_from_date,
     )
     if output:
-        print(f"[curve] Saved to {output}")
+        logger.protocol_end("curve", token_symbol, output)
 
 
-def process_all_curve_tokens(chain: str, start_date: str | None = None) -> None:
+def process_all_curve_tokens(
+    chain: str,
+    start_date: str | None = None,
+    replace_from_date: str | None = None,
+    logger: PipelineLogger | None = None,
+) -> None:
+    logger = logger or PipelineLogger()
     tokens = load_tokens(chain=chain)
     token_ranges = load_snapshot_ranges(chain=chain)
 
@@ -228,22 +262,24 @@ def process_all_curve_tokens(chain: str, start_date: str | None = None) -> None:
             explicit_start_date=start_date,
             fallback_start_date=fallback_start_date,
         )
-        end_date = "now" if rng["qty"] > 0 else format_daily_datetime(rng["end"])
+        end_date = resolve_protocol_end_date(rng)
         if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
-            print(f"[curve] Skipping {symbol}: start={resolved_start_date} is after end={end_date}")
+            logger.protocol_skip(
+                "curve",
+                symbol,
+                f"start={resolved_start_date} is after end={end_date}",
+            )
             continue
 
         if resolved_start_date is None:
             continue
 
-        print(f"[curve] Processing {symbol} ({resolved_start_date} -> {end_date})")
+        logger.protocol_start("curve", symbol, resolved_start_date, end_date)
         get_curve_history(
             chain=chain,
             token_address=address,
             start_date=resolved_start_date,
             end_date=end_date,
+            replace_from_date=replace_from_date,
+            logger=logger,
         )
-
-
-if __name__ == "__main__":
-    process_all_curve_tokens(chain="arbitrum")

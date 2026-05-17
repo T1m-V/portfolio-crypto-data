@@ -37,6 +37,22 @@ OUTPUT_COLUMNS = [
 ]
 
 
+def should_fetch_metadata_for_transaction(*, is_standard_transaction: bool) -> bool:
+    """
+    Determines whether transaction analysis may add unknown token metadata.
+
+    args:
+        is_standard_transaction: Whether the hash came from the wallet's standard tx list.
+
+    returns:
+        True for wallet-initiated standard transactions, false for passive-only hashes.
+    """
+    # Passive-only transfers can be unsolicited dust/spam. This blunt guard keeps
+    # those tokens out of the ledger; legitimate passive tokens need explicit
+    # metadata updates instead of broad passive discovery.
+    return is_standard_transaction
+
+
 def _fetch_explorer_data(
     api_url: str,
     params: dict[str, Any],
@@ -312,17 +328,32 @@ async def retrieve_transactions(
     # We process these first and ALLOW fetching metadata (updating token DB)
     if std_list:
         print(f"Processing {len(std_list)} Standard TXs (Async)...")
-        tasks_std = [analyze_wrapper(tx_hash=tx, fetch_meta=True) for tx in std_list]
+        tasks_std = [
+            analyze_wrapper(
+                tx_hash=tx,
+                fetch_meta=should_fetch_metadata_for_transaction(
+                    is_standard_transaction=True,
+                ),
+            )
+            for tx in std_list
+        ]
 
         # tqdm_asyncio.gather displays a progress bar for async tasks
         batch_results = await tqdm_asyncio.gather(*tasks_std, desc="Standard TXs", unit="tx")
         results.extend([r for r in batch_results if r])
 
     # 6. Phase B: Process Passive Transactions
-    # We process these second and DENY fetching metadata (use only cached tokens)
     if others_list:
         print(f"Processing {len(others_list)} Passive TXs (Async)...")
-        tasks_others = [analyze_wrapper(tx_hash=tx, fetch_meta=False) for tx in others_list]
+        tasks_others = [
+            analyze_wrapper(
+                tx_hash=tx,
+                fetch_meta=should_fetch_metadata_for_transaction(
+                    is_standard_transaction=False,
+                ),
+            )
+            for tx in others_list
+        ]
 
         batch_results = await tqdm_asyncio.gather(*tasks_others, desc="Passive TXs", unit="tx")
         results.extend([r for r in batch_results if r])
@@ -351,9 +382,3 @@ async def retrieve_transactions(
             print("No results generated.")
     finally:
         token_manager.flush()
-
-
-if __name__ == "__main__":
-    asyncio.run(
-        retrieve_transactions(chain="arbitrum", start_date="01/01/2020", end_date="01/02/2026")
-    )

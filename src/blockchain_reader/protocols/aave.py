@@ -13,6 +13,7 @@ from blockchain_reader.datetime_utils import (
     format_daily_datetime,
     parse_daily_datetime,
 )
+from blockchain_reader.pipeline_logging import PipelineLogger
 from blockchain_reader.protocols.common import (
     load_block_map,
     load_chain_config,
@@ -335,8 +336,13 @@ def _derive_aave_bounds_from_transactions(chain: str) -> tuple[str | None, str |
 
 
 def get_aave_daily_exposure(
-    chain: str, start_date: str | None = None, end_date: str | None = None
+    chain: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    replace_from_date: str | None = None,
+    logger: PipelineLogger | None = None,
 ) -> None:
+    logger = logger or PipelineLogger()
     normalized_start_date = format_daily_datetime(start_date) if start_date else None
     normalized_end_date = (
         format_daily_datetime(end_date) if end_date and str(end_date).lower() != "now" else None
@@ -359,7 +365,7 @@ def get_aave_daily_exposure(
         address_symbol_map=address_symbol_map,
     )
     if not descriptors:
-        print("[aave] no Aave token descriptors resolved; skipping")
+        logger.protocol_skip("aave", "aave_daily_exposure", "no Aave token descriptors resolved")
         return
 
     token_contracts = {
@@ -473,12 +479,13 @@ def get_aave_daily_exposure(
         symbol="aave_daily_exposure",
         history_data=history,
         fieldnames=_build_aave_field_order(history=history),
+        replace_from_date=replace_from_date,
     )
     if output:
         first_day = first_processed_day or "-"
         last_day = last_processed_day or "-"
-        print(f"[aave] Saved to {output}")
-        print(
+        logger.protocol_end("aave", "aave_daily_exposure", output)
+        logger.info(
             "[aave] Audit "
             f"first_day={first_day}, last_day={last_day}, days={len(history)}, "
             f"non_zero_net_days={non_zero_net_days}, unresolved_mappings={unresolved_count}, "
@@ -486,7 +493,13 @@ def get_aave_daily_exposure(
         )
 
 
-def process_all_aave_tokens(chain: str, start_date: str | None = None) -> None:
+def process_all_aave_tokens(
+    chain: str,
+    start_date: str | None = None,
+    replace_from_date: str | None = None,
+    logger: PipelineLogger | None = None,
+) -> None:
+    logger = logger or PipelineLogger()
     fallback_start_date, end_date = _derive_aave_bounds_from_transactions(chain=chain)
     resolved_start_date = resolve_effective_start_date(
         protocol="aave",
@@ -496,16 +509,23 @@ def process_all_aave_tokens(chain: str, start_date: str | None = None) -> None:
         fallback_start_date=fallback_start_date,
     )
     if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
-        print(
-            "[aave] Skipping aave_daily_exposure: "
-            f"start={resolved_start_date} is after end={end_date}"
+        logger.protocol_skip(
+            "aave",
+            "aave_daily_exposure",
+            f"start={resolved_start_date} is after end={end_date}",
         )
         return
 
-    get_aave_daily_exposure(chain=chain, start_date=resolved_start_date, end_date=end_date)
-
-
-if __name__ == "__main__":
-    default_start = "2023-03-24"
-    default_end = "2025-05-10"
-    get_aave_daily_exposure(chain="arbitrum", start_date=default_start, end_date=default_end)
+    logger.protocol_start(
+        "aave",
+        "aave_daily_exposure",
+        resolved_start_date or "<initial>",
+        end_date or "<auto-close>",
+    )
+    get_aave_daily_exposure(
+        chain=chain,
+        start_date=resolved_start_date,
+        end_date=end_date,
+        replace_from_date=replace_from_date,
+        logger=logger,
+    )

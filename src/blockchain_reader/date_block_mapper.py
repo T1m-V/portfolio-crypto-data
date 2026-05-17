@@ -217,7 +217,3 @@ def map_blocks(chain: str, start_date: str | None = None, end_date: str | None =
         print(f"Saved updated map to {map_file_path}")
     else:
         print("No new dates to save.")
-
-
-if __name__ == "__main__":
-    map_blocks(chain="arbitrum")
