@@ -147,7 +147,13 @@ def _clear_lp_price_outputs(chain: str) -> None:
 
 def _clear_accounting_outputs(chain: str) -> None:
     paths = accounting_paths(chain=chain)
-    for path in (paths.source_base_daily, paths.base_daily, paths.issues):
+    for path in (
+        paths.principal_events,
+        paths.principal_daily,
+        paths.source_base_daily,
+        paths.base_daily,
+        paths.issues,
+    ):
         _delete_file(path)
 
 
@@ -331,6 +337,7 @@ def _run_snapshots_stage(
     _ = replace_derived, logger
     transactions_path = _transaction_path(chain)
     output_path = _raw_snapshot_path(chain)
+    principal_paths = accounting_paths(chain=chain)
     if not transactions_path.exists():
         return StageResult(
             name="snapshots",
@@ -341,6 +348,7 @@ def _run_snapshots_stage(
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    principal_paths.principal_events.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(
         suffix=".csv",
         prefix=f"{chain}_raw_snapshots_",
@@ -348,18 +356,36 @@ def _run_snapshots_stage(
         delete=False,
     ) as temp_file:
         temp_path = Path(temp_file.name)
+    with NamedTemporaryFile(
+        suffix=".csv",
+        prefix=f"{chain}_principal_events_",
+        dir=principal_paths.principal_events.parent,
+        delete=False,
+    ) as temp_file:
+        temp_principal_events = Path(temp_file.name)
+    with NamedTemporaryFile(
+        suffix=".csv",
+        prefix=f"{chain}_principal_daily_",
+        dir=principal_paths.principal_daily.parent,
+        delete=False,
+    ) as temp_file:
+        temp_principal_daily = Path(temp_file.name)
 
     try:
         generate_raw_snapshots(
             input_csv=transactions_path,
             output_csv=temp_path,
             chain=chain,
+            principal_events_csv=temp_principal_events,
+            principal_daily_csv=temp_principal_daily,
         )
         rows = _merge_generated_daily_rows(
             existing_path=output_path,
             generated_path=temp_path,
             from_date=from_date,
         )
+        temp_principal_events.replace(principal_paths.principal_events)
+        temp_principal_daily.replace(principal_paths.principal_daily)
     except Exception as exc:
         return StageResult(
             name="snapshots",
@@ -369,15 +395,20 @@ def _run_snapshots_stage(
             errors=[str(exc)],
         )
     finally:
-        if temp_path.exists():
-            temp_path.unlink()
+        for path in (temp_path, temp_principal_events, temp_principal_daily):
+            if path.exists():
+                path.unlink()
 
     return StageResult(
         name="snapshots",
         start_date=_format_daily_bound(from_date),
         end_date=_format_daily_bound(to_date),
-        files=[output_path],
-        rows={"raw_snapshots": rows},
+        files=[output_path, principal_paths.principal_events, principal_paths.principal_daily],
+        rows={
+            "raw_snapshots": rows,
+            "principal_events": _count_rows(principal_paths.principal_events),
+            "principal_daily": _count_rows(principal_paths.principal_daily),
+        },
     )
 
 
@@ -464,11 +495,15 @@ def _run_accounting_stage(
         start_date=_format_daily_bound(from_date),
         end_date=_format_daily_bound(to_date),
         files=[
+            paths.principal_events,
+            paths.principal_daily,
             paths.source_base_daily,
             paths.base_daily,
             paths.issues,
         ],
         rows={
+            "principal_events": _count_rows(paths.principal_events),
+            "principal_daily": _count_rows(paths.principal_daily),
             "source_base_daily": _count_rows(paths.source_base_daily),
             "base_daily": _count_rows(paths.base_daily),
             "issues": _count_rows(paths.issues),

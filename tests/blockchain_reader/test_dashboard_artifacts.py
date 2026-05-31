@@ -39,6 +39,15 @@ def _patch_artifact_paths(monkeypatch, tmp_path) -> dict[str, object]:
     return paths
 
 
+def _write_principal_daily(paths: dict[str, object], rows: list[dict[str, object]]) -> None:
+    root = paths["accounting"] / "arbitrum"
+    root.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows, columns=["Date", "Coin", "PrincipalInvestedEUR"]).to_csv(
+        root / "principal_daily.csv",
+        index=False,
+    )
+
+
 def test_build_arbitrum_dashboard_artifacts_writes_schema_and_splits_lp_principal(
     monkeypatch,
     tmp_path,
@@ -70,10 +79,17 @@ def test_build_arbitrum_dashboard_artifacts_writes_schema_and_splits_lp_principa
                 "Date": "2022-12-01",
                 "Coin": "mooFishUSDT-USDC",
                 "Quantity": 1.0,
-                "Principal Invested": 4000.0,
+                "Principal Invested": 0.0,
             }
         ]
     ).to_csv(paths["snapshots"] / "arbitrum_raw_snapshots.csv", index=False)
+    _write_principal_daily(
+        paths,
+        [
+            {"Date": "2022-12-01", "Coin": "USDC", "PrincipalInvestedEUR": 2000.0},
+            {"Date": "2022-12-01", "Coin": "USDT", "PrincipalInvestedEUR": 2000.0},
+        ],
+    )
     pd.DataFrame(
         [
             {
@@ -168,10 +184,14 @@ def test_build_arbitrum_dashboard_artifacts_treats_variable_debt_as_negative_pri
                 "Date": "2024-06-08",
                 "Coin": "variableDebtArbLINK",
                 "Quantity": 12.5,
-                "Principal Invested": 183.0,
+                "Principal Invested": 0.0,
             }
         ]
     ).to_csv(paths["snapshots"] / "arbitrum_raw_snapshots.csv", index=False)
+    _write_principal_daily(
+        paths,
+        [{"Date": "2024-06-08", "Coin": "LINK", "PrincipalInvestedEUR": -183.0}],
+    )
     pd.DataFrame(
         [
             {
@@ -247,7 +267,7 @@ def test_build_arbitrum_dashboard_artifacts_uses_eth_principal_proxy_for_aave_ws
                 "Date": "2025-03-15",
                 "Coin": "ETH",
                 "Quantity": 0.0,
-                "Principal Invested": 1000.0,
+                "Principal Invested": 0.0,
             },
             {
                 "Date": "2025-03-15",
@@ -257,6 +277,10 @@ def test_build_arbitrum_dashboard_artifacts_uses_eth_principal_proxy_for_aave_ws
             },
         ]
     ).to_csv(paths["snapshots"] / "arbitrum_raw_snapshots.csv", index=False)
+    _write_principal_daily(
+        paths,
+        [{"Date": "2025-03-15", "Coin": "ETH", "PrincipalInvestedEUR": 1000.0}],
+    )
     pd.DataFrame(
         [
             {
@@ -361,7 +385,7 @@ def test_build_arbitrum_dashboard_artifacts_keeps_nested_eth_wrapper_pnl_stable(
                 "Date": "2024-12-17",
                 "Coin": "ETH",
                 "Quantity": 0.0,
-                "Principal Invested": 2000.0,
+                "Principal Invested": 0.0,
             },
             {
                 "Date": "2024-12-17",
@@ -373,7 +397,7 @@ def test_build_arbitrum_dashboard_artifacts_keeps_nested_eth_wrapper_pnl_stable(
                 "Date": "2024-12-18",
                 "Coin": "ETH",
                 "Quantity": 0.0,
-                "Principal Invested": 2000.0,
+                "Principal Invested": 0.0,
             },
             {
                 "Date": "2024-12-18",
@@ -389,6 +413,13 @@ def test_build_arbitrum_dashboard_artifacts_keeps_nested_eth_wrapper_pnl_stable(
             },
         ]
     ).to_csv(paths["snapshots"] / "arbitrum_raw_snapshots.csv", index=False)
+    _write_principal_daily(
+        paths,
+        [
+            {"Date": "2024-12-17", "Coin": "ETH", "PrincipalInvestedEUR": 2000.0},
+            {"Date": "2024-12-18", "Coin": "ETH", "PrincipalInvestedEUR": 2000.0},
+        ],
+    )
     pd.DataFrame(
         [
             {
@@ -464,7 +495,7 @@ def test_build_timeseries_daily_extends_closed_assets_with_zero_value_and_rolled
     assert btc["TxCount"].tolist() == [0, 1, 0]
 
 
-def test_protocol_source_closure_keeps_residual_principal_on_underlying(
+def test_protocol_source_closure_reallocates_base_principal_to_active_source(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -499,22 +530,29 @@ def test_protocol_source_closure_keeps_residual_principal_on_underlying(
                 "Date": "2025-01-01",
                 "Coin": "OLD-ETH",
                 "Quantity": 1.0,
-                "Principal Invested": 1000.0,
+                "Principal Invested": 0.0,
             },
             {
                 "Date": "2025-01-02",
                 "Coin": "OLD-ETH",
                 "Quantity": 0.0,
-                "Principal Invested": 250.0,
+                "Principal Invested": 0.0,
             },
             {
                 "Date": "2025-01-02",
                 "Coin": "NEW-ETH",
                 "Quantity": 1.0,
-                "Principal Invested": 750.0,
+                "Principal Invested": 0.0,
             },
         ]
     ).to_csv(paths["snapshots"] / "arbitrum_raw_snapshots.csv", index=False)
+    _write_principal_daily(
+        paths,
+        [
+            {"Date": "2025-01-01", "Coin": "ETH", "PrincipalInvestedEUR": 1000.0},
+            {"Date": "2025-01-02", "Coin": "ETH", "PrincipalInvestedEUR": 1000.0},
+        ],
+    )
     pd.DataFrame(
         [
             {
@@ -540,10 +578,16 @@ def test_protocol_source_closure_keeps_residual_principal_on_underlying(
     assert eth["ProfitLossEUR"].tolist() == [0.0, 0.0]
 
     sources = pd.read_csv(artifact_paths.source_daily)
-    closed_old = sources[
+    old_rows = sources[
         (sources["Date"] == "2025-01-02")
         & (sources["Selection"] == "ETH")
         & (sources["Source"] == "OLD-ETH")
+    ]
+    assert old_rows.empty
+    new_row = sources[
+        (sources["Date"] == "2025-01-02")
+        & (sources["Selection"] == "ETH")
+        & (sources["Source"] == "NEW-ETH")
     ].iloc[0]
-    assert closed_old["Quantity"] == 0.0
-    assert closed_old["PrincipalInvestedEUR"] == 250.0
+    assert new_row["Quantity"] == 1.0
+    assert new_row["PrincipalInvestedEUR"] == 1000.0

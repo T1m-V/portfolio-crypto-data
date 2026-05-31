@@ -16,6 +16,7 @@ from blockchain_reader.composition.core import (
     component_value_weights,
 )
 from blockchain_reader.datetime_utils import format_daily_datetime, parse_daily_datetime
+from blockchain_reader.principal_ledger import PRINCIPAL_DAILY_COLUMNS, PRINCIPAL_EVENT_COLUMNS
 from blockchain_reader.shared.prices import clear_price_cache
 from blockchain_reader.shared.token_metadata import load_token_metadata
 from blockchain_reader.shared.valuation_routes import ValuationRoute
@@ -76,6 +77,8 @@ INTERNAL_SOURCE_BASE_COLUMNS = [*SOURCE_BASE_DAILY_COLUMNS, "_ResolvedMarketValu
 
 @dataclass(frozen=True)
 class AccountingArtifactPaths:
+    principal_events: Path
+    principal_daily: Path
     source_base_daily: Path
     base_daily: Path
     issues: Path
@@ -91,6 +94,8 @@ class AccountingBuildResult:
 def accounting_paths(chain: str) -> AccountingArtifactPaths:
     root = BLOCKCHAIN_ACCOUNTING_FOLDER / chain
     return AccountingArtifactPaths(
+        principal_events=root / "principal_events.csv",
+        principal_daily=root / "principal_daily.csv",
         source_base_daily=root / "source_base_daily.csv",
         base_daily=root / "base_daily.csv",
         issues=root / "issues.csv",
@@ -136,6 +141,25 @@ def _normalize_snapshot_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return normalized[columns].reset_index(drop=True)
 
 
+def _normalize_principal_daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty or not set(PRINCIPAL_DAILY_COLUMNS).issubset(frame.columns):
+        return _empty(PRINCIPAL_DAILY_COLUMNS)
+
+    normalized = frame.copy()
+    normalized["_row_order"] = range(len(normalized))
+    normalized["Date"] = _parse_daily_series(normalized["Date"])
+    normalized["Coin"] = normalized["Coin"].map(sanitize_symbol)
+    normalized["PrincipalInvestedEUR"] = pd.to_numeric(
+        normalized["PrincipalInvestedEUR"],
+        errors="coerce",
+    ).fillna(0.0)
+    normalized = normalized.dropna(subset=["Date"])
+    normalized = normalized[normalized["Coin"] != ""]
+    normalized = normalized.sort_values(["Date", "Coin", "_row_order"])
+    normalized = normalized.groupby(["Date", "Coin"], as_index=False).tail(1)
+    return normalized[PRINCIPAL_DAILY_COLUMNS].reset_index(drop=True)
+
+
 def _dense_snapshot_state(
     *,
     snapshots: pd.DataFrame,
@@ -167,6 +191,31 @@ def _dense_snapshot_state(
         how="outer",
     )
     return merged.sort_values(["Date", "Coin"]).reset_index(drop=True)
+
+
+def _dense_principal_state(
+    *,
+    principal_daily: pd.DataFrame,
+    end_date: pd.Timestamp | None,
+) -> pd.DataFrame:
+    if principal_daily.empty:
+        return _empty(PRINCIPAL_DAILY_COLUMNS)
+
+    latest_date = principal_daily["Date"].max()
+    final_date = max(latest_date, end_date) if end_date is not None else latest_date
+    calendar = pd.date_range(start=principal_daily["Date"].min(), end=final_date, freq="D")
+    pivot = principal_daily.pivot(index="Date", columns="Coin", values="PrincipalInvestedEUR")
+    dense = pivot.reindex(calendar).sort_index().ffill().fillna(0.0)
+    melted = dense.reset_index().melt(
+        id_vars="index",
+        var_name="Coin",
+        value_name="PrincipalInvestedEUR",
+    )
+    return (
+        melted.rename(columns={"index": "Date"})[PRINCIPAL_DAILY_COLUMNS]
+        .sort_values(["Date", "Coin"])
+        .reset_index(drop=True)
+    )
 
 
 def _load_aave_overlay(chain: str) -> pd.DataFrame | None:
@@ -685,14 +734,19 @@ def _build_aave_source_position_rows(
 def _build_source_base_daily(
     *,
     snapshots: pd.DataFrame,
+    principal_daily: pd.DataFrame,
     ctx: CompositionContext,
     metadata: dict[str, dict[str, Any]],
     end_date: pd.Timestamp | None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if snapshots.empty:
+    if snapshots.empty and principal_daily.empty:
         return _empty(SOURCE_BASE_DAILY_COLUMNS), _empty(ACCOUNTING_ISSUE_COLUMNS)
 
     dense = _dense_snapshot_state(snapshots=snapshots, end_date=end_date)
+    dense_principal = _dense_principal_state(
+        principal_daily=principal_daily,
+        end_date=end_date,
+    )
     price_resolver = PriceResolver(ctx=ctx, prices_folder=PRICES_FOLDER, mode="eur")
     previous_shares: dict[str, dict[str, float]] = {}
     rows: list[dict[str, object]] = []
@@ -732,7 +786,7 @@ def _build_source_base_daily(
                 continue
 
             quantity = Decimal(str(state["Quantity"]))
-            principal = Decimal(str(state["Principal Invested"]))
+            principal = Decimal("0")
             if abs(quantity) > DUST:
                 rows.extend(
                     _active_rows_for_source(
@@ -747,48 +801,137 @@ def _build_source_base_daily(
                         issues=issues,
                     )
                 )
-            else:
-                rows.extend(
-                    _closed_rows_for_source(
-                        date_value=date_ts,
-                        source=source,
-                        principal=principal,
-                        route=route,
-                        ctx=ctx,
-                        metadata=metadata,
-                        previous_shares=previous_shares,
-                    )
-                )
 
     source_base = pd.DataFrame(rows, columns=INTERNAL_SOURCE_BASE_COLUMNS)
+    if source_base.empty:
+        source_base = _empty(INTERNAL_SOURCE_BASE_COLUMNS)
+    else:
+        for column in ("Quantity", "MarketValueEUR", "PrincipalInvestedEUR", "RealizedPnLEUR"):
+            source_base[column] = pd.to_numeric(source_base[column], errors="coerce")
+        source_base["_ResolvedMarketValue"] = source_base["_ResolvedMarketValue"].map(bool)
+        source_base = source_base[
+            source_base.apply(
+                lambda row: _is_material(
+                    quantity=Decimal(str(row["Quantity"])),
+                    market_value=(
+                        None
+                        if pd.isna(row["MarketValueEUR"])
+                        else Decimal(str(row["MarketValueEUR"]))
+                    ),
+                    principal=Decimal(str(row["PrincipalInvestedEUR"])),
+                    realized_pnl=Decimal(str(row["RealizedPnLEUR"])),
+                ),
+                axis=1,
+            )
+        ].copy()
+        source_base["MarketValueEUR"] = source_base["MarketValueEUR"].fillna(0.0)
+
+    source_base = _allocate_principal_to_sources(
+        source_base=source_base,
+        principal_daily=dense_principal,
+    )
     if source_base.empty:
         return _empty(SOURCE_BASE_DAILY_COLUMNS), pd.DataFrame(
             issues,
             columns=ACCOUNTING_ISSUE_COLUMNS,
         )
 
+    source_base = source_base.sort_values(["Date", "Source", "BaseCoin"]).reset_index(drop=True)
+    return source_base, pd.DataFrame(
+        issues,
+        columns=ACCOUNTING_ISSUE_COLUMNS,
+    )
+
+
+def _allocate_principal_to_sources(
+    *,
+    source_base: pd.DataFrame,
+    principal_daily: pd.DataFrame,
+) -> pd.DataFrame:
+    if principal_daily.empty:
+        return source_base
+
+    output = source_base.copy()
+    if output.empty:
+        output = _empty(INTERNAL_SOURCE_BASE_COLUMNS)
     for column in ("Quantity", "MarketValueEUR", "PrincipalInvestedEUR", "RealizedPnLEUR"):
-        source_base[column] = pd.to_numeric(source_base[column], errors="coerce")
-    source_base["_ResolvedMarketValue"] = source_base["_ResolvedMarketValue"].map(bool)
-    source_base = source_base[
-        source_base.apply(
+        if column not in output.columns:
+            output[column] = 0.0
+        output[column] = pd.to_numeric(output[column], errors="coerce").fillna(0.0)
+    if "_ResolvedMarketValue" not in output.columns:
+        output["_ResolvedMarketValue"] = True
+
+    appended: list[dict[str, object]] = []
+    principal_frame = principal_daily.copy()
+    principal_frame["Date"] = pd.to_datetime(
+        principal_frame["Date"],
+        errors="coerce",
+    ).dt.normalize()
+    principal_frame["PrincipalInvestedEUR"] = pd.to_numeric(
+        principal_frame["PrincipalInvestedEUR"],
+        errors="coerce",
+    ).fillna(0.0)
+    principal_frame = principal_frame.dropna(subset=["Date"])
+
+    for _, row in principal_frame.iterrows():
+        date_value = pd.Timestamp(row["Date"]).normalize()
+        base_coin = sanitize_symbol(row["Coin"])
+        principal = Decimal(str(row["PrincipalInvestedEUR"]))
+        if not base_coin or abs(principal) < VALUE_DUST_EUR:
+            continue
+
+        mask = (pd.to_datetime(output["Date"], errors="coerce").dt.normalize() == date_value) & (
+            output["BaseCoin"] == base_coin
+        )
+        active = output[mask & (output["MarketValueEUR"].abs() > float(VALUE_DUST_EUR))]
+        if active.empty:
+            appended.append(
+                _source_base_row(
+                    date_value=date_value,
+                    source="Closed",
+                    base_coin=base_coin,
+                    quantity=Decimal("0"),
+                    market_value=Decimal("0"),
+                    principal=principal,
+                    realized_pnl=Decimal("0"),
+                    route=ValuationRoute.DIRECT,
+                    has_direct_exposure=False,
+                    has_protocol_exposure=False,
+                    has_aave_exposure=False,
+                )
+            )
+            continue
+
+        weights = active["MarketValueEUR"].abs()
+        total_weight = Decimal(str(weights.sum()))
+        remaining = principal
+        active_indexes = active.index.tolist()
+        for index, row_index in enumerate(active_indexes):
+            if index == len(active_indexes) - 1:
+                share = remaining
+            else:
+                share = principal * Decimal(str(weights.loc[row_index])) / total_weight
+                remaining -= share
+            output.loc[row_index, "PrincipalInvestedEUR"] += float(share)
+
+    if appended:
+        output = pd.concat(
+            [output, pd.DataFrame(appended, columns=INTERNAL_SOURCE_BASE_COLUMNS)],
+            ignore_index=True,
+            sort=False,
+        )
+    output = output[
+        output.apply(
             lambda row: _is_material(
                 quantity=Decimal(str(row["Quantity"])),
-                market_value=(
-                    None if pd.isna(row["MarketValueEUR"]) else Decimal(str(row["MarketValueEUR"]))
-                ),
+                market_value=Decimal(str(row["MarketValueEUR"])),
                 principal=Decimal(str(row["PrincipalInvestedEUR"])),
                 realized_pnl=Decimal(str(row["RealizedPnLEUR"])),
             ),
             axis=1,
         )
     ].copy()
-    source_base["MarketValueEUR"] = source_base["MarketValueEUR"].fillna(0.0)
-    source_base = source_base.sort_values(["Date", "Source", "BaseCoin"]).reset_index(drop=True)
-    return source_base, pd.DataFrame(
-        issues,
-        columns=ACCOUNTING_ISSUE_COLUMNS,
-    )
+    return output[INTERNAL_SOURCE_BASE_COLUMNS].reset_index(drop=True)
 
 
 def _exposure_route(row: pd.Series) -> str:
@@ -823,7 +966,7 @@ def _build_base_daily(source_base: pd.DataFrame) -> pd.DataFrame:
     if grouped.empty:
         return _empty(BASE_DAILY_COLUMNS)
 
-    grouped["PrincipalInvestedEUR"] = grouped["ActivePrincipalEUR"] - grouped["RealizedPnLEUR"]
+    grouped["PrincipalInvestedEUR"] = grouped["ActivePrincipalEUR"]
     grouped["ProfitLossEUR"] = grouped["MarketValueEUR"] - grouped["PrincipalInvestedEUR"]
     grouped["ValuationRoute"] = grouped.apply(_exposure_route, axis=1)
     grouped["PriceSymbol"] = grouped["Coin"].map(
@@ -868,12 +1011,16 @@ def build_accounting_artifacts(
             ["Date", "Coin", "Quantity", "Principal Invested"],
         )
     )
+    principal_daily = _normalize_principal_daily_frame(
+        _read_csv(paths.principal_daily, PRINCIPAL_DAILY_COLUMNS)
+    )
     end_date = pd.Timestamp(as_of_date).normalize() if as_of_date is not None else None
     if end_date is None and not snapshots.empty:
         end_date = pd.Timestamp(snapshots["Date"].max()).normalize()
 
     source_base, issues = _build_source_base_daily(
         snapshots=snapshots,
+        principal_daily=principal_daily,
         ctx=ctx,
         metadata=metadata,
         end_date=end_date,
@@ -882,6 +1029,9 @@ def build_accounting_artifacts(
 
     _write_csv(paths.source_base_daily, source_base, SOURCE_BASE_DAILY_COLUMNS)
     _write_csv(paths.base_daily, base_daily, BASE_DAILY_COLUMNS)
+    if not paths.principal_events.exists():
+        _write_csv(paths.principal_events, _empty(PRINCIPAL_EVENT_COLUMNS), PRINCIPAL_EVENT_COLUMNS)
+    _write_csv(paths.principal_daily, principal_daily, PRINCIPAL_DAILY_COLUMNS)
     _write_csv(paths.issues, issues, ACCOUNTING_ISSUE_COLUMNS)
     errors = [
         f"{row['Date']} {row['Source']}->{row['BaseCoin']}: {row['Reason']}"
@@ -890,6 +1040,8 @@ def build_accounting_artifacts(
     return AccountingBuildResult(
         paths=paths,
         rows_written={
+            "principal_events": _read_csv(paths.principal_events, PRINCIPAL_EVENT_COLUMNS).shape[0],
+            "principal_daily": len(principal_daily),
             "source_base_daily": len(source_base),
             "base_daily": len(base_daily),
             "issues": len(issues),

@@ -64,6 +64,10 @@ def _patch_prices(monkeypatch, prices: dict[str, float]) -> None:
     )
 
 
+def _principal_balance(tracker: CryptoTracker, coin: str) -> float:
+    return float(tracker.ledger.principal_ledger.balances.get(coin, Decimal("0")))
+
+
 def _tx(
     *,
     tx_type: str,
@@ -186,6 +190,77 @@ def _nested_eth_wrapper_tracker(monkeypatch, tmp_path: Path) -> CryptoTracker:
 
 
 class TestCryptoSnapshots:
+    def test_generate_raw_snapshots_writes_separate_base_principal_ledger(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        _wsteth_tracker(monkeypatch=monkeypatch, tmp_path=tmp_path)
+        transactions = tmp_path / "transactions.csv"
+        raw_output = tmp_path / "raw_snapshots.csv"
+        principal_events = tmp_path / "principal_events.csv"
+        principal_daily = tmp_path / "principal_daily.csv"
+        pd.DataFrame(
+            [
+                {
+                    "TX Hash": "receive",
+                    "Date": "01/01/2025 10:00:00",
+                    "Type": "Receive",
+                    "Qty in": "10",
+                    "Token in": "ETH",
+                    "Qty out": "",
+                    "Token out": "",
+                    "Fee": "",
+                    "Fee Token": "",
+                },
+                {
+                    "TX Hash": "wrap",
+                    "Date": "01/01/2025 11:00:00",
+                    "Type": "Swap",
+                    "Qty in": "10",
+                    "Token in": "wstETH",
+                    "Qty out": "10",
+                    "Token out": "ETH",
+                    "Fee": "",
+                    "Fee Token": "",
+                },
+                {
+                    "TX Hash": "aave",
+                    "Date": "01/01/2025 12:00:00",
+                    "Type": "Swap",
+                    "Qty in": "10",
+                    "Token in": "aArbwstETH",
+                    "Qty out": "10",
+                    "Token out": "wstETH",
+                    "Fee": "",
+                    "Fee Token": "",
+                },
+            ]
+        ).to_csv(transactions, index=False)
+
+        raw_snapshots.generate_raw_snapshots(
+            input_csv=transactions,
+            output_csv=raw_output,
+            chain="arbitrum",
+            principal_events_csv=principal_events,
+            principal_daily_csv=principal_daily,
+        )
+
+        raw = pd.read_csv(raw_output)
+        latest = raw.sort_values("Date").groupby("Coin").tail(1).set_index("Coin")
+        assert latest.loc["ETH", "Quantity"] == 0.0
+        assert latest.loc["wstETH", "Quantity"] == 0.0
+        assert latest.loc["aArbwstETH", "Quantity"] == 10.0
+        assert raw["Principal Invested"].fillna(0.0).eq(0.0).all()
+
+        principal = pd.read_csv(principal_daily)
+        assert principal.columns.tolist() == ["Date", "Coin", "PrincipalInvestedEUR"]
+        assert principal.iloc[-1].to_dict() == {
+            "Date": "2025-01-01 00:00:00",
+            "Coin": "ETH",
+            "PrincipalInvestedEUR": 10000.0,
+        }
+
     def test_protocol_symbols_do_not_use_family_proxy_in_raw_snapshots(self) -> None:
         tracker = CryptoTracker(
             chain="arbitrum",
@@ -198,6 +273,54 @@ class TestCryptoSnapshots:
         wrap = tracker.fetch_asset("WRAP")
         assert wrap.family_proxy is None
         assert wrap.price_source == "WRAP"
+
+    def test_price_proxy_alias_principal_canonicalizes_without_family_metadata(
+        self, monkeypatch
+    ) -> None:
+        tracker = CryptoTracker(
+            chain="arbitrum",
+            token_metadata={"0xweth": {"symbol": "WETH"}},
+        )
+        _patch_prices(monkeypatch, {"ETH": 1000.0, "WETH": 1000.0})
+
+        tracker.process_transaction(_tx(tx_type="Receive", qty_in="1", token_in="WETH"))
+
+        assert tracker.assets["WETH"].quantity == Decimal("1")
+        assert tracker.assets["WETH"].principal == 0.0
+        assert _principal_balance(tracker, "ETH") == 1000.0
+        assert _principal_balance(tracker, "WETH") == 0.0
+
+    def test_single_family_protocol_principal_uses_future_composition_for_base_identity(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        root = _patch_protocol_underlying_root(monkeypatch, tmp_path)
+        protocol_dir = root / "liquid_staking"
+        protocol_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(
+            [
+                {
+                    "date": "2025-01-02",
+                    "asset_ETH": 1.1,
+                }
+            ]
+        ).to_csv(protocol_dir / "arbitrum_wstETH.csv", index=False)
+        _patch_prices(monkeypatch, {"ETH": 1000.0, "wstETH": 1100.0})
+        tracker = CryptoTracker(
+            chain="arbitrum",
+            token_metadata={
+                "0xeth": {"symbol": "ETH"},
+                "0xwsteth": {"symbol": "wstETH", "protocol": "liquid_staking"},
+            },
+        )
+
+        tracker.process_transaction(_tx(tx_type="Receive", qty_in="1", token_in="wstETH"))
+
+        assert tracker.assets["wstETH"].quantity == Decimal("1")
+        assert tracker.assets["wstETH"].principal == 0.0
+        assert _principal_balance(tracker, "ETH") == 1100.0
+        assert _principal_balance(tracker, "wstETH") == 0.0
 
     def test_plain_reward_does_not_create_fake_reward_asset(self) -> None:
         tracker = CryptoTracker(chain="arbitrum", token_metadata={})
@@ -268,10 +391,11 @@ class TestCryptoSnapshots:
 
         assert tracker.assets["aArbUSDT"].price_source == "USDT"
         assert tracker.assets["USDT"].quantity == Decimal("0")
-        assert tracker.assets["USDT"].principal == 1000.0
+        assert tracker.assets["USDT"].principal == 0.0
         assert tracker.assets["aArbUSDT"].quantity == Decimal("1000")
         assert tracker.assets["aArbUSDT"].principal == 0.0
-        assert tracker.assets["aArbUSDT"].family_proxy is tracker.assets["USDT"]
+        assert tracker.assets["aArbUSDT"].family_proxy is None
+        assert _principal_balance(tracker, "USDT") == 1000.0
 
     def test_wrapper_supply_principal_stays_on_base_family_through_aave(
         self,
@@ -283,13 +407,14 @@ class TestCryptoSnapshots:
         _deposit_eth_to_aave_wsteth(tracker=tracker)
 
         assert tracker.assets["ETH"].quantity == Decimal("0")
-        assert tracker.assets["ETH"].principal == 10000.0
+        assert tracker.assets["ETH"].principal == 0.0
         assert tracker.assets["wstETH"].quantity == Decimal("0")
         assert tracker.assets["wstETH"].principal == 0.0
-        assert tracker.assets["wstETH"].family_proxy is tracker.assets["ETH"]
+        assert tracker.assets["wstETH"].family_proxy is None
         assert tracker.assets["aArbwstETH"].quantity == Decimal("10")
         assert tracker.assets["aArbwstETH"].principal == 0.0
-        assert tracker.assets["aArbwstETH"].family_proxy is tracker.assets["ETH"]
+        assert tracker.assets["aArbwstETH"].family_proxy is None
+        assert _principal_balance(tracker, "ETH") == 10000.0
 
     def test_aave_supply_withdraw_unwrap_leaves_no_wrapper_principal(
         self,
@@ -321,11 +446,12 @@ class TestCryptoSnapshots:
         )
 
         assert tracker.assets["ETH"].quantity == Decimal("10")
-        assert tracker.assets["ETH"].principal == 10000.0
+        assert tracker.assets["ETH"].principal == 0.0
         assert tracker.assets["wstETH"].quantity == Decimal("0")
         assert tracker.assets["wstETH"].principal == 0.0
         assert tracker.assets["aArbwstETH"].quantity == Decimal("0")
         assert tracker.assets["aArbwstETH"].principal == 0.0
+        assert _principal_balance(tracker, "ETH") == 10000.0
 
     def test_partial_aave_withdrawal_keeps_principal_on_base_family(
         self,
@@ -347,11 +473,12 @@ class TestCryptoSnapshots:
         )
 
         assert tracker.assets["ETH"].quantity == Decimal("0")
-        assert tracker.assets["ETH"].principal == 10000.0
+        assert tracker.assets["ETH"].principal == 0.0
         assert tracker.assets["wstETH"].quantity == Decimal("4")
         assert tracker.assets["wstETH"].principal == 0.0
         assert tracker.assets["aArbwstETH"].quantity == Decimal("6")
         assert tracker.assets["aArbwstETH"].principal == 0.0
+        assert _principal_balance(tracker, "ETH") == 10000.0
 
     def test_nested_single_family_protocol_principal_stays_on_base_family(
         self,
@@ -383,13 +510,14 @@ class TestCryptoSnapshots:
         )
 
         assert tracker.assets["ETH"].quantity == Decimal("0")
-        assert tracker.assets["ETH"].principal == 2000.0
+        assert tracker.assets["ETH"].principal == 0.0
         assert tracker.assets["wstETH-WETH-BPT"].quantity == Decimal("0")
         assert tracker.assets["wstETH-WETH-BPT"].principal == 0.0
-        assert tracker.assets["wstETH-WETH-BPT"].family_proxy is tracker.assets["ETH"]
+        assert tracker.assets["wstETH-WETH-BPT"].family_proxy is None
         assert tracker.assets["mooBalancerArbwstETH-ETHV3"].quantity == Decimal("2")
         assert tracker.assets["mooBalancerArbwstETH-ETHV3"].principal == 0.0
-        assert tracker.assets["mooBalancerArbwstETH-ETHV3"].family_proxy is tracker.assets["ETH"]
+        assert tracker.assets["mooBalancerArbwstETH-ETHV3"].family_proxy is None
+        assert _principal_balance(tracker, "ETH") == 2000.0
 
     def test_nested_single_family_wrapper_closure_keeps_no_intermediate_principal(
         self,
@@ -440,7 +568,7 @@ class TestCryptoSnapshots:
         )
 
         assert tracker.assets["ETH"].quantity == Decimal("0")
-        assert tracker.assets["ETH"].principal == 2000.0
+        assert tracker.assets["ETH"].principal == 0.0
         assert tracker.assets["wstETH-WETH-BPT"].principal == 0.0
         assert tracker.assets["mooBalancerArbwstETH-ETHV3"].quantity == Decimal("0")
         assert tracker.assets["mooBalancerArbwstETH-ETHV3"].principal == 0.0
@@ -448,6 +576,7 @@ class TestCryptoSnapshots:
         assert tracker.assets["wstETH"].principal == 0.0
         assert tracker.assets["aArbwstETH"].quantity == Decimal("2")
         assert tracker.assets["aArbwstETH"].principal == 0.0
+        assert _principal_balance(tracker, "ETH") == 2000.0
 
     def test_mixed_protocol_wrapper_keeps_principal_on_active_wrapper(
         self,
@@ -490,8 +619,10 @@ class TestCryptoSnapshots:
         assert tracker.assets["USDC"].quantity == Decimal("0")
         assert tracker.assets["USDC"].principal == 0.0
         assert tracker.assets["mooFishUSDT-USDC"].quantity == Decimal("100")
-        assert tracker.assets["mooFishUSDT-USDC"].principal == 100.0
+        assert tracker.assets["mooFishUSDT-USDC"].principal == 0.0
         assert tracker.assets["mooFishUSDT-USDC"].family_proxy is None
+        assert _principal_balance(tracker, "USDC") == 50.0
+        assert _principal_balance(tracker, "USDT") == 50.0
 
     def test_swap_clears_outgoing_principal_using_outgoing_value(self, monkeypatch) -> None:
         tracker = CryptoTracker(chain="arbitrum", token_metadata={})
@@ -533,7 +664,8 @@ class TestCryptoSnapshots:
         assert tracker.assets["USDC"].quantity == Decimal("0")
         assert tracker.assets["USDC"].principal == 0.0
         assert tracker.assets["GLP"].quantity == Decimal("100")
-        assert tracker.assets["GLP"].principal == 100.0
+        assert tracker.assets["GLP"].principal == 0.0
+        assert _principal_balance(tracker, "GLP") == 100.0
 
     def test_swap_assigns_principal_to_unpriced_incoming_leg(self, monkeypatch) -> None:
         tracker = CryptoTracker(
@@ -582,7 +714,8 @@ class TestCryptoSnapshots:
         assert tracker.assets["USDC"].quantity == Decimal("0")
         assert tracker.assets["USDC"].principal == 0.0
         assert tracker.assets["WETH"].principal == 0.0
-        assert tracker.assets["UNPRICED-LP"].principal == 1000.0
+        assert tracker.assets["UNPRICED-LP"].principal == 0.0
+        assert _principal_balance(tracker, "UNPRICED-LP") == 1000.0
 
     def test_swap_records_missing_incoming_price_and_keeps_principal_transfer(
         self, monkeypatch
@@ -632,13 +765,15 @@ class TestCryptoSnapshots:
         )
 
         assert tracker.assets["USDC"].principal == 0.0
-        assert tracker.assets["UNPRICED-LP"].principal == 1000.0
+        assert tracker.assets["UNPRICED-LP"].principal == 0.0
+        assert _principal_balance(tracker, "UNPRICED-LP") == 1000.0
         assert tracker.unresolved_prices[0].coin == "UNPRICED-LP"
         assert tracker.unresolved_prices[0].action == "swap_in"
 
-    def test_reward_with_explicit_source_keeps_reallocation_behavior(self) -> None:
+    def test_reward_with_explicit_source_keeps_reallocation_behavior(self, monkeypatch) -> None:
         tracker = CryptoTracker(chain="arbitrum", token_metadata={})
-        tracker.fetch_asset("GLP").principal = 100.0
+        _patch_prices(monkeypatch, {"ETH": 100.0, "GLP": 1.0})
+        tracker.ledger.principal_ledger.balances["GLP"] = Decimal("100")
         row = pd.Series(
             {
                 "Date": pd.Timestamp("2025-01-01 10:00:00"),
@@ -655,7 +790,8 @@ class TestCryptoSnapshots:
         tracker.process_transaction(row=row)
 
         assert tracker.assets["ETH"].quantity == Decimal("2")
-        assert tracker.assets["GLP"].principal < 100.0
+        assert _principal_balance(tracker, "ETH") == 200.0
+        assert _principal_balance(tracker, "GLP") == -100.0
         assert "REWARD" not in tracker.assets
 
     def test_save_to_csv_uses_second_precision_daily_dates(self) -> None:
