@@ -600,11 +600,24 @@ wheels = [
 [[package]]
 name = "portfolio-core"
 version = "0.2.0"
-source = { git = "https://github.com/T1m-V/portfolio-core.git?rev=v0.2.0#9f30e81cf565750c99c339cd5cb6dc6415307567" }
+source = { editable = "../portfolio-core" }
 dependencies = [
     { name = "pandas" },
     { name = "platformdirs" },
     { name = "python-dotenv" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pandas", specifier = ">=2.3.3" },
+    { name = "platformdirs", specifier = ">=4.3.8" },
+    { name = "python-dotenv", specifier = ">=1.1.1" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "ruff", specifier = ">=0.14.10" },
 ]
 
 [[package]]
@@ -628,7 +641,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pandas", specifier = ">=2.3.3" },
-    { name = "portfolio-core", git = "https://github.com/T1m-V/portfolio-core.git?rev=v0.2.0" },
+    { name = "portfolio-core", editable = "../portfolio-core" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "web3", specifier = ">=7.14.0" },

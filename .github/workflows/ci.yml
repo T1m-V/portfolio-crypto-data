@@ -8,8 +8,19 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: portfolio-crypto-data
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout crypto package
+        uses: actions/checkout@v4
+        with:
+          path: portfolio-crypto-data
+      - name: Checkout editable core dependency
+        uses: actions/checkout@v4
+        with:
+          repository: T1m-V/portfolio-core
+          path: portfolio-core
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true

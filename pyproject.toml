@@ -26,6 +26,9 @@ build-backend = "uv_build"
 required-version = ">=0.12.3,<0.13"
 preview-features = ["centralized-project-envs"]
 
+[tool.uv.sources]
+portfolio-core = { path = "../portfolio-core", editable = true }
+
 [tool.ruff]
 line-length = 100
 target-version = "py314"

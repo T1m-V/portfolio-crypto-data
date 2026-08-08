@@ -88,6 +88,10 @@ Persisted outputs must use atomic replacement so dashboard readers never observe
 
 ## Development
 
+`[project].dependencies` must keep the immutable core Git tag so built wheels are standalone.
+`[tool.uv.sources]` deliberately overrides that dependency with the editable sibling checkout only
+when synchronizing this source repository. Do not replace either side of this two-mode setup.
+
 ```powershell
 uv sync
 uv run ruff check src tests
