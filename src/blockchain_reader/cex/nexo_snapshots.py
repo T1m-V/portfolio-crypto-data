@@ -1016,11 +1016,16 @@ def _build_manual_repayment_actions(
         liquidation_rows.append((idx, date, usd_equivalent, in_token, out_token))
 
     for pair in pairs:
+        principal_value = round(float(pair.manual_repayment.entry.quantity), 2)
         pair_actions_by_row_idx[pair.manual_repayment.idx] = NormalizedAction(
             action="swap",
             ins=[pair.manual_repayment.entry],
             outs=[pair.manual_sell.entry],
             rewards=[],
+            principal_overrides={
+                pair.manual_repayment.entry.token: principal_value,
+                pair.manual_sell.entry.token: -principal_value,
+            },
         )
 
         candidates: list[tuple[pd.Timedelta, Decimal, int]] = []
@@ -1129,12 +1134,24 @@ def _apply_generic_action(
     additions = action.principal_additions or {}
 
     if action.action == "swap":
-        tracker._process_swap(
-            ins=action.ins,
-            outs=action.outs,
-            date=date,
-            touched_coins=touched_coins,
-        )
+        if overrides:
+            for entry in action.ins:
+                asset = tracker.fetch_asset(entry.token)
+                asset.quantity += entry.quantity
+                asset.adjust_principal(overrides.get(entry.token, 0.0))
+                touched_coins.add(asset.coin)
+            for entry in action.outs:
+                asset = tracker.fetch_asset(entry.token)
+                asset.quantity -= entry.quantity
+                asset.adjust_principal(overrides.get(entry.token, 0.0))
+                touched_coins.add(asset.coin)
+        else:
+            tracker._process_swap(
+                ins=action.ins,
+                outs=action.outs,
+                date=date,
+                touched_coins=touched_coins,
+            )
         return
 
     if action.action == "buy":
