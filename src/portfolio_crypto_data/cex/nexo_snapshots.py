@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
-from portfolio_core import BLOCKCHAIN_SNAPSHOT_FOLDER, BLOCKCHAIN_TRANSACTIONS_FOLDER
+from portfolio_core import atomic_write_csv
 
 from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
@@ -1077,23 +1077,26 @@ def _build_manual_repayment_actions(
 def _save_liquidation_review(*, review_rows: list[dict[str, object]], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if not review_rows:
-        pd.DataFrame(columns=LIQUIDATION_REVIEW_COLUMNS).to_csv(output_path, index=False)
+        atomic_write_csv(
+            frame=pd.DataFrame(columns=LIQUIDATION_REVIEW_COLUMNS),
+            path=output_path,
+        )
         return
     frame = pd.DataFrame(review_rows)
     frame = frame[LIQUIDATION_REVIEW_COLUMNS]
-    frame.to_csv(output_path, index=False)
+    atomic_write_csv(frame=frame, path=output_path)
 
 
 def _save_history(history: list[dict], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if not history:
-        pd.DataFrame(columns=SNAPSHOT_COLUMNS).to_csv(output_path, index=False)
+        atomic_write_csv(frame=pd.DataFrame(columns=SNAPSHOT_COLUMNS), path=output_path)
         return
 
     frame = pd.DataFrame(history)
     if frame.empty:
-        pd.DataFrame(columns=SNAPSHOT_COLUMNS).to_csv(output_path, index=False)
+        atomic_write_csv(frame=pd.DataFrame(columns=SNAPSHOT_COLUMNS), path=output_path)
         return
 
     frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
@@ -1104,7 +1107,7 @@ def _save_history(history: list[dict], output_path: Path) -> None:
     frame = frame.dropna(subset=["Quantity", "Principal Invested"])
     frame = frame.sort_values(by=["Date", "Coin"], ascending=[True, True])
     frame = frame[SNAPSHOT_COLUMNS]
-    frame.to_csv(output_path, index=False)
+    atomic_write_csv(frame=frame, path=output_path)
 
 
 def _load_nexo_transaction_exports(input_csv: Path) -> pd.DataFrame:
@@ -1284,11 +1287,4 @@ def generate_nexo_raw_snapshots(input_csv: Path, output_csv: Path) -> None:
     print(
         "[nexo_snapshots] Wrote exchange-liquidation review list "
         f"({len(liquidation_review_rows)} rows) to {liquidation_review_path}"
-    )
-
-
-if __name__ == "__main__":
-    generate_nexo_raw_snapshots(
-        input_csv=BLOCKCHAIN_TRANSACTIONS_FOLDER / "cex" / "nexo",
-        output_csv=BLOCKCHAIN_SNAPSHOT_FOLDER / "cex" / "nexo" / "nexo_raw_snapshots.csv",
     )

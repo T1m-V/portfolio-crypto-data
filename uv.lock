@@ -599,8 +599,8 @@ wheels = [
 
 [[package]]
 name = "portfolio-core"
-version = "0.1.0"
-source = { git = "https://github.com/T1m-V/portfolio-core.git?tag=v0.1.0#16ef8624e2c6c8ed9f31f90c89af7c54c823e584" }
+version = "0.2.0"
+source = { git = "https://github.com/T1m-V/portfolio-core.git?rev=v0.2.0#9f30e81cf565750c99c339cd5cb6dc6415307567" }
 dependencies = [
     { name = "pandas" },
     { name = "platformdirs" },
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "portfolio-crypto-data"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "pandas" },
@@ -628,7 +628,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pandas", specifier = ">=2.3.3" },
-    { name = "portfolio-core", git = "https://github.com/T1m-V/portfolio-core.git?tag=v0.1.0" },
+    { name = "portfolio-core", git = "https://github.com/T1m-V/portfolio-core.git?rev=v0.2.0" },
     { name = "requests", specifier = ">=2.32.5" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "web3", specifier = ">=7.14.0" },

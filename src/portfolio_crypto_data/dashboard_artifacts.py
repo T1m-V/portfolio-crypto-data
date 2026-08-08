@@ -6,12 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from portfolio_core import (
-    BLOCKCHAIN_DASHBOARD_FOLDER,
-    BLOCKCHAIN_TRANSACTIONS_FOLDER,
-    PRICES_FOLDER,
-    TOKENS_FOLDER,
-)
+from portfolio_core import active_context, atomic_write_csv
 
 from portfolio_crypto_data.accounting import (
     BASE_DAILY_COLUMNS,
@@ -113,7 +108,7 @@ class ArbitrumDashboardArtifactPaths:
 
 
 def artifact_paths(chain: str = CHAIN) -> ArbitrumDashboardArtifactPaths:
-    root = BLOCKCHAIN_DASHBOARD_FOLDER / chain
+    root = active_context().paths.dashboard_artifacts / chain
     return ArbitrumDashboardArtifactPaths(
         asset_daily=root / "asset_daily.csv",
         timeseries_daily=root / "timeseries_daily.csv",
@@ -363,7 +358,7 @@ def _build_principal_source_components(
     if snapshots.empty:
         return _empty(columns)
 
-    price_resolver = PriceResolver(ctx=ctx, prices_folder=PRICES_FOLDER, mode="eur")
+    price_resolver = PriceResolver(ctx=ctx, mode="eur")
     rows: list[dict[str, object]] = []
     previous_protocol_component_shares: dict[str, dict[str, float]] = {}
     for _, row in snapshots.iterrows():
@@ -645,7 +640,7 @@ def _build_position_asset_rows(
     if dense.empty:
         return _empty(ASSET_DAILY_COLUMNS)
 
-    price_resolver = PriceResolver(ctx=ctx, prices_folder=PRICES_FOLDER, mode="eur")
+    price_resolver = PriceResolver(ctx=ctx, mode="eur")
     rows: list[dict[str, object]] = []
     for _, row in dense.iterrows():
         source_symbol = sanitize_symbol(row["Coin"])
@@ -734,7 +729,7 @@ def _build_source_quantity_rows(
         return _empty(columns)
 
     expander = ExposureExpander(ctx=ctx)
-    price_resolver = PriceResolver(ctx=ctx, prices_folder=PRICES_FOLDER, mode="eur")
+    price_resolver = PriceResolver(ctx=ctx, mode="eur")
     rows: list[dict[str, object]] = []
     for _, row in dense.iterrows():
         source_symbol = sanitize_symbol(row["Coin"])
@@ -1159,7 +1154,7 @@ def _write_artifact(path: Path, frame: pd.DataFrame, columns: list[str]) -> None
                 output[column] = output[column].dt.strftime("%Y-%m-%d")
             else:
                 output[column] = output[column].astype(str)
-    output.to_csv(path, index=False)
+    atomic_write_csv(frame=output, path=path)
 
 
 def build_arbitrum_dashboard_artifacts(chain: str = CHAIN) -> ArbitrumDashboardArtifactPaths:
@@ -1173,7 +1168,8 @@ def build_arbitrum_dashboard_artifacts(chain: str = CHAIN) -> ArbitrumDashboardA
         Paths for all generated dashboard artifacts.
     """
     paths = artifact_paths(chain=chain)
-    token_metadata = load_token_metadata(chain=chain, tokens_folder=TOKENS_FOLDER)
+    runtime_paths = active_context().paths
+    token_metadata = load_token_metadata(chain=chain, tokens_folder=runtime_paths.tokens)
     metadata = _metadata_by_symbol(token_metadata)
     accounting = accounting_paths(chain=chain)
     base = _normalize_accounting_base_frame(
@@ -1201,7 +1197,7 @@ def build_arbitrum_dashboard_artifacts(chain: str = CHAIN) -> ArbitrumDashboardA
     transactions = _build_transactions_dashboard(
         transactions=_normalize_transactions_frame(
             _read_csv(
-                BLOCKCHAIN_TRANSACTIONS_FOLDER / f"{chain}_transactions.csv",
+                runtime_paths.crypto_transactions / f"{chain}_transactions.csv",
                 TRANSACTIONS_DASHBOARD_COLUMNS[:-1],
             )
         ),

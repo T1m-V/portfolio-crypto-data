@@ -1,6 +1,7 @@
 import json
 
 import pandas as pd
+from portfolio_core import active_context
 
 import portfolio_crypto_data.accounting as accounting
 import portfolio_crypto_data.dashboard_artifacts as dashboard_artifacts
@@ -8,34 +9,19 @@ import portfolio_crypto_data.shared.prices as shared_prices
 
 
 def _patch_artifact_paths(monkeypatch, tmp_path) -> dict[str, object]:
+    runtime_paths = active_context().paths
     paths = {
-        "dashboard": tmp_path / "dashboard",
-        "accounting": tmp_path / "accounting",
-        "protocol": tmp_path / "protocol",
-        "snapshots": tmp_path / "snapshots",
-        "transactions": tmp_path / "transactions",
-        "tokens": tmp_path / "tokens",
-        "prices": tmp_path / "prices",
+        "dashboard": runtime_paths.dashboard_artifacts,
+        "accounting": runtime_paths.accounting,
+        "protocol": runtime_paths.protocol_underlying_tokens,
+        "snapshots": runtime_paths.crypto_snapshots,
+        "transactions": runtime_paths.crypto_transactions,
+        "tokens": runtime_paths.tokens,
+        "prices": runtime_paths.prices,
     }
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
 
-    monkeypatch.setattr(
-        dashboard_artifacts,
-        "BLOCKCHAIN_DASHBOARD_FOLDER",
-        paths["dashboard"],
-    )
-    monkeypatch.setattr(
-        dashboard_artifacts,
-        "BLOCKCHAIN_TRANSACTIONS_FOLDER",
-        paths["transactions"],
-    )
-    monkeypatch.setattr(dashboard_artifacts, "TOKENS_FOLDER", paths["tokens"])
-    monkeypatch.setattr(accounting, "BLOCKCHAIN_ACCOUNTING_FOLDER", paths["accounting"])
-    monkeypatch.setattr(accounting, "PROTOCOL_UNDERLYING_TOKEN_FOLDER", paths["protocol"])
-    monkeypatch.setattr(accounting, "BLOCKCHAIN_SNAPSHOT_FOLDER", paths["snapshots"])
-    monkeypatch.setattr(accounting, "TOKENS_FOLDER", paths["tokens"])
-    monkeypatch.setattr(accounting, "PRICES_FOLDER", paths["prices"])
     return paths
 
 

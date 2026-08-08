@@ -4,11 +4,7 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
-from portfolio_core import (
-    BLOCKCHAIN_BLOCK_MAP_FOLDER,
-    BLOCKCHAIN_TRANSACTIONS_FOLDER,
-    CHAIN_INFO_PATH,
-)
+from portfolio_core import active_context
 from web3 import Web3
 
 from portfolio_crypto_data.datetime_utils import (
@@ -53,7 +49,7 @@ def get_earliest_tx_date(chain: str) -> datetime | None:
     returns:
         The earliest transaction date or None if not found.
     """
-    tx_path = BLOCKCHAIN_TRANSACTIONS_FOLDER / f"{chain}_transactions.csv"
+    tx_path = active_context().paths.crypto_transactions / f"{chain}_transactions.csv"
     if not os.path.exists(path=tx_path):
         return None
 
@@ -82,11 +78,12 @@ def map_blocks(chain: str, start_date: str | None = None, end_date: str | None =
     print(f"--- Starting Block Mapper for {chain} ---")
 
     # 1. Setup Connection
-    if not os.path.exists(path=CHAIN_INFO_PATH):
-        print(f"Config '{CHAIN_INFO_PATH}' not found.")
+    paths = active_context().paths
+    if not os.path.exists(path=paths.chain_config):
+        print(f"Config '{paths.chain_config}' not found.")
         return
 
-    with open(file=CHAIN_INFO_PATH, mode="r") as f:
+    with open(file=paths.chain_config, mode="r") as f:
         config_data = json.load(fp=f)
 
     if chain not in config_data:
@@ -108,8 +105,8 @@ def map_blocks(chain: str, start_date: str | None = None, end_date: str | None =
     search_low = 0
 
     # Define output path similar to evm_reader
-    map_file_path = BLOCKCHAIN_BLOCK_MAP_FOLDER / f"block_map_{chain}.csv"
-    os.makedirs(name=BLOCKCHAIN_BLOCK_MAP_FOLDER, exist_ok=True)
+    map_file_path = paths.block_map / f"block_map_{chain}.csv"
+    os.makedirs(name=paths.block_map, exist_ok=True)
 
     # 2. Load Existing Map
     block_map = {}

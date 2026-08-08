@@ -10,12 +10,7 @@ from tempfile import NamedTemporaryFile
 from typing import Callable, Literal
 
 import pandas as pd
-from portfolio_core import (
-    BLOCKCHAIN_SNAPSHOT_FOLDER,
-    BLOCKCHAIN_TRANSACTIONS_FOLDER,
-    LP_PRICES_FOLDER,
-    PROTOCOL_UNDERLYING_TOKEN_FOLDER,
-)
+from portfolio_core import active_context, atomic_write_csv
 
 from portfolio_crypto_data.accounting import accounting_paths, build_accounting_artifacts
 from portfolio_crypto_data.composition.lp_pricing import generate_protocol_lp_price_files
@@ -100,11 +95,11 @@ class PipelineRunReport:
 
 
 def _transaction_path(chain: str) -> Path:
-    return BLOCKCHAIN_TRANSACTIONS_FOLDER / f"{chain}_transactions.csv"
+    return active_context().paths.crypto_transactions / f"{chain}_transactions.csv"
 
 
 def _raw_snapshot_path(chain: str) -> Path:
-    return BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_raw_snapshots.csv"
+    return active_context().paths.crypto_snapshots / f"{chain}_raw_snapshots.csv"
 
 
 def _stage_index(stage: StageName) -> int:
@@ -127,7 +122,7 @@ def _delete_file(path: Path) -> None:
 
 
 def _clear_protocol_outputs(chain: str) -> None:
-    root = PROTOCOL_UNDERLYING_TOKEN_FOLDER
+    root = active_context().paths.protocol_underlying_tokens
     if not root.exists():
         return
     for protocol_dir in root.iterdir():
@@ -138,7 +133,7 @@ def _clear_protocol_outputs(chain: str) -> None:
 
 
 def _clear_lp_price_outputs(chain: str) -> None:
-    root = LP_PRICES_FOLDER / chain
+    root = active_context().paths.lp_prices / chain
     if not root.exists():
         return
     for path in root.glob("*.csv"):
@@ -268,7 +263,7 @@ def _merge_generated_daily_rows(
     generated = _read_csv(generated_path)
     if generated.empty or from_date is None:
         existing_path.parent.mkdir(parents=True, exist_ok=True)
-        generated.to_csv(existing_path, index=False)
+        atomic_write_csv(frame=generated, path=existing_path)
         return len(generated)
 
     existing = _read_csv(existing_path)
@@ -287,7 +282,7 @@ def _merge_generated_daily_rows(
         replacement = generated[generated_dates >= from_date].copy()
         merged = pd.concat([before, replacement], ignore_index=True, sort=False)
 
-    merged.to_csv(existing_path, index=False)
+    atomic_write_csv(frame=merged, path=existing_path)
     return len(merged)
 
 
@@ -455,7 +450,7 @@ def _run_lp_prices_stage(
 ) -> StageResult:
     _ = replace_derived, logger
     try:
-        files = generate_protocol_lp_price_files(chain=chain)
+        files = generate_protocol_lp_price_files(chain=chain, context=active_context())
     except Exception as exc:
         return StageResult(
             name="lp_prices",

@@ -778,20 +778,17 @@ class TestBlockchainProtocols:
                     }
                 )
 
-            with patch(
-                "portfolio_crypto_data.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                root,
-            ):
-                output = common.write_protocol_history_csv(
-                    protocol="curve",
-                    chain="arbitrum",
-                    symbol="LP",
-                    history_data=[
-                        {"date": "2026-01-02", "block": 999, "asset_A": 9.9, "asset_B": 99},
-                        {"date": "2026-01-03", "block": 30, "asset_A": 3.3, "asset_B": 33},
-                    ],
-                    fieldnames=["date", "block", "asset_A"],
-                )
+            output = common.write_protocol_history_csv(
+                protocol="curve",
+                chain="arbitrum",
+                symbol="LP",
+                history_data=[
+                    {"date": "2026-01-02", "block": 999, "asset_A": 9.9, "asset_B": 99},
+                    {"date": "2026-01-03", "block": 30, "asset_A": 3.3, "asset_B": 33},
+                ],
+                fieldnames=["date", "block", "asset_A"],
+                protocol_root=root,
+            )
 
             assert output == output_path
             with open(output_path, mode="r", newline="", encoding="utf-8") as f:
@@ -824,20 +821,17 @@ class TestBlockchainProtocols:
                 ]
             ).to_csv(output_path, index=False)
 
-            with patch(
-                "portfolio_crypto_data.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                root,
-            ):
-                output = common.write_protocol_history_csv(
-                    protocol="curve",
-                    chain="arbitrum",
-                    symbol="LP",
-                    history_data=[
-                        {"date": "2026-01-02", "block": 200, "asset_A": 22.0},
-                        {"date": "2026-01-04", "block": 400, "asset_A": 44.0},
-                    ],
-                    replace_from_date="2026-01-02",
-                )
+            output = common.write_protocol_history_csv(
+                protocol="curve",
+                chain="arbitrum",
+                symbol="LP",
+                history_data=[
+                    {"date": "2026-01-02", "block": 200, "asset_A": 22.0},
+                    {"date": "2026-01-04", "block": 400, "asset_A": 44.0},
+                ],
+                replace_from_date="2026-01-02",
+                protocol_root=root,
+            )
 
             assert output == output_path
             result = pd.read_csv(output_path)
@@ -862,17 +856,14 @@ class TestBlockchainProtocols:
                 ]
             ).to_csv(output_path, index=False)
 
-            with patch(
-                "portfolio_crypto_data.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                root,
-            ):
-                output = common.write_protocol_history_csv(
-                    protocol="curve",
-                    chain="arbitrum",
-                    symbol="LP",
-                    history_data=[],
-                    replace_from_date="2026-01-02",
-                )
+            output = common.write_protocol_history_csv(
+                protocol="curve",
+                chain="arbitrum",
+                symbol="LP",
+                history_data=[],
+                replace_from_date="2026-01-02",
+                protocol_root=root,
+            )
 
             assert output == output_path
             result = pd.read_csv(output_path)
@@ -1130,15 +1121,12 @@ class TestBlockchainProtocols:
             with open(tokens_root / "arbitrum_tokens.json", "w") as f:
                 json.dump({}, f)
 
-            with (
-                patch(
-                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                    protocol_root,
-                ),
-                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
-            ):
-                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+            updated = lp_pricing.generate_protocol_lp_price_files(
+                chain="arbitrum",
+                protocol_root=protocol_root,
+                prices_folder=prices_root,
+                tokens_folder=tokens_root,
+            )
 
             assert updated == [lp_prices_root / "LP.csv"]
             result = pd.read_csv(lp_prices_root / "LP.csv")
@@ -1177,15 +1165,12 @@ class TestBlockchainProtocols:
             with open(tokens_root / "arbitrum_tokens.json", "w") as f:
                 json.dump({}, f)
 
-            with (
-                patch(
-                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                    protocol_root,
-                ),
-                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
-            ):
-                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+            updated = lp_pricing.generate_protocol_lp_price_files(
+                chain="arbitrum",
+                protocol_root=protocol_root,
+                prices_folder=prices_root,
+                tokens_folder=tokens_root,
+            )
 
             assert set(updated) == {lp_prices_root / "LP.csv", lp_prices_root / "MOO.csv"}
             lp_frame = pd.read_csv(lp_prices_root / "LP.csv")
@@ -1219,15 +1204,12 @@ class TestBlockchainProtocols:
                     f,
                 )
 
-            with (
-                patch(
-                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                    protocol_root,
-                ),
-                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
-            ):
-                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+            updated = lp_pricing.generate_protocol_lp_price_files(
+                chain="arbitrum",
+                protocol_root=protocol_root,
+                prices_folder=prices_root,
+                tokens_folder=tokens_root,
+            )
 
             assert updated == [lp_prices_root / "mooFishUSDT-USDC.csv"]
             frame = pd.read_csv(lp_prices_root / "mooFishUSDT-USDC.csv")
@@ -1256,15 +1238,12 @@ class TestBlockchainProtocols:
             with open(tokens_root / "arbitrum_tokens.json", "w", encoding="utf-8") as f:
                 json.dump({}, f)
 
-            with (
-                patch(
-                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                    protocol_root,
-                ),
-                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
-            ):
-                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+            updated = lp_pricing.generate_protocol_lp_price_files(
+                chain="arbitrum",
+                protocol_root=protocol_root,
+                prices_folder=prices_root,
+                tokens_folder=tokens_root,
+            )
 
             assert updated == [lp_prices_root / "2BTC.csv"]
             frame = pd.read_csv(lp_prices_root / "2BTC.csv")
@@ -1289,15 +1268,12 @@ class TestBlockchainProtocols:
             with open(tokens_root / "arbitrum_tokens.json", "w") as f:
                 json.dump({}, f)
 
-            with (
-                patch(
-                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                    protocol_root,
-                ),
-                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
-            ):
-                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+            updated = lp_pricing.generate_protocol_lp_price_files(
+                chain="arbitrum",
+                protocol_root=protocol_root,
+                prices_folder=prices_root,
+                tokens_folder=tokens_root,
+            )
 
             assert updated == []
             assert not (lp_prices_root / "BAD.csv").exists()
@@ -1330,15 +1306,12 @@ class TestBlockchainProtocols:
             with open(tokens_root / "arbitrum_tokens.json", "w") as f:
                 json.dump({}, f)
 
-            with (
-                patch(
-                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                    protocol_root,
-                ),
-                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
-            ):
-                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+            updated = lp_pricing.generate_protocol_lp_price_files(
+                chain="arbitrum",
+                protocol_root=protocol_root,
+                prices_folder=prices_root,
+                tokens_folder=tokens_root,
+            )
 
             assert updated == [lp_prices_root / "LP.csv"]
             assert (lp_prices_root / "LP.csv").exists()
@@ -1376,15 +1349,12 @@ class TestBlockchainProtocols:
                     f,
                 )
 
-            with (
-                patch(
-                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                    protocol_root,
-                ),
-                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
-            ):
-                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+            updated = lp_pricing.generate_protocol_lp_price_files(
+                chain="arbitrum",
+                protocol_root=protocol_root,
+                prices_folder=prices_root,
+                tokens_folder=tokens_root,
+            )
 
             assert updated == [lp_prices_root / "WRAP.csv"]
             frame = pd.read_csv(lp_prices_root / "WRAP.csv")
@@ -1428,15 +1398,12 @@ class TestBlockchainProtocols:
                     f,
                 )
 
-            with (
-                patch(
-                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-                    protocol_root,
-                ),
-                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
-            ):
-                updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
+            updated = lp_pricing.generate_protocol_lp_price_files(
+                chain="arbitrum",
+                protocol_root=protocol_root,
+                prices_folder=prices_root,
+                tokens_folder=tokens_root,
+            )
 
             assert set(updated) == {lp_prices_root / "wstETH.csv", lp_prices_root / "WRAP.csv"}
             wsteth_frame = pd.read_csv(lp_prices_root / "wstETH.csv")

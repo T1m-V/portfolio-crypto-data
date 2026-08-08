@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 import pandas as pd
-from portfolio_core import BLOCKCHAIN_TRANSACTIONS_FOLDER
+from portfolio_core import active_context
 from tqdm import tqdm
 from web3 import Web3
 
@@ -300,7 +300,7 @@ def _parse_entries_from_row(
 
 
 def _derive_aave_bounds_from_transactions(chain: str) -> tuple[str | None, str | None]:
-    tx_path = BLOCKCHAIN_TRANSACTIONS_FOLDER / f"{chain}_transactions.csv"
+    tx_path = active_context().paths.crypto_transactions / f"{chain}_transactions.csv"
     tokens = load_tokens(chain=chain)
     wrappers = {
         sanitize_symbol(info.get("symbol"))

@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from portfolio_core import PRICES_FOLDER, PROTOCOL_UNDERLYING_TOKEN_FOLDER
 
 from portfolio_crypto_data.composition.core import (
     DUST,
@@ -66,8 +65,8 @@ class PrincipalResolver:
         *,
         chain: str,
         token_metadata: dict[str, dict[str, Any]],
-        protocol_root: Path = PROTOCOL_UNDERLYING_TOKEN_FOLDER,
-        prices_folder: Path = PRICES_FOLDER,
+        protocol_root: Path | None = None,
+        prices_folder: Path | None = None,
     ):
         self.ctx = build_composition_context(
             chain=chain,

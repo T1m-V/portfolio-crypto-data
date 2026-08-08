@@ -4,27 +4,24 @@ import json
 from pathlib import Path
 
 import pandas as pd
+from portfolio_core import active_context
 
 import portfolio_crypto_data.accounting as accounting
 import portfolio_crypto_data.shared.prices as shared_prices
 
 
 def _patch_accounting_paths(monkeypatch, tmp_path: Path) -> dict[str, Path]:
+    runtime_paths = active_context().paths
     paths = {
-        "accounting": tmp_path / "accounting",
-        "snapshots": tmp_path / "snapshots",
-        "protocol": tmp_path / "protocol",
-        "tokens": tmp_path / "tokens",
-        "prices": tmp_path / "prices",
+        "accounting": runtime_paths.accounting,
+        "snapshots": runtime_paths.crypto_snapshots,
+        "protocol": runtime_paths.protocol_underlying_tokens,
+        "tokens": runtime_paths.tokens,
+        "prices": runtime_paths.prices,
     }
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
 
-    monkeypatch.setattr(accounting, "BLOCKCHAIN_ACCOUNTING_FOLDER", paths["accounting"])
-    monkeypatch.setattr(accounting, "BLOCKCHAIN_SNAPSHOT_FOLDER", paths["snapshots"])
-    monkeypatch.setattr(accounting, "PROTOCOL_UNDERLYING_TOKEN_FOLDER", paths["protocol"])
-    monkeypatch.setattr(accounting, "TOKENS_FOLDER", paths["tokens"])
-    monkeypatch.setattr(accounting, "PRICES_FOLDER", paths["prices"])
     return paths
 
 

@@ -3,16 +3,11 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
-from portfolio_core import (
-    BLOCKCHAIN_BLOCK_MAP_FOLDER,
-    BLOCKCHAIN_SNAPSHOT_FOLDER,
-    CHAIN_INFO_PATH,
-    PROTOCOL_UNDERLYING_TOKEN_FOLDER,
-    TOKENS_FOLDER,
-)
+from portfolio_core import active_context, atomic_write_text
 from web3 import Web3
 
 from portfolio_crypto_data.datetime_utils import (
@@ -24,10 +19,11 @@ ACTIVE_PROTOCOL_QUANTITY_THRESHOLD = Decimal("0.00000001")
 
 
 def load_chain_config(chain: str) -> dict[str, str]:
-    if not os.path.exists(CHAIN_INFO_PATH):
-        raise FileNotFoundError(f"Config '{CHAIN_INFO_PATH}' not found.")
+    chain_config = active_context().paths.chain_config
+    if not os.path.exists(chain_config):
+        raise FileNotFoundError(f"Config '{chain_config}' not found.")
 
-    with open(file=CHAIN_INFO_PATH, mode="r") as f:
+    with open(file=chain_config, mode="r") as f:
         config_data = json.load(fp=f)
 
     if chain not in config_data:
@@ -49,7 +45,7 @@ def load_chain_web3(chain: str) -> Web3:
 
 
 def load_tokens(chain: str) -> dict[str, dict[str, str]]:
-    tokens_file_path = TOKENS_FOLDER / f"{chain}_tokens.json"
+    tokens_file_path = active_context().paths.tokens / f"{chain}_tokens.json"
     if not os.path.exists(tokens_file_path):
         raise FileNotFoundError(f"Config '{tokens_file_path}' not found.")
 
@@ -58,7 +54,7 @@ def load_tokens(chain: str) -> dict[str, dict[str, str]]:
 
 
 def load_snapshot_ranges(chain: str) -> dict[str, dict[str, object]]:
-    snapshots_file_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_raw_snapshots.csv"
+    snapshots_file_path = active_context().paths.crypto_snapshots / f"{chain}_raw_snapshots.csv"
     if not os.path.exists(snapshots_file_path):
         raise FileNotFoundError(f"Snapshots '{snapshots_file_path}' not found.")
 
@@ -98,7 +94,7 @@ def resolve_date_window(
 
 
 def load_block_map(chain: str) -> dict[str, int]:
-    map_file_path = BLOCKCHAIN_BLOCK_MAP_FOLDER / f"block_map_{chain}.csv"
+    map_file_path = active_context().paths.block_map / f"block_map_{chain}.csv"
     block_map = {}
     if os.path.exists(path=map_file_path):
         with open(file=map_file_path, mode="r") as f:
@@ -112,8 +108,15 @@ def load_block_map(chain: str) -> dict[str, int]:
     return block_map
 
 
-def protocol_history_output_path(protocol: str, chain: str, symbol: str) -> Path:
-    return PROTOCOL_UNDERLYING_TOKEN_FOLDER / protocol / f"{chain}_{symbol}.csv"
+def protocol_history_output_path(
+    protocol: str,
+    chain: str,
+    symbol: str,
+    *,
+    protocol_root: Path | None = None,
+) -> Path:
+    root = protocol_root or active_context().paths.protocol_underlying_tokens
+    return root / protocol / f"{chain}_{symbol}.csv"
 
 
 def _parse_history_date(raw_value: object) -> datetime | None:
@@ -134,8 +137,19 @@ def _normalize_history_date(raw_value: object) -> str | None:
     return format_daily_datetime(parsed)
 
 
-def get_output_max_processed_date(protocol: str, chain: str, symbol: str) -> datetime | None:
-    output_file = protocol_history_output_path(protocol=protocol, chain=chain, symbol=symbol)
+def get_output_max_processed_date(
+    protocol: str,
+    chain: str,
+    symbol: str,
+    *,
+    protocol_root: Path | None = None,
+) -> datetime | None:
+    output_file = protocol_history_output_path(
+        protocol=protocol,
+        chain=chain,
+        symbol=symbol,
+        protocol_root=protocol_root,
+    )
     if not output_file.exists():
         return None
 
@@ -161,6 +175,7 @@ def resolve_effective_start_date(
     symbol: str,
     explicit_start_date: str | None,
     fallback_start_date: str | None,
+    protocol_root: Path | None = None,
 ) -> str | None:
     if explicit_start_date:
         return format_daily_datetime(explicit_start_date)
@@ -173,6 +188,7 @@ def resolve_effective_start_date(
         protocol=protocol,
         chain=chain,
         symbol=symbol,
+        protocol_root=protocol_root,
     )
     inferred_start_date: str | None = None
     if max_processed_date is not None:
@@ -247,8 +263,14 @@ def write_protocol_history_csv(
     history_data: list[dict[str, object]],
     fieldnames: list[str] | None = None,
     replace_from_date: str | datetime | None = None,
+    protocol_root: Path | None = None,
 ) -> Path | None:
-    output_file = protocol_history_output_path(protocol=protocol, chain=chain, symbol=symbol)
+    output_file = protocol_history_output_path(
+        protocol=protocol,
+        chain=chain,
+        symbol=symbol,
+        protocol_root=protocol_root,
+    )
     os.makedirs(output_file.parent, exist_ok=True)
     replacement_start = _parse_history_date(raw_value=replace_from_date)
     if not history_data and replacement_start is None:
@@ -295,8 +317,9 @@ def write_protocol_history_csv(
         remaining = sorted([name for name in keys if name not in set(preferred)])
         ordered_fieldnames = preferred + remaining
 
-    with open(file=output_file, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f=f, fieldnames=ordered_fieldnames)
-        writer.writeheader()
-        writer.writerows(merged_rows)
+    buffer = StringIO(newline="")
+    writer = csv.DictWriter(f=buffer, fieldnames=ordered_fieldnames)
+    writer.writeheader()
+    writer.writerows(merged_rows)
+    atomic_write_text(text=buffer.getvalue(), path=output_file)
     return output_file

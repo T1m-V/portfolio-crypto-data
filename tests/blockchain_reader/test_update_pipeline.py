@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
+from portfolio_core import active_context
 
 import portfolio_crypto_data.accounting as accounting
 import portfolio_crypto_data.rebuild_arbitrum_derived as rebuild
@@ -13,22 +14,17 @@ from portfolio_crypto_data.dashboard_artifacts import ArbitrumDashboardArtifactP
 
 
 def _patch_update_paths(monkeypatch, tmp_path: Path) -> dict[str, Path]:
+    runtime_paths = active_context().paths
     paths = {
-        "transactions": tmp_path / "transactions",
-        "snapshots": tmp_path / "snapshots",
-        "accounting": tmp_path / "accounting",
-        "dashboard": tmp_path / "dashboard",
-        "protocols": tmp_path / "protocol_underlying_tokens",
-        "lp_prices": tmp_path / "prices" / "lp_prices",
+        "transactions": runtime_paths.crypto_transactions,
+        "snapshots": runtime_paths.crypto_snapshots,
+        "accounting": runtime_paths.accounting,
+        "dashboard": runtime_paths.dashboard_artifacts,
+        "protocols": runtime_paths.protocol_underlying_tokens,
+        "lp_prices": runtime_paths.lp_prices,
     }
     for path in paths.values():
         path.mkdir(parents=True, exist_ok=True)
-
-    monkeypatch.setattr(update, "BLOCKCHAIN_TRANSACTIONS_FOLDER", paths["transactions"])
-    monkeypatch.setattr(update, "BLOCKCHAIN_SNAPSHOT_FOLDER", paths["snapshots"])
-    monkeypatch.setattr(update, "PROTOCOL_UNDERLYING_TOKEN_FOLDER", paths["protocols"])
-    monkeypatch.setattr(update, "LP_PRICES_FOLDER", paths["lp_prices"])
-    monkeypatch.setattr(accounting, "BLOCKCHAIN_ACCOUNTING_FOLDER", paths["accounting"])
 
     def fake_dashboard_paths(chain: str = "arbitrum") -> ArbitrumDashboardArtifactPaths:
         root = paths["dashboard"] / chain
@@ -157,7 +153,7 @@ def test_update_blockchain_data_runs_stages_in_dependency_order(monkeypatch, tmp
 
         return _run
 
-    def fake_lp_prices(chain: str) -> list[Path]:
+    def fake_lp_prices(*, chain: str, context) -> list[Path]:
         calls.append("lp_prices")
         return [tmp_path / "ETH.csv"]
 
@@ -231,9 +227,6 @@ def test_rebuild_arbitrum_derived_runs_only_snapshot_accounting_and_dashboard(
     tmp_path,
 ) -> None:
     paths = _patch_update_paths(monkeypatch, tmp_path)
-    monkeypatch.setattr(rebuild, "BLOCKCHAIN_TRANSACTIONS_FOLDER", paths["transactions"])
-    monkeypatch.setattr(rebuild, "BLOCKCHAIN_SNAPSHOT_FOLDER", paths["snapshots"])
-    monkeypatch.setattr(accounting, "BLOCKCHAIN_ACCOUNTING_FOLDER", paths["accounting"])
     calls: list[str] = []
     pd.DataFrame({"Date": ["01/01/2025 10:00:00"]}).to_csv(
         paths["transactions"] / "arbitrum_transactions.csv",

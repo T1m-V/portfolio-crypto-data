@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 import requests
-from portfolio_core import BLOCKCHAIN_TRANSACTIONS_FOLDER, CHAIN_INFO_PATH, TOKENS_FOLDER
+from portfolio_core import active_context
 from tqdm.asyncio import tqdm_asyncio
 from web3 import Web3
 
@@ -243,10 +243,11 @@ async def retrieve_transactions(
     print(f"--- START PROCESSING: {chain.upper()} ---")
 
     # 1. Load Config
-    if not os.path.exists(CHAIN_INFO_PATH):
-        raise FileNotFoundError(f"Config '{CHAIN_INFO_PATH}' not found.")
+    paths = active_context().paths
+    if not os.path.exists(paths.chain_config):
+        raise FileNotFoundError(f"Config '{paths.chain_config}' not found.")
 
-    with open(CHAIN_INFO_PATH, "r") as f:
+    with open(paths.chain_config, "r") as f:
         config_data = json.load(f)
 
     if chain not in config_data:
@@ -261,10 +262,10 @@ async def retrieve_transactions(
         raise ValueError(f"Chain '{chain}' missing 'api_url' in config.")
 
     # Setup Paths & Connection
-    token_path = TOKENS_FOLDER / f"{chain}_tokens.json"
-    output_path = BLOCKCHAIN_TRANSACTIONS_FOLDER / f"{chain}_transactions.csv"
-    os.makedirs(BLOCKCHAIN_TRANSACTIONS_FOLDER, exist_ok=True)
-    os.makedirs(TOKENS_FOLDER, exist_ok=True)
+    token_path = paths.tokens / f"{chain}_tokens.json"
+    output_path = paths.crypto_transactions / f"{chain}_transactions.csv"
+    os.makedirs(paths.crypto_transactions, exist_ok=True)
+    os.makedirs(paths.tokens, exist_ok=True)
 
     w3 = Web3(Web3.HTTPProvider(cfg["rpc_url"]))
     if not w3.is_connected():

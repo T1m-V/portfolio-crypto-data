@@ -5,12 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from portfolio_core import (
-    CURRENCY_METADATA,
-    get_direct_price_file_path,
-    get_forex_rate,
-    get_lp_price_file_path,
-)
+from portfolio_core import active_context, get_forex_rate
 
 STABLE_PRICE_SYMBOLS: dict[str, Decimal] = {
     "EUR": Decimal("1"),
@@ -79,13 +74,10 @@ def _resolve_price_file_path(
     if use_lp_prices and not chain:
         raise ValueError("LP price lookup requires `chain` from context.")
 
+    root = prices_folder or active_context().paths.prices
     if use_lp_prices:
-        return get_lp_price_file_path(
-            chain=str(chain),
-            symbol=symbol,
-            prices_folder=prices_folder,
-        )
-    return get_direct_price_file_path(symbol=symbol, prices_folder=prices_folder)
+        return root / "lp_prices" / str(chain) / f"{symbol}.csv"
+    return root / f"{symbol}.csv"
 
 
 def clear_price_cache() -> None:
@@ -144,10 +136,20 @@ def get_price_eur_on_or_before(
     if price is None:
         return None
 
-    metadata = currency_metadata or CURRENCY_METADATA
+    context = active_context()
+    resolved_prices_folder = prices_folder or context.paths.prices
+    metadata = currency_metadata if currency_metadata is not None else context.currency_metadata()
     currency = PRICE_CURRENCY_OVERRIDES.get(
         symbol,
         str(metadata.get(symbol, {}).get("currency", "USD")),
     )
-    fx_rate = Decimal(str(get_forex_rate(currency=currency, date=str(_normalize_date(as_of_date)))))
+    fx_rate = Decimal(
+        str(
+            get_forex_rate(
+                currency=currency,
+                date=str(_normalize_date(as_of_date)),
+                prices_folder=resolved_prices_folder,
+            )
+        )
+    )
     return price * fx_rate

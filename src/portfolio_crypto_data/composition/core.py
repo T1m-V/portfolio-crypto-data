@@ -7,14 +7,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pandas as pd
-from portfolio_core import (
-    PRICES_FOLDER,
-    PROTOCOL_UNDERLYING_TOKEN_FOLDER,
-    TOKENS_FOLDER,
-    get_direct_price_file_path,
-    get_lp_price_file_path,
-    load_price_csv,
-)
+from portfolio_core import active_context, load_price_csv
 
 from portfolio_crypto_data.datetime_utils import parse_daily_datetime
 from portfolio_crypto_data.shared.prices import (
@@ -78,9 +71,10 @@ class ProtocolStore:
         cls,
         *,
         chain: str,
-        root: Path = PROTOCOL_UNDERLYING_TOKEN_FOLDER,
+        root: Path | None = None,
         include_aave: bool = False,
     ) -> ProtocolStore:
+        root = root or active_context().paths.protocol_underlying_tokens
         rows: dict[str, pd.DataFrame] = {}
         if not root.exists():
             return cls(chain=chain, rows=rows)
@@ -138,6 +132,7 @@ class CompositionContext:
     known_symbols: set[str] = field(default_factory=set)
     symbol_metadata: dict[str, SymbolMetadata] = field(default_factory=dict)
     price_cache: dict[tuple[str, bool], pd.DataFrame] = field(default_factory=dict)
+    currency_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def route_for(self, symbol: str) -> ValuationRoute:
         return classify_valuation_route(
@@ -187,19 +182,20 @@ def build_composition_context(
     *,
     chain: str,
     token_metadata: dict[str, dict[str, Any]] | None = None,
-    protocol_root: Path = PROTOCOL_UNDERLYING_TOKEN_FOLDER,
+    protocol_root: Path | None = None,
     include_aave: bool = False,
     aave_overlay: pd.DataFrame | None = None,
     aave_wrapper_symbols: set[str] | None = None,
 ) -> CompositionContext:
+    context = active_context()
     metadata = token_metadata
     if metadata is None:
-        metadata = load_token_metadata(chain=chain, tokens_folder=TOKENS_FOLDER)
+        metadata = load_token_metadata(chain=chain, tokens_folder=context.paths.tokens)
 
     symbol_family = build_symbol_family_map(token_metadata=metadata)
     protocol_store = ProtocolStore.load(
         chain=chain,
-        root=protocol_root,
+        root=protocol_root or context.paths.protocol_underlying_tokens,
         include_aave=include_aave,
     )
     return CompositionContext(
@@ -215,6 +211,7 @@ def build_composition_context(
             symbol_family=symbol_family,
         ),
         symbol_metadata=build_symbol_metadata(token_metadata=metadata),
+        currency_metadata=context.currency_metadata(),
     )
 
 
@@ -488,12 +485,12 @@ class PriceResolver:
         self,
         *,
         ctx: CompositionContext,
-        prices_folder: Path = PRICES_FOLDER,
+        prices_folder: Path | None = None,
         mode: PriceMode = "eur",
         fallback_to_oldest: bool = False,
     ):
         self.ctx = ctx
-        self.prices_folder = prices_folder
+        self.prices_folder = prices_folder or active_context().paths.prices
         self.mode = mode
         self.fallback_to_oldest = fallback_to_oldest
         self.currency = "EUR" if mode == "eur" else "native"
@@ -703,6 +700,7 @@ class PriceResolver:
                 prices_folder=self.prices_folder,
                 chain=self.ctx.chain,
                 use_lp_prices=use_lp_prices,
+                currency_metadata=self.ctx.currency_metadata,
                 fallback_to_oldest=self.fallback_to_oldest,
             )
 
@@ -726,13 +724,9 @@ class PriceResolver:
             return self.ctx.price_cache[cache_key]
 
         file_path = (
-            get_lp_price_file_path(
-                chain=self.ctx.chain,
-                symbol=symbol,
-                prices_folder=self.prices_folder,
-            )
+            self.prices_folder / "lp_prices" / self.ctx.chain / f"{symbol}.csv"
             if use_lp_prices
-            else get_direct_price_file_path(symbol=symbol, prices_folder=self.prices_folder)
+            else self.prices_folder / f"{symbol}.csv"
         )
         frame = load_price_csv(file_path=file_path)
         if frame.empty:

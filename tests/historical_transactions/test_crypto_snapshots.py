@@ -3,20 +3,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pandas as pd
+from portfolio_core import active_context
 
 import portfolio_crypto_data.raw_snapshots as raw_snapshots
 from portfolio_crypto_data.raw_snapshots import CryptoTracker
 
 
 def _patch_protocol_underlying_root(monkeypatch, tmp_path: Path) -> Path:
-    root = tmp_path / "protocol_underlying_tokens"
+    root = active_context().paths.protocol_underlying_tokens
     root.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(
-        raw_snapshots,
-        "PROTOCOL_UNDERLYING_TOKEN_FOLDER",
-        root,
-        raising=False,
-    )
     return root
 
 
@@ -195,7 +190,7 @@ class TestCryptoSnapshots:
         monkeypatch,
         tmp_path,
     ) -> None:
-        _wsteth_tracker(monkeypatch=monkeypatch, tmp_path=tmp_path)
+        configured_tracker = _wsteth_tracker(monkeypatch=monkeypatch, tmp_path=tmp_path)
         transactions = tmp_path / "transactions.csv"
         raw_output = tmp_path / "raw_snapshots.csv"
         principal_events = tmp_path / "principal_events.csv"
@@ -244,6 +239,7 @@ class TestCryptoSnapshots:
             chain="arbitrum",
             principal_events_csv=principal_events,
             principal_daily_csv=principal_daily,
+            token_metadata=configured_tracker.ledger.token_metadata,
         )
 
         raw = pd.read_csv(raw_output)

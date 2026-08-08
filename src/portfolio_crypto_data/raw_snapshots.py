@@ -7,12 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from portfolio_core import (
-    PRICES_FOLDER,
-    PROTOCOL_UNDERLYING_TOKEN_FOLDER,
-    TOKENS_FOLDER,
-    get_forex_rate,
-)
+from portfolio_core import active_context, atomic_write_csv, get_forex_rate
 
 from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
@@ -64,6 +59,7 @@ def get_crypto_price(
     returns:
         Crypto price on the requested date, or None when no price is resolvable.
     """
+    context = active_context()
     candidates = [coin]
     proxy = price_proxy_symbol(coin)
     if proxy and proxy not in candidates:
@@ -78,10 +74,11 @@ def get_crypto_price(
             price = get_price_eur_on_or_before(
                 symbol=candidate,
                 as_of_date=date,
-                prices_folder=PRICES_FOLDER,
+                prices_folder=context.paths.prices,
                 chain=chain,
                 use_lp_prices=lookup_lp_prices,
                 fallback_to_oldest=False,
+                currency_metadata=context.currency_metadata(),
             )
             if price is not None:
                 return float(price)
@@ -91,10 +88,11 @@ def get_crypto_price(
             oldest_price = get_price_eur_on_or_before(
                 symbol=candidate,
                 as_of_date=date,
-                prices_folder=PRICES_FOLDER,
+                prices_folder=context.paths.prices,
                 chain=chain,
                 use_lp_prices=lookup_lp_prices,
                 fallback_to_oldest=True,
+                currency_metadata=context.currency_metadata(),
             )
             if oldest_price is not None:
                 if candidate not in STABLE_PRICE_SYMBOLS:
@@ -159,7 +157,7 @@ def _load_protocol_components(
     returns:
         Mapping of protocol token symbol to its component symbols.
     """
-    root = root or PROTOCOL_UNDERLYING_TOKEN_FOLDER
+    root = root or active_context().paths.protocol_underlying_tokens
     if not root.exists():
         return {}
 
@@ -213,12 +211,20 @@ class CryptoPosition:
 
     def buy(self, amount_bought: Decimal, fiat_spent: Decimal, currency: str, date: str):
         self.quantity += amount_bought
-        rate = get_forex_rate(currency=currency, date=date)
+        rate = get_forex_rate(
+            currency=currency,
+            date=date,
+            prices_folder=active_context().paths.prices,
+        )
         self.adjust_principal(float(fiat_spent) * rate)
 
     def sell(self, amount_sold: Decimal, fiat_received: Decimal, currency: str, date: str):
         self.quantity -= amount_sold
-        rate = get_forex_rate(currency=currency, date=date)
+        rate = get_forex_rate(
+            currency=currency,
+            date=date,
+            prices_folder=active_context().paths.prices,
+        )
         self.adjust_principal(-(float(fiat_received) * rate))
 
     def receive(self, amount_received: Decimal, date: str):
@@ -332,21 +338,25 @@ class TransactionParser:
 class PortfolioLedger:
     def __init__(self, chain: str, token_metadata: dict[str, dict[str, Any]] | None = None):
         self.chain = chain
+        paths = active_context().paths
         self.token_metadata = token_metadata or load_token_metadata(
             chain=chain,
-            tokens_folder=TOKENS_FOLDER,
+            tokens_folder=paths.tokens,
         )
         self.symbol_to_meta: dict[str, dict[str, Any]] = {}
         self.symbol_family: dict[str, str] = {}
         self.symbol_protocol = build_symbol_protocol_map(token_metadata=self.token_metadata)
-        self.protocol_components = _load_protocol_components(chain=chain)
+        self.protocol_components = _load_protocol_components(
+            chain=chain,
+            root=paths.protocol_underlying_tokens,
+        )
         self.use_dual_principal = chain == "arbitrum"
         self.principal_ledger = EconomicPrincipalLedger(
             resolver=PrincipalResolver(
                 chain=chain,
                 token_metadata=self.token_metadata,
-                protocol_root=PROTOCOL_UNDERLYING_TOKEN_FOLDER,
-                prices_folder=PRICES_FOLDER,
+                protocol_root=paths.protocol_underlying_tokens,
+                prices_folder=paths.prices,
             )
         )
 
@@ -845,7 +855,11 @@ class TransactionApplier:
 
             asset_in = self.ledger.fetch_asset(entry_in.token)
             asset_in.quantity += entry_in.quantity
-            rate = get_forex_rate(currency=entry_out.token, date=date_value)
+            rate = get_forex_rate(
+                currency=entry_out.token,
+                date=date_value,
+                prices_folder=active_context().paths.prices,
+            )
             self.ledger.adjust_principal(
                 asset=asset_in,
                 amount_eur=float(entry_out.quantity) * rate,
@@ -872,7 +886,11 @@ class TransactionApplier:
 
             asset_out = self.ledger.fetch_asset(entry_out.token)
             asset_out.quantity -= entry_out.quantity
-            rate = get_forex_rate(currency=entry_in.token, date=date_value)
+            rate = get_forex_rate(
+                currency=entry_in.token,
+                date=date_value,
+                prices_folder=active_context().paths.prices,
+            )
             self.ledger.adjust_principal(
                 asset=asset_out,
                 amount_eur=-(float(entry_in.quantity) * rate),
@@ -941,14 +959,20 @@ class SnapshotWriter:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date"])
         df["Date"] = df["Date"].map(format_daily_datetime)
-        df.to_csv(output_path, index=False)
+        atomic_write_csv(frame=df, path=output_path)
         print(f"Portfolio snapshots successfully saved to {output_path}")
 
     def save_principal(self, *, tracker: CryptoTracker, events_path: Path, daily_path: Path):
         events_path.parent.mkdir(parents=True, exist_ok=True)
         daily_path.parent.mkdir(parents=True, exist_ok=True)
-        tracker.ledger.principal_ledger.events_frame().to_csv(events_path, index=False)
-        tracker.ledger.principal_ledger.daily_frame().to_csv(daily_path, index=False)
+        atomic_write_csv(
+            frame=tracker.ledger.principal_ledger.events_frame(),
+            path=events_path,
+        )
+        atomic_write_csv(
+            frame=tracker.ledger.principal_ledger.daily_frame(),
+            path=daily_path,
+        )
 
 
 class CryptoTracker:
@@ -1105,6 +1129,7 @@ def generate_raw_snapshots(
     chain: str,
     principal_events_csv: Path | None = None,
     principal_daily_csv: Path | None = None,
+    token_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     df = pd.read_csv(input_csv, dtype=str)
     parsed_dates = parse_transaction_datetime_series(df["Date"])
@@ -1122,7 +1147,7 @@ def generate_raw_snapshots(
     df = df.dropna(subset=["Date"])
     df = df.sort_values(by=["Date"], ascending=True)
 
-    tracker = CryptoTracker(chain=chain)
+    tracker = CryptoTracker(chain=chain, token_metadata=token_metadata)
     for _, row in df.iterrows():
         tracker.process_transaction(row)
 

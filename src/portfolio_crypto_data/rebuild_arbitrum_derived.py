@@ -4,7 +4,7 @@ import argparse
 import sys
 from typing import Any
 
-from portfolio_core import BLOCKCHAIN_SNAPSHOT_FOLDER, BLOCKCHAIN_TRANSACTIONS_FOLDER
+from portfolio_core import active_context
 
 from portfolio_crypto_data.accounting import accounting_paths, build_accounting_artifacts
 from portfolio_crypto_data.dashboard_artifacts import build_arbitrum_dashboard_artifacts
@@ -14,8 +14,9 @@ CHAIN = "arbitrum"
 
 
 def rebuild_arbitrum_derived(*, as_of_date: str = "2026-05-09") -> dict[str, Any]:
-    transaction_path = BLOCKCHAIN_TRANSACTIONS_FOLDER / f"{CHAIN}_transactions.csv"
-    snapshot_path = BLOCKCHAIN_SNAPSHOT_FOLDER / f"{CHAIN}_raw_snapshots.csv"
+    paths = active_context().paths
+    transaction_path = paths.crypto_transactions / f"{CHAIN}_transactions.csv"
+    snapshot_path = paths.crypto_snapshots / f"{CHAIN}_raw_snapshots.csv"
     if not transaction_path.exists():
         raise FileNotFoundError(f"missing transaction file: {transaction_path}")
 

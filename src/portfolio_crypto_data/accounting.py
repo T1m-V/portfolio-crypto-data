@@ -6,13 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from portfolio_core import (
-    BLOCKCHAIN_ACCOUNTING_FOLDER,
-    BLOCKCHAIN_SNAPSHOT_FOLDER,
-    PRICES_FOLDER,
-    PROTOCOL_UNDERLYING_TOKEN_FOLDER,
-    TOKENS_FOLDER,
-)
+from portfolio_core import active_context, atomic_write_csv
 
 from portfolio_crypto_data.composition.core import (
     DUST,
@@ -92,7 +86,7 @@ class AccountingBuildResult:
 
 
 def accounting_paths(chain: str) -> AccountingArtifactPaths:
-    root = BLOCKCHAIN_ACCOUNTING_FOLDER / chain
+    root = active_context().paths.accounting / chain
     return AccountingArtifactPaths(
         principal_events=root / "principal_events.csv",
         principal_daily=root / "principal_daily.csv",
@@ -219,7 +213,11 @@ def _dense_principal_state(
 
 
 def _load_aave_overlay(chain: str) -> pd.DataFrame | None:
-    overlay_path = PROTOCOL_UNDERLYING_TOKEN_FOLDER / "aave" / f"{chain}_aave_daily_exposure.csv"
+    overlay_path = (
+        active_context().paths.protocol_underlying_tokens
+        / "aave"
+        / f"{chain}_aave_daily_exposure.csv"
+    )
     if not overlay_path.exists():
         return None
 
@@ -247,10 +245,11 @@ def _load_aave_wrapper_symbols(token_metadata: dict[str, dict[str, Any]]) -> set
 
 
 def _build_context(*, chain: str, token_metadata: dict[str, dict[str, Any]]) -> CompositionContext:
+    paths = active_context().paths
     return build_composition_context(
         chain=chain,
         token_metadata=token_metadata,
-        protocol_root=PROTOCOL_UNDERLYING_TOKEN_FOLDER,
+        protocol_root=paths.protocol_underlying_tokens,
         include_aave=False,
         aave_overlay=_load_aave_overlay(chain=chain),
         aave_wrapper_symbols=_load_aave_wrapper_symbols(token_metadata=token_metadata),
@@ -747,7 +746,7 @@ def _build_source_base_daily(
         principal_daily=principal_daily,
         end_date=end_date,
     )
-    price_resolver = PriceResolver(ctx=ctx, prices_folder=PRICES_FOLDER, mode="eur")
+    price_resolver = PriceResolver(ctx=ctx, mode="eur")
     previous_shares: dict[str, dict[str, float]] = {}
     rows: list[dict[str, object]] = []
     issues: list[dict[str, object]] = []
@@ -991,7 +990,7 @@ def _write_csv(path: Path, frame: pd.DataFrame, columns: list[str]) -> None:
         if column not in output.columns:
             output[column] = pd.NA
     output = output[columns]
-    output.to_csv(path, index=False)
+    atomic_write_csv(frame=output, path=path)
 
 
 def build_accounting_artifacts(
@@ -1001,13 +1000,14 @@ def build_accounting_artifacts(
 ) -> AccountingBuildResult:
     clear_price_cache()
     paths = accounting_paths(chain=chain)
-    token_metadata = load_token_metadata(chain=chain, tokens_folder=TOKENS_FOLDER)
+    runtime_paths = active_context().paths
+    token_metadata = load_token_metadata(chain=chain, tokens_folder=runtime_paths.tokens)
     metadata = _metadata_by_symbol(token_metadata=token_metadata)
     ctx = _build_context(chain=chain, token_metadata=token_metadata)
 
     snapshots = _normalize_snapshot_frame(
         _read_csv(
-            BLOCKCHAIN_SNAPSHOT_FOLDER / f"{chain}_raw_snapshots.csv",
+            runtime_paths.crypto_snapshots / f"{chain}_raw_snapshots.csv",
             ["Date", "Coin", "Quantity", "Principal Invested"],
         )
     )

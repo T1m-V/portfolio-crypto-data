@@ -24,6 +24,7 @@ derived artifacts consumed by the dashboard. It exposes the `portfolio-crypto` C
   state.
 - `cex`: Nexo snapshot processing.
 - `dashboard_artifacts.py`: read contract used by `portfolio-dashboard`.
+- `nexo_dashboard.py`: read-only Nexo projection used by `portfolio-dashboard`.
 - `update.py` and `cli.py`: orchestration/process boundary.
 
 Supported commands:
@@ -42,6 +43,8 @@ uv run portfolio-crypto --data-dir C:\path\to\portfolio-data rebuild
 - Keep shared filesystem and price rules in `portfolio-core`; do not create another path layer here.
 - Keep loader mutation behind the CLI or explicit orchestration functions. Dashboard read code may
   import artifacts, but must not assemble a second crypto pipeline.
+- Create one `PortfolioContext` at the CLI boundary. Internal pipeline code may use its task-local
+  activation within that call tree, but must not cache a data root at module import time.
 - Prefer explicit transformations and small accounting operations over compatibility branches.
 - When persisted formats change, update all readers/writers and provide a one-way migration if
   existing user data needs it. Avoid indefinite dual-format support.
@@ -72,6 +75,9 @@ directories.
 
 Never expose RPC credentials, API keys, wallet-specific configuration, or private transaction
 content in logs, fixtures, commits, or review output.
+
+Both CLI commands acquire the core-owned workspace mutation lock and publish a run manifest.
+Persisted outputs must use atomic replacement so dashboard readers never observe partial files.
 
 ## Release Coordination
 
