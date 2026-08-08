@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-import blockchain_reader.accounting as accounting
-import blockchain_reader.rebuild_arbitrum_derived as rebuild
-import blockchain_reader.update as update
-from blockchain_reader.dashboard_artifacts import ArbitrumDashboardArtifactPaths
+import portfolio_crypto_data.accounting as accounting
+import portfolio_crypto_data.rebuild_arbitrum_derived as rebuild
+import portfolio_crypto_data.update as update
+from portfolio_crypto_data.dashboard_artifacts import ArbitrumDashboardArtifactPaths
 
 
 def _patch_update_paths(monkeypatch, tmp_path: Path) -> dict[str, Path]:

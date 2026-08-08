@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 from web3 import Web3
 
-from blockchain_reader.extraction import transaction_analyzer
+from portfolio_crypto_data.extraction import transaction_analyzer
 
 
 class DummyTokenManager:
@@ -74,7 +74,7 @@ def test_analyze_transaction_formats_utc_date() -> None:
     )
 
     with patch(
-        "blockchain_reader.extraction.transaction_analyzer._fetch_transaction_data"
+        "portfolio_crypto_data.extraction.transaction_analyzer._fetch_transaction_data"
     ) as fetch_mock:
         fetch_mock.return_value = tx_context
         result = transaction_analyzer.analyze_transaction(

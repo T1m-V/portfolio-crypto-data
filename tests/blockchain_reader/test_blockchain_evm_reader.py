@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from blockchain_reader.extraction.evm_reader import (
+from portfolio_crypto_data.extraction.evm_reader import (
     OUTPUT_COLUMNS,
     _derive_start_date,
     _fetch_explorer_data,
@@ -69,7 +69,7 @@ def test_fetch_explorer_data_handles_no_transactions() -> None:
     }
 
     with patch(
-        "blockchain_reader.extraction.evm_reader.requests.get",
+        "portfolio_crypto_data.extraction.evm_reader.requests.get",
         return_value=response,
     ) as get_mock:
         data = _fetch_explorer_data(

@@ -1,4 +1,4 @@
-from blockchain_reader.date_block_mapper import get_block_by_timestamp
+from portfolio_crypto_data.date_block_mapper import get_block_by_timestamp
 
 
 class FakeEth:

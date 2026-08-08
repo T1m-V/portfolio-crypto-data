@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
-import blockchain_reader.accounting as accounting
-import blockchain_reader.shared.prices as shared_prices
+import portfolio_crypto_data.accounting as accounting
+import portfolio_crypto_data.shared.prices as shared_prices
 
 
 def _patch_accounting_paths(monkeypatch, tmp_path: Path) -> dict[str, Path]:

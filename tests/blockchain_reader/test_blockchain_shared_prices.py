@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 import pandas as pd
 import pytest
 
-from blockchain_reader.shared.prices import clear_price_cache, get_price_on_or_before
+from portfolio_crypto_data.shared.prices import clear_price_cache, get_price_on_or_before
 
 
 class TestBlockchainSharedPrices:

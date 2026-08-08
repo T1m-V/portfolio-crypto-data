@@ -2,9 +2,9 @@ import json
 
 import pandas as pd
 
-import blockchain_reader.accounting as accounting
-import blockchain_reader.dashboard_artifacts as dashboard_artifacts
-import blockchain_reader.shared.prices as shared_prices
+import portfolio_crypto_data.accounting as accounting
+import portfolio_crypto_data.dashboard_artifacts as dashboard_artifacts
+import portfolio_crypto_data.shared.prices as shared_prices
 
 
 def _patch_artifact_paths(monkeypatch, tmp_path) -> dict[str, object]:

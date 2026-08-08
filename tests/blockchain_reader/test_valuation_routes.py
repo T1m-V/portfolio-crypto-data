@@ -1,4 +1,4 @@
-from blockchain_reader.shared.valuation_routes import (
+from portfolio_crypto_data.shared.valuation_routes import (
     ValuationRoute,
     build_symbol_protocol_map,
     classify_valuation_route,

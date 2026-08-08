@@ -3,8 +3,8 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from blockchain_reader import raw_snapshots
-from blockchain_reader.cex.nexo_snapshots import generate_nexo_raw_snapshots
+from portfolio_crypto_data import raw_snapshots
+from portfolio_crypto_data.cex.nexo_snapshots import generate_nexo_raw_snapshots
 
 
 def _run_nexo_generator(

@@ -4,8 +4,8 @@ from tempfile import TemporaryDirectory
 
 import pandas as pd
 
-import blockchain_reader.raw_snapshots as raw_snapshots
-from blockchain_reader.raw_snapshots import CryptoTracker
+import portfolio_crypto_data.raw_snapshots as raw_snapshots
+from portfolio_crypto_data.raw_snapshots import CryptoTracker
 
 
 def _patch_protocol_underlying_root(monkeypatch, tmp_path: Path) -> Path:

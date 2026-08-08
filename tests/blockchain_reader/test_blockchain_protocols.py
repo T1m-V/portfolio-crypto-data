@@ -8,8 +8,8 @@ from unittest.mock import ANY, Mock, patch
 
 import pandas as pd
 
-from blockchain_reader.composition import lp_pricing
-from blockchain_reader.protocols import aave, balancer, beefy, common, curve, liquid_staking
+from portfolio_crypto_data.composition import lp_pricing
+from portfolio_crypto_data.protocols import aave, balancer, beefy, common, curve, liquid_staking
 
 
 class DummyProgress:
@@ -380,20 +380,20 @@ class TestBlockchainProtocols:
 
         with (
             patch(
-                "blockchain_reader.protocols.aave.load_chain_config",
+                "portfolio_crypto_data.protocols.aave.load_chain_config",
                 return_value={"my_address": "0xwallet"},
             ),
-            patch("blockchain_reader.protocols.aave.load_chain_web3", return_value=fake_w3),
-            patch("blockchain_reader.protocols.aave.load_tokens", return_value={}),
-            patch("blockchain_reader.protocols.aave.load_block_map", return_value=block_map),
-            patch("blockchain_reader.protocols.aave.build_symbol_family_map", return_value={}),
-            patch("blockchain_reader.protocols.aave.build_address_symbol_map", return_value={}),
+            patch("portfolio_crypto_data.protocols.aave.load_chain_web3", return_value=fake_w3),
+            patch("portfolio_crypto_data.protocols.aave.load_tokens", return_value={}),
+            patch("portfolio_crypto_data.protocols.aave.load_block_map", return_value=block_map),
+            patch("portfolio_crypto_data.protocols.aave.build_symbol_family_map", return_value={}),
+            patch("portfolio_crypto_data.protocols.aave.build_address_symbol_map", return_value={}),
             patch(
-                "blockchain_reader.protocols.aave._build_aave_descriptors",
+                "portfolio_crypto_data.protocols.aave._build_aave_descriptors",
                 return_value=([descriptor], 0),
             ),
-            patch("blockchain_reader.protocols.aave.write_protocol_history_csv", write_mock),
-            patch("blockchain_reader.protocols.aave.tqdm", return_value=DummyProgress()),
+            patch("portfolio_crypto_data.protocols.aave.write_protocol_history_csv", write_mock),
+            patch("portfolio_crypto_data.protocols.aave.tqdm", return_value=DummyProgress()),
         ):
             aave.get_aave_daily_exposure(
                 chain="arbitrum",
@@ -628,7 +628,7 @@ class TestBlockchainProtocols:
         ]
 
         with patch(
-            "blockchain_reader.protocols.curve._read_curve_pool_tokens",
+            "portfolio_crypto_data.protocols.curve._read_curve_pool_tokens",
             return_value=pool_tokens,
         ) as read_pool_mock:
             result = curve.get_curve_underlying(
@@ -658,7 +658,7 @@ class TestBlockchainProtocols:
         ]
 
         with patch(
-            "blockchain_reader.protocols.curve._read_curve_pool_tokens",
+            "portfolio_crypto_data.protocols.curve._read_curve_pool_tokens",
             return_value=pool_tokens,
         ) as read_pool_mock:
             result = curve.get_curve_underlying(
@@ -673,7 +673,7 @@ class TestBlockchainProtocols:
 
     def test_resolve_effective_start_date_prefers_existing_output_plus_one(self) -> None:
         with patch(
-            "blockchain_reader.protocols.common.get_output_max_processed_date",
+            "portfolio_crypto_data.protocols.common.get_output_max_processed_date",
             return_value=date(2026, 1, 5),
         ):
             result = common.resolve_effective_start_date(
@@ -687,7 +687,7 @@ class TestBlockchainProtocols:
 
     def test_resolve_effective_start_date_respects_explicit_start(self) -> None:
         with patch(
-            "blockchain_reader.protocols.common.get_output_max_processed_date",
+            "portfolio_crypto_data.protocols.common.get_output_max_processed_date",
             return_value=date(2026, 1, 5),
         ):
             result = common.resolve_effective_start_date(
@@ -701,7 +701,7 @@ class TestBlockchainProtocols:
 
     def test_resolve_effective_start_date_uses_fallback_without_existing_output(self) -> None:
         with patch(
-            "blockchain_reader.protocols.common.get_output_max_processed_date",
+            "portfolio_crypto_data.protocols.common.get_output_max_processed_date",
             return_value=None,
         ):
             result = common.resolve_effective_start_date(
@@ -715,7 +715,7 @@ class TestBlockchainProtocols:
 
     def test_resolve_effective_start_date_clamps_to_fallback_floor(self) -> None:
         with patch(
-            "blockchain_reader.protocols.common.get_output_max_processed_date",
+            "portfolio_crypto_data.protocols.common.get_output_max_processed_date",
             return_value=date(2026, 1, 1),
         ):
             result = common.resolve_effective_start_date(
@@ -778,7 +778,10 @@ class TestBlockchainProtocols:
                     }
                 )
 
-            with patch("blockchain_reader.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER", root):
+            with patch(
+                "portfolio_crypto_data.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                root,
+            ):
                 output = common.write_protocol_history_csv(
                     protocol="curve",
                     chain="arbitrum",
@@ -821,7 +824,10 @@ class TestBlockchainProtocols:
                 ]
             ).to_csv(output_path, index=False)
 
-            with patch("blockchain_reader.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER", root):
+            with patch(
+                "portfolio_crypto_data.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                root,
+            ):
                 output = common.write_protocol_history_csv(
                     protocol="curve",
                     chain="arbitrum",
@@ -856,7 +862,10 @@ class TestBlockchainProtocols:
                 ]
             ).to_csv(output_path, index=False)
 
-            with patch("blockchain_reader.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER", root):
+            with patch(
+                "portfolio_crypto_data.protocols.common.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                root,
+            ):
                 output = common.write_protocol_history_csv(
                     protocol="curve",
                     chain="arbitrum",
@@ -872,11 +881,11 @@ class TestBlockchainProtocols:
     def test_process_all_curve_tokens_passes_resolved_incremental_start(self) -> None:
         with (
             patch(
-                "blockchain_reader.protocols.curve.load_tokens",
+                "portfolio_crypto_data.protocols.curve.load_tokens",
                 return_value={"0xpool": {"protocol": "curve", "symbol": "CurveLP"}},
             ),
             patch(
-                "blockchain_reader.protocols.curve.load_snapshot_ranges",
+                "portfolio_crypto_data.protocols.curve.load_snapshot_ranges",
                 return_value={
                     "CurveLP": {
                         "start": pd.Timestamp("2024-01-01"),
@@ -886,10 +895,10 @@ class TestBlockchainProtocols:
                 },
             ),
             patch(
-                "blockchain_reader.protocols.curve.resolve_effective_start_date",
+                "portfolio_crypto_data.protocols.curve.resolve_effective_start_date",
                 return_value="2024-01-05",
             ),
-            patch("blockchain_reader.protocols.curve.get_curve_history") as history_mock,
+            patch("portfolio_crypto_data.protocols.curve.get_curve_history") as history_mock,
         ):
             curve.process_all_curve_tokens(chain="arbitrum")
 
@@ -905,11 +914,11 @@ class TestBlockchainProtocols:
     def test_process_all_curve_tokens_skips_when_resolved_start_after_end(self) -> None:
         with (
             patch(
-                "blockchain_reader.protocols.curve.load_tokens",
+                "portfolio_crypto_data.protocols.curve.load_tokens",
                 return_value={"0xpool": {"protocol": "curve", "symbol": "CurveLP"}},
             ),
             patch(
-                "blockchain_reader.protocols.curve.load_snapshot_ranges",
+                "portfolio_crypto_data.protocols.curve.load_snapshot_ranges",
                 return_value={
                     "CurveLP": {
                         "start": pd.Timestamp("2024-01-01"),
@@ -919,10 +928,10 @@ class TestBlockchainProtocols:
                 },
             ),
             patch(
-                "blockchain_reader.protocols.curve.resolve_effective_start_date",
+                "portfolio_crypto_data.protocols.curve.resolve_effective_start_date",
                 return_value="2024-01-20",
             ),
-            patch("blockchain_reader.protocols.curve.get_curve_history") as history_mock,
+            patch("portfolio_crypto_data.protocols.curve.get_curve_history") as history_mock,
         ):
             curve.process_all_curve_tokens(chain="arbitrum")
 
@@ -931,14 +940,14 @@ class TestBlockchainProtocols:
     def test_process_all_aave_tokens_uses_resolved_incremental_start(self) -> None:
         with (
             patch(
-                "blockchain_reader.protocols.aave._derive_aave_bounds_from_transactions",
+                "portfolio_crypto_data.protocols.aave._derive_aave_bounds_from_transactions",
                 return_value=("2024-01-01", "2024-01-10"),
             ),
             patch(
-                "blockchain_reader.protocols.aave.resolve_effective_start_date",
+                "portfolio_crypto_data.protocols.aave.resolve_effective_start_date",
                 return_value="2024-01-06",
             ),
-            patch("blockchain_reader.protocols.aave.get_aave_daily_exposure") as exposure_mock,
+            patch("portfolio_crypto_data.protocols.aave.get_aave_daily_exposure") as exposure_mock,
         ):
             aave.process_all_aave_tokens(chain="arbitrum")
 
@@ -953,14 +962,14 @@ class TestBlockchainProtocols:
     def test_process_all_aave_tokens_skips_when_resolved_start_after_end(self) -> None:
         with (
             patch(
-                "blockchain_reader.protocols.aave._derive_aave_bounds_from_transactions",
+                "portfolio_crypto_data.protocols.aave._derive_aave_bounds_from_transactions",
                 return_value=("2024-01-01", "2024-01-10"),
             ),
             patch(
-                "blockchain_reader.protocols.aave.resolve_effective_start_date",
+                "portfolio_crypto_data.protocols.aave.resolve_effective_start_date",
                 return_value="2024-01-20",
             ),
-            patch("blockchain_reader.protocols.aave.get_aave_daily_exposure") as exposure_mock,
+            patch("portfolio_crypto_data.protocols.aave.get_aave_daily_exposure") as exposure_mock,
         ):
             aave.process_all_aave_tokens(chain="arbitrum")
 
@@ -979,15 +988,15 @@ class TestBlockchainProtocols:
 
         with (
             patch(
-                "blockchain_reader.protocols.liquid_staking.load_chain_web3",
+                "portfolio_crypto_data.protocols.liquid_staking.load_chain_web3",
                 return_value=fake_w3,
             ),
             patch(
-                "blockchain_reader.protocols.liquid_staking.load_block_map",
+                "portfolio_crypto_data.protocols.liquid_staking.load_block_map",
                 return_value={"2026-01-01 00:00:00": 11, "2026-01-02 00:00:00": 12},
             ),
             patch(
-                "blockchain_reader.protocols.liquid_staking.write_protocol_history_csv",
+                "portfolio_crypto_data.protocols.liquid_staking.write_protocol_history_csv",
                 write_mock,
             ),
         ):
@@ -1013,7 +1022,7 @@ class TestBlockchainProtocols:
     def test_process_all_liquid_staking_tokens_passes_resolved_incremental_start(self) -> None:
         with (
             patch(
-                "blockchain_reader.protocols.liquid_staking.load_snapshot_ranges",
+                "portfolio_crypto_data.protocols.liquid_staking.load_snapshot_ranges",
                 return_value={
                     "wstETH": {
                         "start": pd.Timestamp("2024-01-01"),
@@ -1023,15 +1032,15 @@ class TestBlockchainProtocols:
                 },
             ),
             patch(
-                "blockchain_reader.protocols.liquid_staking.load_block_map",
+                "portfolio_crypto_data.protocols.liquid_staking.load_block_map",
                 return_value={"2024-01-01": 100},
             ),
             patch(
-                "blockchain_reader.protocols.liquid_staking.resolve_effective_start_date",
+                "portfolio_crypto_data.protocols.liquid_staking.resolve_effective_start_date",
                 return_value="2024-01-05",
             ),
             patch(
-                "blockchain_reader.protocols.liquid_staking.get_liquid_staking_history"
+                "portfolio_crypto_data.protocols.liquid_staking.get_liquid_staking_history"
             ) as history_mock,
         ):
             liquid_staking.process_all_liquid_staking_tokens(chain="arbitrum")
@@ -1052,15 +1061,15 @@ class TestBlockchainProtocols:
     def test_process_all_liquid_staking_tokens_uses_block_map_fallback_start(self) -> None:
         with (
             patch(
-                "blockchain_reader.protocols.liquid_staking.load_snapshot_ranges",
+                "portfolio_crypto_data.protocols.liquid_staking.load_snapshot_ranges",
                 return_value={},
             ),
             patch(
-                "blockchain_reader.protocols.liquid_staking.load_block_map",
+                "portfolio_crypto_data.protocols.liquid_staking.load_block_map",
                 return_value={"2024-05-01": 12, "2024-01-15": 2},
             ),
             patch(
-                "blockchain_reader.protocols.liquid_staking.resolve_effective_start_date",
+                "portfolio_crypto_data.protocols.liquid_staking.resolve_effective_start_date",
                 return_value=None,
             ) as resolve_start_mock,
         ):
@@ -1071,9 +1080,11 @@ class TestBlockchainProtocols:
     def test_process_all_liquid_staking_tokens_skips_unsupported_chain(self) -> None:
         with (
             patch(
-                "blockchain_reader.protocols.liquid_staking.load_snapshot_ranges"
+                "portfolio_crypto_data.protocols.liquid_staking.load_snapshot_ranges"
             ) as snapshots_mock,
-            patch("blockchain_reader.protocols.liquid_staking.load_block_map") as block_map_mock,
+            patch(
+                "portfolio_crypto_data.protocols.liquid_staking.load_block_map"
+            ) as block_map_mock,
         ):
             liquid_staking.process_all_liquid_staking_tokens(chain="ethereum")
 
@@ -1121,11 +1132,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -1168,11 +1179,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -1210,11 +1221,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -1247,11 +1258,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -1280,11 +1291,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -1321,11 +1332,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -1367,11 +1378,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 
@@ -1419,11 +1430,11 @@ class TestBlockchainProtocols:
 
             with (
                 patch(
-                    "blockchain_reader.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
+                    "portfolio_crypto_data.composition.lp_pricing.PROTOCOL_UNDERLYING_TOKEN_FOLDER",
                     protocol_root,
                 ),
-                patch("blockchain_reader.composition.lp_pricing.PRICES_FOLDER", prices_root),
-                patch("blockchain_reader.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.PRICES_FOLDER", prices_root),
+                patch("portfolio_crypto_data.composition.lp_pricing.TOKENS_FOLDER", tokens_root),
             ):
                 updated = lp_pricing.generate_protocol_lp_price_files(chain="arbitrum")
 

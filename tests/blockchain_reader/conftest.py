@@ -19,9 +19,10 @@ def isolate_blockchain_io(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> No
     snapshots_root.mkdir(parents=True, exist_ok=True)
     tokens_root.mkdir(parents=True, exist_ok=True)
 
-    import blockchain_reader.accounting as accounting
-    from blockchain_reader.composition import lp_pricing
-    from price_history.price_data_utils import save_price_csv as _save_price_csv
+    from portfolio_core import save_price_csv as _save_price_csv
+
+    import portfolio_crypto_data.accounting as accounting
+    from portfolio_crypto_data.composition import lp_pricing
 
     monkeypatch.setattr(lp_pricing, "PRICES_FOLDER", prices_root)
     monkeypatch.setattr(lp_pricing, "PROTOCOL_UNDERLYING_TOKEN_FOLDER", protocol_root)
