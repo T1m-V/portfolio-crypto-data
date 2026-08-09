@@ -108,18 +108,6 @@ class ProtocolStore:
 
         return cls(chain=chain, rows=rows)
 
-    @property
-    def symbols(self) -> set[str]:
-        return set(self.rows.keys())
-
-    def find_row(self, *, symbol: str, target_date: object) -> pd.Series | None:
-        return find_protocol_row(
-            protocol_rows=self.rows,
-            symbol=symbol,
-            target_date=target_date,
-        )
-
-
 @dataclass
 class CompositionContext:
     chain: str
@@ -202,7 +190,7 @@ def build_composition_context(
         chain=chain,
         protocol_rows=protocol_store.rows,
         symbol_protocol=build_symbol_protocol_map(token_metadata=metadata),
-        protocol_derived_symbols=protocol_store.symbols,
+        protocol_derived_symbols=set(protocol_store.rows),
         symbol_family=symbol_family,
         aave_overlay=aave_overlay,
         aave_wrapper_symbols=aave_wrapper_symbols or set(),

@@ -14,7 +14,6 @@ from portfolio_crypto_data.composition.core import (
     ExposureExpander,
     PriceResolver,
     build_composition_context,
-    component_value_weights,
 )
 from portfolio_crypto_data.datetime_utils import format_daily_datetime, parse_daily_datetime
 from portfolio_crypto_data.principal_ledger import PRINCIPAL_DAILY_COLUMNS, PRINCIPAL_EVENT_COLUMNS
@@ -58,15 +57,6 @@ BASE_DAILY_COLUMNS = [
     "HasProtocolExposure",
     "HasAaveExposure",
 ]
-ACCOUNTING_ISSUE_COLUMNS = [
-    "Date",
-    "Source",
-    "BaseCoin",
-    "Quantity",
-    "Reason",
-    "Action",
-]
-INTERNAL_SOURCE_BASE_COLUMNS = [*SOURCE_BASE_DAILY_COLUMNS, "_ResolvedMarketValue"]
 
 
 @dataclass(frozen=True)
@@ -75,14 +65,12 @@ class AccountingArtifactPaths:
     principal_daily: Path
     source_base_daily: Path
     base_daily: Path
-    issues: Path
 
 
 @dataclass(frozen=True)
 class AccountingBuildResult:
     paths: AccountingArtifactPaths
     rows_written: dict[str, int]
-    errors: list[str]
 
 
 def accounting_paths(chain: str) -> AccountingArtifactPaths:
@@ -92,7 +80,6 @@ def accounting_paths(chain: str) -> AccountingArtifactPaths:
         principal_daily=root / "principal_daily.csv",
         source_base_daily=root / "source_base_daily.csv",
         base_daily=root / "base_daily.csv",
-        issues=root / "issues.csv",
     )
 
 
@@ -101,12 +88,7 @@ def _empty(columns: list[str]) -> pd.DataFrame:
 
 
 def _read_csv(path: Path, columns: list[str]) -> pd.DataFrame:
-    if not path.exists():
-        return _empty(columns)
     frame = pd.read_csv(path)
-    for column in columns:
-        if column not in frame.columns:
-            frame[column] = pd.NA
     return frame[columns].copy()
 
 
@@ -297,32 +279,9 @@ def _aave_base_symbol(symbol: str, meta: dict[str, Any] | None) -> str:
     return price_proxy_symbol(normalized) or normalized
 
 
-def _display_direct_symbol(symbol: str, ctx: CompositionContext) -> str:
-    canonical = canonicalize_symbol(symbol, symbol_family=ctx.symbol_family)
-    return canonical or symbol
-
-
-def _component_weights(
-    *,
-    exposures: dict[str, Any],
-    date_value: pd.Timestamp,
-    price_resolver: PriceResolver,
-) -> dict[str, float]:
-    weights = component_value_weights(
-        exposures=exposures,
-        date_value=date_value,
-        price_resolver=price_resolver,
-    )
-    total = sum(weights.values())
-    if total <= 0:
-        return {}
-    return {coin: weight / total for coin, weight in weights.items() if weight > 0}
-
-
 def _is_material(
     *,
-    quantity: Decimal,
-    market_value: Decimal | None,
+    market_value: Decimal,
     principal: Decimal,
     realized_pnl: Decimal,
 ) -> bool:
@@ -330,28 +289,7 @@ def _is_material(
         return True
     if abs(realized_pnl) >= MATERIAL_VALUE_THRESHOLD_EUR:
         return True
-    if market_value is None:
-        return abs(quantity) > MATERIAL_QUANTITY_THRESHOLD
     return abs(market_value) >= MATERIAL_VALUE_THRESHOLD_EUR
-
-
-def _issue_row(
-    *,
-    date_value: pd.Timestamp,
-    source: str,
-    base_coin: str,
-    quantity: Decimal,
-    reason: str,
-    action: str,
-) -> dict[str, object]:
-    return {
-        "Date": format_daily_datetime(date_value),
-        "Source": source,
-        "BaseCoin": base_coin,
-        "Quantity": float(quantity),
-        "Reason": reason,
-        "Action": action,
-    }
 
 
 def _source_base_row(
@@ -360,7 +298,7 @@ def _source_base_row(
     source: str,
     base_coin: str,
     quantity: Decimal,
-    market_value: Decimal | None,
+    market_value: Decimal,
     principal: Decimal,
     realized_pnl: Decimal,
     route: ValuationRoute,
@@ -373,14 +311,13 @@ def _source_base_row(
         "Source": source,
         "BaseCoin": base_coin,
         "Quantity": float(quantity),
-        "MarketValueEUR": float(market_value) if market_value is not None else "",
+        "MarketValueEUR": float(market_value),
         "PrincipalInvestedEUR": float(principal),
         "RealizedPnLEUR": float(realized_pnl),
         "ValuationRoute": route.value,
         "HasDirectExposure": has_direct_exposure,
         "HasProtocolExposure": has_protocol_exposure,
         "HasAaveExposure": has_aave_exposure,
-        "_ResolvedMarketValue": market_value is not None,
     }
 
 
@@ -389,12 +326,9 @@ def _active_rows_for_source(
     date_value: pd.Timestamp,
     source: str,
     quantity: Decimal,
-    principal: Decimal,
     route: ValuationRoute,
     ctx: CompositionContext,
     price_resolver: PriceResolver,
-    previous_shares: dict[str, dict[str, float]],
-    issues: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     has_protocol = route == ValuationRoute.PROTOCOL_DERIVED
     has_direct = route == ValuationRoute.DIRECT
@@ -409,66 +343,15 @@ def _active_rows_for_source(
     if not exposures:
         return []
 
-    shares = _component_weights(
-        exposures=exposures,
-        date_value=date_value,
-        price_resolver=price_resolver,
-    )
-    if shares:
-        previous_shares[source] = shares
-    else:
-        equal_share = 1 / len(exposures)
-        previous_shares[source] = {coin: equal_share for coin in exposures}
-
     rows: list[dict[str, object]] = []
-    remaining_principal = principal
-    component_items = list(exposures.items())
-    for index, (base_coin, exposure) in enumerate(component_items):
+    for base_coin, exposure in exposures.items():
         resolution = price_resolver.resolve(symbol=base_coin, target_date=date_value)
-        market_value = (
-            exposure.quantity * resolution.price_eur if resolution.price_eur is not None else None
-        )
-        share = previous_shares[source].get(base_coin, 0.0)
-        if index == len(component_items) - 1:
-            component_principal = remaining_principal
+        if resolution.price_eur is None:
+            if abs(exposure.quantity) > MATERIAL_QUANTITY_THRESHOLD:
+                raise ValueError(f"Missing EUR price for {base_coin} on {date_value.date()}")
+            market_value = Decimal("0")
         else:
-            component_principal = principal * Decimal(str(share))
-            remaining_principal -= component_principal
-
-        if market_value is None and _is_material(
-            quantity=exposure.quantity,
-            market_value=None,
-            principal=component_principal,
-            realized_pnl=Decimal("0"),
-        ):
-            reason = "missing_material_price"
-            action = "add price history or protocol decomposition before " "rebuilding accounting"
-            if route == ValuationRoute.PROTOCOL_DERIVED and source not in ctx.protocol_rows:
-                reason = "protocol_decomposition_missing"
-                action = "run protocol adapter before rebuilding accounting"
-            else:
-                canonical_base = canonicalize_symbol(
-                    base_coin,
-                    symbol_family=ctx.symbol_family,
-                )
-                if ctx.known_symbols and (
-                    base_coin not in ctx.known_symbols and canonical_base not in ctx.known_symbols
-                ):
-                    reason = "unknown_symbol_material"
-                    action = "add token metadata or protocol mapping"
-                elif route == ValuationRoute.DIRECT:
-                    reason = "known_symbol_missing_price"
-                    action = "add direct price file or direct symbol metadata"
-            issues.append(
-                _issue_row(
-                    date_value=date_value,
-                    source=source,
-                    base_coin=base_coin,
-                    quantity=exposure.quantity,
-                    reason=reason,
-                    action=action,
-                )
-            )
+            market_value = exposure.quantity * resolution.price_eur
 
         rows.append(
             _source_base_row(
@@ -477,66 +360,12 @@ def _active_rows_for_source(
                 base_coin=base_coin,
                 quantity=exposure.quantity,
                 market_value=market_value,
-                principal=component_principal,
+                principal=Decimal("0"),
                 realized_pnl=Decimal("0"),
                 route=route,
                 has_direct_exposure=exposure.has_direct_exposure,
                 has_protocol_exposure=exposure.has_protocol_exposure,
                 has_aave_exposure=exposure.has_aave_exposure,
-            )
-        )
-    return rows
-
-
-def _closed_rows_for_source(
-    *,
-    date_value: pd.Timestamp,
-    source: str,
-    principal: Decimal,
-    route: ValuationRoute,
-    ctx: CompositionContext,
-    metadata: dict[str, dict[str, Any]],
-    previous_shares: dict[str, dict[str, float]],
-) -> list[dict[str, object]]:
-    if abs(principal) < VALUE_DUST_EUR:
-        return []
-
-    if route == ValuationRoute.AAVE:
-        base_coin = _aave_base_symbol(symbol=source, meta=metadata.get(source))
-        signed_principal = principal * _aave_multiplier(source)
-        shares = {base_coin: 1.0}
-    elif route == ValuationRoute.PROTOCOL_DERIVED:
-        shares = previous_shares.get(source, {})
-        signed_principal = principal
-        if not shares:
-            return []
-    else:
-        base_coin = _display_direct_symbol(source, ctx=ctx)
-        signed_principal = principal
-        shares = {base_coin: 1.0}
-
-    rows: list[dict[str, object]] = []
-    remaining_realized = -signed_principal
-    share_items = list(shares.items())
-    for index, (base_coin, share) in enumerate(share_items):
-        if index == len(share_items) - 1:
-            realized_pnl = remaining_realized
-        else:
-            realized_pnl = -signed_principal * Decimal(str(share))
-            remaining_realized -= realized_pnl
-        rows.append(
-            _source_base_row(
-                date_value=date_value,
-                source=source,
-                base_coin=base_coin,
-                quantity=Decimal("0"),
-                market_value=Decimal("0"),
-                principal=Decimal("0"),
-                realized_pnl=realized_pnl,
-                route=route,
-                has_direct_exposure=route == ValuationRoute.DIRECT,
-                has_protocol_exposure=route == ValuationRoute.PROTOCOL_DERIVED,
-                has_aave_exposure=route == ValuationRoute.AAVE,
             )
         )
     return rows
@@ -549,7 +378,6 @@ def _build_aave_overlay_rows(
     date_value: pd.Timestamp,
     source_state: pd.DataFrame,
     metadata: dict[str, dict[str, Any]],
-    issues: list[dict[str, object]],
 ) -> list[dict[str, object]]:
     if ctx.aave_overlay is None or ctx.aave_overlay.empty:
         return []
@@ -598,17 +426,7 @@ def _build_aave_overlay_rows(
         if ctx.known_symbols and (
             overlay_symbol not in ctx.known_symbols and canonical_overlay not in ctx.known_symbols
         ):
-            issues.append(
-                _issue_row(
-                    date_value=date_value,
-                    source="Aave",
-                    base_coin=overlay_symbol,
-                    quantity=quantity,
-                    reason="unknown_aave_overlay_symbol",
-                    action="fix aave overlay header or token metadata",
-                )
-            )
-            continue
+            raise ValueError(f"Unknown Aave overlay symbol: {overlay_symbol}")
         exposures = ExposureExpander(ctx=ctx).expand(
             symbol=overlay_symbol,
             quantity=quantity,
@@ -628,27 +446,9 @@ def _build_aave_overlay_rows(
                 continue
 
             resolution = price_resolver.resolve(symbol=base_coin, target_date=date_value)
-            market_value = (
-                exposure.quantity * resolution.price_eur
-                if resolution.price_eur is not None
-                else None
-            )
-            if market_value is None and _is_material(
-                quantity=exposure.quantity,
-                market_value=None,
-                principal=principal,
-                realized_pnl=realized,
-            ):
-                issues.append(
-                    _issue_row(
-                        date_value=date_value,
-                        source="Aave",
-                        base_coin=base_coin,
-                        quantity=exposure.quantity,
-                        reason="missing_material_price",
-                        action="add price history for Aave base asset",
-                    )
-                )
+            if resolution.price_eur is None:
+                raise ValueError(f"Missing EUR price for {base_coin} on {date_value.date()}")
+            market_value = exposure.quantity * resolution.price_eur
 
             rows.append(
                 _source_base_row(
@@ -668,68 +468,6 @@ def _build_aave_overlay_rows(
     return rows
 
 
-def _build_aave_source_position_rows(
-    *,
-    ctx: CompositionContext,
-    price_resolver: PriceResolver,
-    date_value: pd.Timestamp,
-    source_state: pd.DataFrame,
-    metadata: dict[str, dict[str, Any]],
-    issues: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    aave_state = source_state[
-        source_state["Coin"].map(lambda value: ctx.route_for(str(value)) == ValuationRoute.AAVE)
-    ]
-    for _, row in aave_state.iterrows():
-        source = sanitize_symbol(row["Coin"])
-        if not source:
-            continue
-        quantity = Decimal(str(row["Quantity"])) * _aave_multiplier(source)
-        raw_principal = Decimal(str(row["Principal Invested"])) * _aave_multiplier(source)
-        if abs(quantity) <= DUST and abs(raw_principal) < VALUE_DUST_EUR:
-            continue
-
-        base_coin = _aave_base_symbol(symbol=source, meta=metadata.get(source))
-        resolution = price_resolver.resolve(symbol=base_coin, target_date=date_value)
-        market_value = quantity * resolution.price_eur if resolution.price_eur is not None else None
-        principal = raw_principal if abs(quantity) > DUST else Decimal("0")
-        realized = Decimal("0") if abs(quantity) > DUST else -raw_principal
-        if market_value is None and _is_material(
-            quantity=quantity,
-            market_value=None,
-            principal=principal,
-            realized_pnl=realized,
-        ):
-            issues.append(
-                _issue_row(
-                    date_value=date_value,
-                    source=source,
-                    base_coin=base_coin,
-                    quantity=quantity,
-                    reason="missing_material_price",
-                    action="add price history for Aave base asset",
-                )
-            )
-
-        rows.append(
-            _source_base_row(
-                date_value=date_value,
-                source=source,
-                base_coin=base_coin,
-                quantity=quantity,
-                market_value=market_value,
-                principal=principal,
-                realized_pnl=realized,
-                route=ValuationRoute.AAVE,
-                has_direct_exposure=False,
-                has_protocol_exposure=False,
-                has_aave_exposure=True,
-            )
-        )
-    return rows
-
-
 def _build_source_base_daily(
     *,
     snapshots: pd.DataFrame,
@@ -737,9 +475,9 @@ def _build_source_base_daily(
     ctx: CompositionContext,
     metadata: dict[str, dict[str, Any]],
     end_date: pd.Timestamp | None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     if snapshots.empty and principal_daily.empty:
-        return _empty(SOURCE_BASE_DAILY_COLUMNS), _empty(ACCOUNTING_ISSUE_COLUMNS)
+        return _empty(SOURCE_BASE_DAILY_COLUMNS)
 
     dense = _dense_snapshot_state(snapshots=snapshots, end_date=end_date)
     dense_principal = _dense_principal_state(
@@ -747,24 +485,21 @@ def _build_source_base_daily(
         end_date=end_date,
     )
     price_resolver = PriceResolver(ctx=ctx, mode="eur")
-    previous_shares: dict[str, dict[str, float]] = {}
     rows: list[dict[str, object]] = []
-    issues: list[dict[str, object]] = []
+
+    material_aave = dense[
+        dense["Coin"].map(lambda value: ctx.route_for(str(value)) == ValuationRoute.AAVE)
+        & (
+            (dense["Quantity"].abs() > float(DUST))
+            | (dense["Principal Invested"].abs() >= float(VALUE_DUST_EUR))
+        )
+    ]
+    if ctx.aave_overlay is None and not material_aave.empty:
+        raise ValueError("Aave positions require aave_daily_exposure.csv")
 
     for date_value, source_state in dense.groupby("Date", sort=True):
         date_ts = pd.Timestamp(date_value).normalize()
-        if ctx.aave_overlay is None:
-            rows.extend(
-                _build_aave_source_position_rows(
-                    ctx=ctx,
-                    price_resolver=price_resolver,
-                    date_value=date_ts,
-                    source_state=source_state,
-                    metadata=metadata,
-                    issues=issues,
-                )
-            )
-        else:
+        if ctx.aave_overlay is not None:
             rows.extend(
                 _build_aave_overlay_rows(
                     ctx=ctx,
@@ -772,7 +507,6 @@ def _build_source_base_daily(
                     date_value=date_ts,
                     source_state=source_state,
                     metadata=metadata,
-                    issues=issues,
                 )
             )
         for _, state in source_state.iterrows():
@@ -785,61 +519,44 @@ def _build_source_base_daily(
                 continue
 
             quantity = Decimal(str(state["Quantity"]))
-            principal = Decimal("0")
             if abs(quantity) > DUST:
                 rows.extend(
                     _active_rows_for_source(
                         date_value=date_ts,
                         source=source,
                         quantity=quantity,
-                        principal=principal,
                         route=route,
                         ctx=ctx,
                         price_resolver=price_resolver,
-                        previous_shares=previous_shares,
-                        issues=issues,
                     )
                 )
 
-    source_base = pd.DataFrame(rows, columns=INTERNAL_SOURCE_BASE_COLUMNS)
+    source_base = pd.DataFrame(rows, columns=SOURCE_BASE_DAILY_COLUMNS)
     if source_base.empty:
-        source_base = _empty(INTERNAL_SOURCE_BASE_COLUMNS)
+        source_base = _empty(SOURCE_BASE_DAILY_COLUMNS)
     else:
         for column in ("Quantity", "MarketValueEUR", "PrincipalInvestedEUR", "RealizedPnLEUR"):
             source_base[column] = pd.to_numeric(source_base[column], errors="coerce")
-        source_base["_ResolvedMarketValue"] = source_base["_ResolvedMarketValue"].map(bool)
         source_base = source_base[
             source_base.apply(
                 lambda row: _is_material(
-                    quantity=Decimal(str(row["Quantity"])),
-                    market_value=(
-                        None
-                        if pd.isna(row["MarketValueEUR"])
-                        else Decimal(str(row["MarketValueEUR"]))
-                    ),
+                    market_value=Decimal(str(row["MarketValueEUR"])),
                     principal=Decimal(str(row["PrincipalInvestedEUR"])),
                     realized_pnl=Decimal(str(row["RealizedPnLEUR"])),
                 ),
                 axis=1,
             )
         ].copy()
-        source_base["MarketValueEUR"] = source_base["MarketValueEUR"].fillna(0.0)
 
     source_base = _allocate_principal_to_sources(
         source_base=source_base,
         principal_daily=dense_principal,
     )
     if source_base.empty:
-        return _empty(SOURCE_BASE_DAILY_COLUMNS), pd.DataFrame(
-            issues,
-            columns=ACCOUNTING_ISSUE_COLUMNS,
-        )
+        return _empty(SOURCE_BASE_DAILY_COLUMNS)
 
     source_base = source_base.sort_values(["Date", "Source", "BaseCoin"]).reset_index(drop=True)
-    return source_base, pd.DataFrame(
-        issues,
-        columns=ACCOUNTING_ISSUE_COLUMNS,
-    )
+    return source_base
 
 
 def _allocate_principal_to_sources(
@@ -852,13 +569,11 @@ def _allocate_principal_to_sources(
 
     output = source_base.copy()
     if output.empty:
-        output = _empty(INTERNAL_SOURCE_BASE_COLUMNS)
+        output = _empty(SOURCE_BASE_DAILY_COLUMNS)
     for column in ("Quantity", "MarketValueEUR", "PrincipalInvestedEUR", "RealizedPnLEUR"):
         if column not in output.columns:
             output[column] = 0.0
         output[column] = pd.to_numeric(output[column], errors="coerce").fillna(0.0)
-    if "_ResolvedMarketValue" not in output.columns:
-        output["_ResolvedMarketValue"] = True
 
     appended: list[dict[str, object]] = []
     principal_frame = principal_daily.copy()
@@ -915,14 +630,13 @@ def _allocate_principal_to_sources(
 
     if appended:
         output = pd.concat(
-            [output, pd.DataFrame(appended, columns=INTERNAL_SOURCE_BASE_COLUMNS)],
+            [output, pd.DataFrame(appended, columns=SOURCE_BASE_DAILY_COLUMNS)],
             ignore_index=True,
             sort=False,
         )
     output = output[
         output.apply(
             lambda row: _is_material(
-                quantity=Decimal(str(row["Quantity"])),
                 market_value=Decimal(str(row["MarketValueEUR"])),
                 principal=Decimal(str(row["PrincipalInvestedEUR"])),
                 realized_pnl=Decimal(str(row["RealizedPnLEUR"])),
@@ -930,7 +644,7 @@ def _allocate_principal_to_sources(
             axis=1,
         )
     ].copy()
-    return output[INTERNAL_SOURCE_BASE_COLUMNS].reset_index(drop=True)
+    return output[SOURCE_BASE_DAILY_COLUMNS].reset_index(drop=True)
 
 
 def _exposure_route(row: pd.Series) -> str:
@@ -946,8 +660,6 @@ def _build_base_daily(source_base: pd.DataFrame) -> pd.DataFrame:
         return _empty(BASE_DAILY_COLUMNS)
 
     frame = source_base.copy()
-    if "_ResolvedMarketValue" not in frame.columns:
-        frame["_ResolvedMarketValue"] = True
     grouped = (
         frame.groupby(["Date", "BaseCoin"], as_index=False, sort=True)
         .agg(
@@ -955,7 +667,6 @@ def _build_base_daily(source_base: pd.DataFrame) -> pd.DataFrame:
             MarketValueEUR=("MarketValueEUR", "sum"),
             ActivePrincipalEUR=("PrincipalInvestedEUR", "sum"),
             RealizedPnLEUR=("RealizedPnLEUR", "sum"),
-            HasResolvedMarketValue=("_ResolvedMarketValue", "any"),
             HasDirectExposure=("HasDirectExposure", "any"),
             HasProtocolExposure=("HasProtocolExposure", "any"),
             HasAaveExposure=("HasAaveExposure", "any"),
@@ -973,10 +684,7 @@ def _build_base_daily(source_base: pd.DataFrame) -> pd.DataFrame:
     )
     grouped["PriceEUR"] = grouped.apply(
         lambda row: row["MarketValueEUR"] / row["Quantity"]
-        if (
-            bool(row["HasResolvedMarketValue"])
-            and abs(float(row["Quantity"])) > float(MATERIAL_QUANTITY_THRESHOLD)
-        )
+        if abs(float(row["Quantity"])) > float(MATERIAL_QUANTITY_THRESHOLD)
         else pd.NA,
         axis=1,
     )
@@ -1018,7 +726,7 @@ def build_accounting_artifacts(
     if end_date is None and not snapshots.empty:
         end_date = pd.Timestamp(snapshots["Date"].max()).normalize()
 
-    source_base, issues = _build_source_base_daily(
+    source_base = _build_source_base_daily(
         snapshots=snapshots,
         principal_daily=principal_daily,
         ctx=ctx,
@@ -1029,14 +737,12 @@ def build_accounting_artifacts(
 
     _write_csv(paths.source_base_daily, source_base, SOURCE_BASE_DAILY_COLUMNS)
     _write_csv(paths.base_daily, base_daily, BASE_DAILY_COLUMNS)
+    stale_issues = paths.base_daily.parent / "issues.csv"
+    if stale_issues.exists():
+        stale_issues.unlink()
     if not paths.principal_events.exists():
         _write_csv(paths.principal_events, _empty(PRINCIPAL_EVENT_COLUMNS), PRINCIPAL_EVENT_COLUMNS)
     _write_csv(paths.principal_daily, principal_daily, PRINCIPAL_DAILY_COLUMNS)
-    _write_csv(paths.issues, issues, ACCOUNTING_ISSUE_COLUMNS)
-    errors = [
-        f"{row['Date']} {row['Source']}->{row['BaseCoin']}: {row['Reason']}"
-        for _, row in issues.iterrows()
-    ]
     return AccountingBuildResult(
         paths=paths,
         rows_written={
@@ -1044,7 +750,5 @@ def build_accounting_artifacts(
             "principal_daily": len(principal_daily),
             "source_base_daily": len(source_base),
             "base_daily": len(base_daily),
-            "issues": len(issues),
         },
-        errors=errors,
     )

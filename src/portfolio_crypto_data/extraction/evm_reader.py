@@ -1,28 +1,25 @@
 import asyncio
 import json
-import os
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_HALF_UP, Context, Decimal
+from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import requests
-from portfolio_core import active_context
+from portfolio_core import active_context, atomic_write_csv
 from tqdm.asyncio import tqdm_asyncio
 from web3 import Web3
 
 from portfolio_crypto_data.datetime_utils import (
     TRANSACTION_DATETIME_FORMAT,
     parse_transaction_datetime,
-)
-from portfolio_crypto_data.datetime_utils import (
-    parse_transaction_datetime_series as parse_transaction_datetime_series_compat,
+    parse_transaction_datetime_series,
 )
 from portfolio_crypto_data.extraction.token_manager import TokenManager
 from portfolio_crypto_data.extraction.transaction_analyzer import analyze_transaction
 
-ctx = Context(prec=78, rounding=ROUND_HALF_UP)
 DEFAULT_START_DATE = "01/01/2000 00:00:00"
 OUTPUT_COLUMNS = [
     "TX Hash",
@@ -35,22 +32,6 @@ OUTPUT_COLUMNS = [
     "Fee",
     "Fee Token",
 ]
-
-
-def should_fetch_metadata_for_transaction(*, is_standard_transaction: bool) -> bool:
-    """
-    Determines whether transaction analysis may add unknown token metadata.
-
-    args:
-        is_standard_transaction: Whether the hash came from the wallet's standard tx list.
-
-    returns:
-        True for wallet-initiated standard transactions, false for passive-only hashes.
-    """
-    # Passive-only transfers can be unsolicited dust/spam. This blunt guard keeps
-    # those tokens out of the ledger; legitimate passive tokens need explicit
-    # metadata updates instead of broad passive discovery.
-    return is_standard_transaction
 
 
 def _fetch_explorer_data(
@@ -104,30 +85,22 @@ def _fetch_explorer_data(
     return []
 
 
-def _parse_input_date_to_utc(date_str: str, end_of_day: bool) -> datetime:
+def _parse_input_date_to_utc(date_str: str) -> datetime:
     parsed = parse_transaction_datetime(date_str)
     if parsed is None:
         raise ValueError(f"Invalid date input: {date_str}")
 
-    text = str(date_str or "").strip()
-    has_explicit_time = " " in text
-    parsed = parsed.replace(tzinfo=timezone.utc)
-
-    if has_explicit_time:
-        return parsed
-    if end_of_day:
-        return parsed.replace(hour=23, minute=59, second=59, microsecond=0)
-    return parsed.replace(hour=0, minute=0, second=0, microsecond=0)
+    return parsed.replace(tzinfo=timezone.utc)
 
 
-def _derive_start_date(output_path: str, overlap_days: int = 1) -> str:
-    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+def _derive_start_date(output_path: Path, overlap_days: int = 1) -> str:
+    if not output_path.exists() or output_path.stat().st_size == 0:
         return DEFAULT_START_DATE
     try:
         df_dates = pd.read_csv(output_path, usecols=["Date"])
         if df_dates.empty:
             return DEFAULT_START_DATE
-        latest = _parse_transaction_datetime_series(df_dates["Date"]).max()
+        latest = parse_transaction_datetime_series(df_dates["Date"]).max()
         if pd.isna(latest):
             return DEFAULT_START_DATE
         start_dt = (latest - timedelta(days=overlap_days)).replace(
@@ -136,11 +109,6 @@ def _derive_start_date(output_path: str, overlap_days: int = 1) -> str:
         return start_dt.strftime(TRANSACTION_DATETIME_FORMAT)
     except (ValueError, KeyError, pd.errors.ParserError):
         return DEFAULT_START_DATE
-
-
-def _parse_transaction_datetime_series(series: pd.Series) -> pd.Series:
-    return parse_transaction_datetime_series_compat(series=series)
-
 
 def _normalize_results_frame(frame: pd.DataFrame) -> pd.DataFrame:
     normalized = frame.copy()
@@ -229,22 +197,18 @@ def build_internal_eth_map(txs_internal: list[dict], my_address: str) -> dict[st
     return internal_map
 
 
-async def retrieve_transactions(
-    chain: str, start_date: str | None = None, end_date: str | None = None
-) -> None:
+async def retrieve_transactions(chain: str) -> None:
     """
     Main entry point to fetch and analyze transactions for a chain.
 
     args:
         chain: Chain identifier (e.g., 'arbitrum').
-        start_date: Start date (DD/MM/YYYY HH:MM:SS; legacy formats supported).
-        end_date: End date (DD/MM/YYYY HH:MM:SS; legacy formats supported).
     """
     print(f"--- START PROCESSING: {chain.upper()} ---")
 
     # 1. Load Config
     paths = active_context().paths
-    if not os.path.exists(paths.chain_config):
+    if not paths.chain_config.exists():
         raise FileNotFoundError(f"Config '{paths.chain_config}' not found.")
 
     with open(paths.chain_config, "r") as f:
@@ -264,24 +228,20 @@ async def retrieve_transactions(
     # Setup Paths & Connection
     token_path = paths.tokens / f"{chain}_tokens.json"
     output_path = paths.crypto_transactions / f"{chain}_transactions.csv"
-    os.makedirs(paths.crypto_transactions, exist_ok=True)
-    os.makedirs(paths.tokens, exist_ok=True)
+    paths.crypto_transactions.mkdir(parents=True, exist_ok=True)
+    paths.tokens.mkdir(parents=True, exist_ok=True)
 
     w3 = Web3(Web3.HTTPProvider(cfg["rpc_url"]))
     if not w3.is_connected():
         print("No RPC connection.")
         return
 
-    # Determine dates if not provided
-    if end_date is None:
-        end_date = datetime.now(tz=timezone.utc).strftime(TRANSACTION_DATETIME_FORMAT)
-
-    if start_date is None:
-        start_date = _derive_start_date(output_path=output_path, overlap_days=1)
+    end_date = datetime.now(tz=timezone.utc).strftime(TRANSACTION_DATETIME_FORMAT)
+    start_date = _derive_start_date(output_path=output_path, overlap_days=1)
 
     # 2. Parse Dates
-    start_ts = int(_parse_input_date_to_utc(start_date, end_of_day=False).timestamp())
-    end_ts = int(_parse_input_date_to_utc(end_date, end_of_day=True).timestamp())
+    start_ts = int(_parse_input_date_to_utc(start_date).timestamp())
+    end_ts = int(_parse_input_date_to_utc(end_date).timestamp())
 
     # 3. Fetch Hashes
     print("Fetching transaction lists...")
@@ -332,9 +292,7 @@ async def retrieve_transactions(
         tasks_std = [
             analyze_wrapper(
                 tx_hash=tx,
-                fetch_meta=should_fetch_metadata_for_transaction(
-                    is_standard_transaction=True,
-                ),
+                fetch_meta=True,
             )
             for tx in std_list
         ]
@@ -349,9 +307,7 @@ async def retrieve_transactions(
         tasks_others = [
             analyze_wrapper(
                 tx_hash=tx,
-                fetch_meta=should_fetch_metadata_for_transaction(
-                    is_standard_transaction=False,
-                ),
+                fetch_meta=False,
             )
             for tx in others_list
         ]
@@ -364,7 +320,7 @@ async def retrieve_transactions(
         if results:
             new_results_df = _normalize_results_frame(pd.DataFrame(results))
 
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            if output_path.exists() and output_path.stat().st_size > 0:
                 existing_results_df = _normalize_results_frame(pd.read_csv(output_path, dtype=str))
                 results_df = pd.concat([existing_results_df, new_results_df]).drop_duplicates(
                     subset=["TX Hash"], keep="last"
@@ -372,12 +328,12 @@ async def retrieve_transactions(
             else:
                 results_df = new_results_df
 
-            results_df["_sort_helper"] = _parse_transaction_datetime_series(results_df["Date"])
+            results_df["_sort_helper"] = parse_transaction_datetime_series(results_df["Date"])
             results_df = results_df.sort_values(by="_sort_helper", ascending=True).drop(
                 columns=["_sort_helper"]
             )
             results_df = _normalize_results_frame(results_df)
-            results_df.to_csv(output_path, index=False)
+            atomic_write_csv(frame=results_df, path=output_path)
             print(f"Done. Saved {len(results_df)} rows to {output_path}")
         else:
             print("No results generated.")

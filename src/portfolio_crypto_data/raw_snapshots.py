@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from portfolio_core import active_context, atomic_write_csv, get_forex_rate
+from portfolio_core import active_context, atomic_write_csv
 
 from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
@@ -24,12 +24,10 @@ from portfolio_crypto_data.shared.valuation_routes import (
     build_symbol_protocol_map,
     classify_valuation_route,
 )
-from portfolio_crypto_data.symbols import canonicalize_symbol, price_proxy_symbol, sanitize_symbol
+from portfolio_crypto_data.symbols import price_proxy_symbol, sanitize_symbol
 
 MAX_INVALID_DATE_RATIO = 0.1
 AAVE_PRICE_SOURCE_PREFIXES = ("variableDebtArb", "stableDebtArb", "aArb")
-AAVE_DEBT_PREFIXES = ("variableDebtArb", "stableDebtArb")
-MAX_PRINCIPAL_PROXY_DEPTH = 8
 SWAP_UNDERVALUED_ALLOCATION_RATIO = 0.01
 SWAP_VALUE_DUST_EUR = 0.01
 
@@ -106,22 +104,6 @@ def get_crypto_price(
     return None
 
 
-def _price_or_zero(
-    *,
-    coin: str,
-    date: str,
-    chain: str,
-    use_lp_prices: bool,
-) -> float:
-    price = get_crypto_price(
-        coin=coin,
-        date=date,
-        chain=chain,
-        use_lp_prices=use_lp_prices,
-    )
-    return price if price is not None else 0.0
-
-
 def _derive_aave_price_source(symbol: str, meta: dict[str, Any] | None) -> str:
     if meta:
         explicit = sanitize_symbol(meta.get("price_source")) or sanitize_symbol(meta.get("family"))
@@ -137,56 +119,6 @@ def _derive_aave_price_source(symbol: str, meta: dict[str, Any] | None) -> str:
     return symbol
 
 
-def _is_aave_debt_symbol(symbol: str) -> bool:
-    normalized = sanitize_symbol(symbol).lower()
-    return any(normalized.startswith(prefix.lower()) for prefix in AAVE_DEBT_PREFIXES)
-
-
-def _load_protocol_components(
-    *,
-    chain: str,
-    root: Path | None = None,
-) -> dict[str, set[str]]:
-    """
-    Loads protocol token component symbols from protocol-underlying CSV headers.
-
-    args:
-        chain: Chain identifier.
-        root: Protocol-underlying CSV root.
-
-    returns:
-        Mapping of protocol token symbol to its component symbols.
-    """
-    root = root or active_context().paths.protocol_underlying_tokens
-    if not root.exists():
-        return {}
-
-    components: dict[str, set[str]] = {}
-    for csv_path in root.rglob(f"{chain}_*.csv"):
-        if csv_path.parent.name == "aave":
-            continue
-
-        symbol = sanitize_symbol(csv_path.stem[len(chain) + 1 :])
-        if not symbol:
-            continue
-
-        try:
-            columns = pd.read_csv(csv_path, nrows=0).columns
-        except (OSError, pd.errors.EmptyDataError):
-            continue
-
-        asset_columns = [
-            sanitize_symbol(column.replace("asset_", "", 1))
-            for column in columns
-            if isinstance(column, str) and column.startswith("asset_")
-        ]
-        asset_symbols = {column for column in asset_columns if column}
-        if asset_symbols:
-            components[symbol] = asset_symbols
-
-    return components
-
-
 @dataclass
 class CryptoPosition:
     """Tracks the running state and calculations of a single crypto position."""
@@ -196,7 +128,6 @@ class CryptoPosition:
     valuation_route: ValuationRoute
     quantity: Decimal = Decimal(0)
     principal: float = 0.0
-    family_proxy: CryptoPosition | None = None
     price_source: str = ""
 
     def __post_init__(self):
@@ -204,60 +135,7 @@ class CryptoPosition:
             self.price_source = self.coin
 
     def adjust_principal(self, amount: float):
-        if self.family_proxy:
-            self.family_proxy.adjust_principal(amount)
-        else:
-            self.principal += amount
-
-    def buy(self, amount_bought: Decimal, fiat_spent: Decimal, currency: str, date: str):
-        self.quantity += amount_bought
-        rate = get_forex_rate(
-            currency=currency,
-            date=date,
-            prices_folder=active_context().paths.prices,
-        )
-        self.adjust_principal(float(fiat_spent) * rate)
-
-    def sell(self, amount_sold: Decimal, fiat_received: Decimal, currency: str, date: str):
-        self.quantity -= amount_sold
-        rate = get_forex_rate(
-            currency=currency,
-            date=date,
-            prices_folder=active_context().paths.prices,
-        )
-        self.adjust_principal(-(float(fiat_received) * rate))
-
-    def receive(self, amount_received: Decimal, date: str):
-        self.quantity += amount_received
-        price = _price_or_zero(
-            coin=self.price_source,
-            date=date,
-            chain=self.chain,
-            use_lp_prices=self.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
-        )
-        self.adjust_principal(float(amount_received) * price)
-
-    def send(self, amount_sent: Decimal, date: str):
-        self.quantity -= amount_sent
-        price = _price_or_zero(
-            coin=self.price_source,
-            date=date,
-            chain=self.chain,
-            use_lp_prices=self.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
-        )
-        self.adjust_principal(-(float(amount_sent) * price))
-
-    def reward(self, amount_received: Decimal, source_asset: CryptoPosition, date: str):
-        self.quantity += amount_received
-        price = _price_or_zero(
-            coin=self.price_source,
-            date=date,
-            chain=self.chain,
-            use_lp_prices=self.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
-        )
-        invested = float(amount_received) * price
-        self.adjust_principal(invested)
-        source_asset.adjust_principal(-invested)
+        self.principal += amount
 
     def to_snapshot(self, date_value) -> dict:
         return {
@@ -320,6 +198,8 @@ class TransactionParser:
             candidate = sanitize_symbol(raw_token.strip())
             if candidate:
                 tokens.append(candidate)
+        if len(tokens) != len(quantities):
+            raise ValueError(f"Mismatched token and quantity fields: {token_val!r}, {qty_val!r}")
         return [TxEntry(token=t, quantity=q) for t, q in zip(tokens, quantities)]
 
     def parse_reward_sources(self, *, tx_type_lower: str) -> list[str]:
@@ -339,17 +219,13 @@ class PortfolioLedger:
     def __init__(self, chain: str, token_metadata: dict[str, dict[str, Any]] | None = None):
         self.chain = chain
         paths = active_context().paths
-        self.token_metadata = token_metadata or load_token_metadata(
-            chain=chain,
-            tokens_folder=paths.tokens,
+        self.token_metadata = (
+            load_token_metadata(chain=chain, tokens_folder=paths.tokens)
+            if token_metadata is None
+            else token_metadata
         )
         self.symbol_to_meta: dict[str, dict[str, Any]] = {}
-        self.symbol_family: dict[str, str] = {}
         self.symbol_protocol = build_symbol_protocol_map(token_metadata=self.token_metadata)
-        self.protocol_components = _load_protocol_components(
-            chain=chain,
-            root=paths.protocol_underlying_tokens,
-        )
         self.use_dual_principal = chain == "arbitrum"
         self.principal_ledger = EconomicPrincipalLedger(
             resolver=PrincipalResolver(
@@ -367,97 +243,11 @@ class PortfolioLedger:
             if symbol not in self.symbol_to_meta:
                 self.symbol_to_meta[symbol] = meta
 
-            family = sanitize_symbol(meta.get("family")) or symbol
-            self.symbol_family[symbol] = family
-
         self.assets: dict[str, CryptoPosition] = {}
         self.history: list[dict] = []
         self.daily_coin_cache: dict[str, int] = {}
         self.current_date: date | None = None
         self.unresolved_prices: list[UnresolvedPriceEvent] = []
-
-    def _principal_terminal_families(
-        self,
-        symbol: str,
-        *,
-        seen: set[str] | None = None,
-        depth: int = 0,
-    ) -> set[str] | None:
-        normalized = sanitize_symbol(symbol)
-        if not normalized or depth > MAX_PRINCIPAL_PROXY_DEPTH:
-            return None
-
-        visited = set(seen or set())
-        if normalized in visited:
-            return None
-        visited.add(normalized)
-
-        price_proxy = price_proxy_symbol(normalized)
-        if price_proxy and price_proxy != normalized:
-            return self._principal_terminal_families(
-                price_proxy,
-                seen=visited,
-                depth=depth + 1,
-            )
-
-        components = self.protocol_components.get(normalized)
-        if components:
-            terminal_families: set[str] = set()
-            for component in components:
-                component_families = self._principal_terminal_families(
-                    component,
-                    seen=visited,
-                    depth=depth + 1,
-                )
-                if component_families is None:
-                    return None
-                terminal_families.update(component_families)
-            return terminal_families
-
-        route = classify_valuation_route(
-            symbol=normalized,
-            symbol_protocol=self.symbol_protocol,
-        )
-        if route == ValuationRoute.PROTOCOL_DERIVED:
-            return None
-
-        terminal = canonicalize_symbol(
-            normalized,
-            symbol_family=self.symbol_family,
-        )
-        return {terminal or normalized}
-
-    def _principal_proxy_symbol(
-        self,
-        *,
-        asset_key: str,
-        route: ValuationRoute,
-        meta: dict[str, Any] | None,
-    ) -> str:
-        if route == ValuationRoute.AAVE:
-            if _is_aave_debt_symbol(asset_key):
-                return ""
-            base_symbol = _derive_aave_price_source(symbol=asset_key, meta=meta)
-        elif route == ValuationRoute.PROTOCOL_DERIVED:
-            if asset_key not in self.protocol_components:
-                return ""
-            base_symbol = asset_key
-        else:
-            base_symbol = ""
-            if meta:
-                base_symbol = canonicalize_symbol(
-                    meta.get("family"),
-                    symbol_family=self.symbol_family,
-                ) or sanitize_symbol(meta.get("price_source"))
-            if not base_symbol:
-                base_symbol = asset_key
-
-        terminal_families = self._principal_terminal_families(base_symbol)
-        if not terminal_families or len(terminal_families) != 1:
-            return ""
-
-        proxy_symbol = next(iter(terminal_families))
-        return proxy_symbol if proxy_symbol and proxy_symbol != asset_key else ""
 
     def fetch_asset(self, coin: str) -> CryptoPosition:
         normalized_coin = sanitize_symbol(coin)
@@ -507,22 +297,10 @@ class PortfolioLedger:
             tx_hash=tx_hash,
         )
 
-    def collect_snapshots(self, *, asset: CryptoPosition, date_value: str) -> list[dict]:
-        snapshots = [asset.to_snapshot(date_value)]
-        if asset.family_proxy:
-            snapshots.append(asset.family_proxy.to_snapshot(date_value))
-        return snapshots
-
     def update_snapshots(self, *, touched_coins: set[str], date_value: str) -> None:
-        new_snapshots = []
         for coin in touched_coins:
-            asset = self.assets[coin]
-            new_snapshots.extend(self.collect_snapshots(asset=asset, date_value=date_value))
-
-        unique_snapshots = {snapshot["Coin"]: snapshot for snapshot in new_snapshots}
-        for snapshot in unique_snapshots.values():
+            snapshot = self.assets[coin].to_snapshot(date_value)
             snap_date = snapshot["Date"].date()
-            coin = snapshot["Coin"]
 
             if self.current_date != snap_date:
                 self.daily_coin_cache = {}
@@ -609,7 +387,7 @@ class TransactionApplier:
             tx_hash=tx_hash,
         )
 
-    def _process_swap(
+    def apply_swap(
         self,
         *,
         ins: list[TxEntry],
@@ -675,7 +453,7 @@ class TransactionApplier:
             )
             touched_coins.add(asset_out.coin)
 
-    def _process_reward(
+    def apply_rewards(
         self,
         *,
         rewards: list[TxEntry],
@@ -811,9 +589,9 @@ class TransactionApplier:
         touched_coins.add(fee_asset.coin)
 
         target_entries = []
-        if tx_type_lower in ["swap", "buy", "receive"] and ins:
+        if tx_type_lower in ["swap", "receive"] and ins:
             target_entries = ins
-        elif tx_type_lower in ["sell", "send"] and outs:
+        elif tx_type_lower == "send" and outs:
             target_entries = outs
 
         if target_entries:
@@ -849,27 +627,7 @@ class TransactionApplier:
         )
         touched_coins = set()
 
-        if tx_type_lower == "buy":
-            entry_in = ins[0]
-            entry_out = outs[0]
-
-            asset_in = self.ledger.fetch_asset(entry_in.token)
-            asset_in.quantity += entry_in.quantity
-            rate = get_forex_rate(
-                currency=entry_out.token,
-                date=date_value,
-                prices_folder=active_context().paths.prices,
-            )
-            self.ledger.adjust_principal(
-                asset=asset_in,
-                amount_eur=float(entry_out.quantity) * rate,
-                date_value=date_value,
-                action="buy",
-                tx_hash=tx_hash,
-            )
-            touched_coins.add(asset_in.coin)
-
-        elif tx_type_lower == "receive":
+        if tx_type_lower == "receive":
             for entry in ins:
                 asset_in = self.ledger.fetch_asset(entry.token)
                 self.receive(
@@ -879,26 +637,6 @@ class TransactionApplier:
                     tx_hash=tx_hash,
                 )
                 touched_coins.add(asset_in.coin)
-
-        elif tx_type_lower == "sell":
-            entry_in = ins[0]
-            entry_out = outs[0]
-
-            asset_out = self.ledger.fetch_asset(entry_out.token)
-            asset_out.quantity -= entry_out.quantity
-            rate = get_forex_rate(
-                currency=entry_in.token,
-                date=date_value,
-                prices_folder=active_context().paths.prices,
-            )
-            self.ledger.adjust_principal(
-                asset=asset_out,
-                amount_eur=-(float(entry_in.quantity) * rate),
-                date_value=date_value,
-                action="sell",
-                tx_hash=tx_hash,
-            )
-            touched_coins.add(asset_out.coin)
 
         elif tx_type_lower == "send":
             for entry in outs:
@@ -912,7 +650,7 @@ class TransactionApplier:
                 touched_coins.add(asset_out.coin)
 
         elif tx_type_lower == "swap":
-            self._process_swap(
+            self.apply_swap(
                 ins=ins,
                 outs=outs,
                 date_value=date_value,
@@ -922,7 +660,7 @@ class TransactionApplier:
 
         elif tx_type_lower.startswith("reward"):
             allocate_reward_to = self.parser.parse_reward_sources(tx_type_lower=tx_type_lower)
-            self._process_reward(
+            self.apply_rewards(
                 rewards=ins,
                 allocate_reward_to=allocate_reward_to,
                 date_value=date_value,
@@ -936,9 +674,7 @@ class TransactionApplier:
         elif tx_type_lower == "interaction":
             pass
         else:
-            error_msg = f"{tx_type}: {ins} -> {outs} on {date_value} not found."
-            print(error_msg)
-            return
+            raise ValueError(f"Unsupported transaction type: {tx_type}")
 
         self.handle_fees(
             row=row,
@@ -953,174 +689,19 @@ class TransactionApplier:
         self.ledger.update_snapshots(touched_coins=touched_coins, date_value=date_value)
 
 
-class SnapshotWriter:
-    def save(self, *, history: list[dict], output_path: Path):
-        df = pd.DataFrame(history)
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        df = df.dropna(subset=["Date"])
-        df["Date"] = df["Date"].map(format_daily_datetime)
-        atomic_write_csv(frame=df, path=output_path)
-        print(f"Portfolio snapshots successfully saved to {output_path}")
-
-    def save_principal(self, *, tracker: CryptoTracker, events_path: Path, daily_path: Path):
-        events_path.parent.mkdir(parents=True, exist_ok=True)
-        daily_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_csv(
-            frame=tracker.ledger.principal_ledger.events_frame(),
-            path=events_path,
-        )
-        atomic_write_csv(
-            frame=tracker.ledger.principal_ledger.daily_frame(),
-            path=daily_path,
-        )
+def _save_snapshots(*, history: list[dict], output_path: Path) -> None:
+    frame = pd.DataFrame(history)
+    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+    frame = frame.dropna(subset=["Date"])
+    frame["Date"] = frame["Date"].map(format_daily_datetime)
+    atomic_write_csv(frame=frame, path=output_path)
 
 
-class CryptoTracker:
-    def __init__(self, chain: str, token_metadata: dict[str, dict[str, Any]] | None = None):
-        self.ledger = PortfolioLedger(chain=chain, token_metadata=token_metadata)
-        self.parser = TransactionParser()
-        self.applier = TransactionApplier(ledger=self.ledger, parser=self.parser)
-        self.writer = SnapshotWriter()
-
-    @property
-    def chain(self) -> str:
-        return self.ledger.chain
-
-    @property
-    def token_metadata(self) -> dict[str, dict[str, Any]]:
-        return self.ledger.token_metadata
-
-    @property
-    def symbol_to_meta(self) -> dict[str, dict[str, Any]]:
-        return self.ledger.symbol_to_meta
-
-    @property
-    def symbol_family(self) -> dict[str, str]:
-        return self.ledger.symbol_family
-
-    @property
-    def symbol_protocol(self) -> dict[str, str]:
-        return self.ledger.symbol_protocol
-
-    @property
-    def assets(self) -> dict[str, CryptoPosition]:
-        return self.ledger.assets
-
-    @assets.setter
-    def assets(self, value: dict[str, CryptoPosition]) -> None:
-        self.ledger.assets = value
-
-    @property
-    def history(self) -> list[dict]:
-        return self.ledger.history
-
-    @history.setter
-    def history(self, value: list[dict]) -> None:
-        self.ledger.history = value
-
-    @property
-    def daily_coin_cache(self) -> dict[str, int]:
-        return self.ledger.daily_coin_cache
-
-    @daily_coin_cache.setter
-    def daily_coin_cache(self, value: dict[str, int]) -> None:
-        self.ledger.daily_coin_cache = value
-
-    @property
-    def current_date(self) -> date | None:
-        return self.ledger.current_date
-
-    @current_date.setter
-    def current_date(self, value: date | None) -> None:
-        self.ledger.current_date = value
-
-    @property
-    def unresolved_prices(self) -> list[UnresolvedPriceEvent]:
-        return self.ledger.unresolved_prices
-
-    def fetch_asset(self, coin: str) -> CryptoPosition:
-        return self.ledger.fetch_asset(coin=coin)
-
-    def _collect_snapshots(self, asset: CryptoPosition, date: str) -> list[dict]:
-        return self.ledger.collect_snapshots(asset=asset, date_value=date)
-
-    def _update_snapshots(self, touched_coins: set[str], date: str) -> None:
-        self.ledger.update_snapshots(touched_coins=touched_coins, date_value=date)
-
-    def _process_swap(
-        self,
-        ins: list[TxEntry],
-        outs: list[TxEntry],
-        date: str,
-        touched_coins: set[str],
-    ) -> None:
-        self.applier._process_swap(
-            ins=ins,
-            outs=outs,
-            date_value=date,
-            touched_coins=touched_coins,
-        )
-
-    def _process_reward(
-        self,
-        rewards: list[TxEntry],
-        allocate_reward_to: list[str],
-        date: str,
-        touched_coins: set[str],
-    ) -> None:
-        self.applier._process_reward(
-            rewards=rewards,
-            allocate_reward_to=allocate_reward_to,
-            date_value=date,
-            touched_coins=touched_coins,
-        )
-
-    def apply_reward_with_allocations(
-        self,
-        *,
-        reward_token: str,
-        reward_quantity: Decimal,
-        date: str,
-        allocations: list[tuple[str | None, float]] | None,
-        touched_coins: set[str],
-    ) -> None:
-        self.applier.apply_reward_with_allocations(
-            reward_token=reward_token,
-            reward_quantity=reward_quantity,
-            date_value=date,
-            allocations=allocations,
-            touched_coins=touched_coins,
-        )
-
-    def _parse_reward_sources(self, tx_type_lower: str) -> list[str]:
-        return self.parser.parse_reward_sources(tx_type_lower=tx_type_lower)
-
-    def handle_fees(
-        self,
-        row: pd.Series,
-        date: str,
-        ins: list[TxEntry],
-        outs: list[TxEntry],
-        tx_type_lower: str,
-        touched_coins: set[str],
-    ) -> None:
-        self.applier.handle_fees(
-            row=row,
-            date_value=date,
-            ins=ins,
-            outs=outs,
-            tx_type_lower=tx_type_lower,
-            touched_coins=touched_coins,
-        )
-
-    def process_transaction(self, row: pd.Series):
-        self.applier.process_transaction(row=row)
-
-    def save_to_csv(self, output_path: Path):
-        self.writer.save(history=self.history, output_path=output_path)
-
-    def save_principal_to_csv(self, *, events_path: Path, daily_path: Path):
-        self.writer.save_principal(tracker=self, events_path=events_path, daily_path=daily_path)
+def _save_principal(*, ledger: PortfolioLedger, events_path: Path, daily_path: Path) -> None:
+    events_path.parent.mkdir(parents=True, exist_ok=True)
+    daily_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_csv(frame=ledger.principal_ledger.events_frame(), path=events_path)
+    atomic_write_csv(frame=ledger.principal_ledger.daily_frame(), path=daily_path)
 
 
 def generate_raw_snapshots(
@@ -1147,15 +728,17 @@ def generate_raw_snapshots(
     df = df.dropna(subset=["Date"])
     df = df.sort_values(by=["Date"], ascending=True)
 
-    tracker = CryptoTracker(chain=chain, token_metadata=token_metadata)
+    ledger = PortfolioLedger(chain=chain, token_metadata=token_metadata)
+    applier = TransactionApplier(ledger=ledger)
     for _, row in df.iterrows():
-        tracker.process_transaction(row)
+        applier.process_transaction(row)
 
-    tracker.save_to_csv(output_csv)
+    _save_snapshots(history=ledger.history, output_path=output_csv)
     if principal_events_csv is not None and principal_daily_csv is not None:
-        tracker.save_principal_to_csv(
+        _save_principal(
+            ledger=ledger,
             events_path=principal_events_csv,
             daily_path=principal_daily_csv,
         )
-    if tracker.unresolved_prices:
-        print(f"[raw_snapshots] Unresolved price events: {len(tracker.unresolved_prices)}")
+    if ledger.unresolved_prices:
+        print(f"[raw_snapshots] Unresolved price events: {len(ledger.unresolved_prices)}")

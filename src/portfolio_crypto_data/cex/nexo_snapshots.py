@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,21 +13,23 @@ from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
     parse_transaction_datetime_series,
 )
-from portfolio_crypto_data.raw_snapshots import CryptoTracker, TxEntry
+from portfolio_crypto_data.raw_snapshots import PortfolioLedger, TransactionApplier, TxEntry
 from portfolio_crypto_data.symbols import sanitize_symbol
 
 MAX_INVALID_DATE_RATIO = 0.1
 INTEREST_TYPES = {"interest", "fixed term interest", "interest additional"}
-CARD_TYPES_TO_IGNORE = {
+SKIPPED_TYPES = {
     "credit card withdrawal credit",
+    "deposit to exchange",
+    "exchange credit",
+    "exchange liquidation",
+    "locking term deposit",
     "manual repayment",
     "manual sell order",
-}
-IGNORED_TYPES = {
     "transfer in",
     "transfer out",
-    "locking term deposit",
     "unlocking term deposit",
+    "withdraw exchanged",
 }
 INPUT_RECEIVE_TYPES = {
     "assimilation",
@@ -42,23 +44,11 @@ INPUT_OUTPUT_SWAP_TYPES = {
     "exchange",
 }
 SNAPSHOT_COLUMNS = ["Date", "Coin", "Quantity", "Principal Invested"]
-LIQUIDATION_REVIEW_COLUMNS = [
-    "Date / Time (UTC)",
-    "Transaction",
-    "Type",
-    "Input Amount",
-    "Input Currency",
-    "Output Amount",
-    "Output Currency",
-    "USD Equivalent",
-    "Details",
-]
 MANUAL_REPAYMENT_PAIR_WINDOW = pd.Timedelta(hours=6)
 MANUAL_REPAYMENT_USD_TOLERANCE = Decimal("0.05")
 MANUAL_REPAYMENT_USD_TOLERANCE_BY_TOKEN = {
     "USDC": Decimal("0.60"),
 }
-LIQUIDATION_REVIEW_FILENAME = "nexo_liquidation_only_review.csv"
 ActionHandler = Callable[[pd.Series], "NormalizedAction"]
 
 
@@ -71,9 +61,9 @@ class RewardInstruction:
 @dataclass
 class NormalizedAction:
     action: str
-    ins: list[TxEntry]
-    outs: list[TxEntry]
-    rewards: list[RewardInstruction]
+    ins: list[TxEntry] = field(default_factory=list)
+    outs: list[TxEntry] = field(default_factory=list)
+    rewards: list[RewardInstruction] = field(default_factory=list)
     principal_overrides: dict[str, float] | None = None
     principal_additions: dict[str, float] | None = None
 
@@ -159,8 +149,8 @@ class NexoTransactionNormalizer:
 
     def normalize_row(self, row: pd.Series) -> NormalizedAction:
         tx_type = str(row.get("Type") or "").strip().lower()
-        if self._should_ignore_row(row=row, tx_type=tx_type):
-            return NormalizedAction(action="skip", ins=[], outs=[], rewards=[])
+        if self._is_internal_wallet_hop(row=row):
+            return NormalizedAction(action="skip")
 
         handler = self.handlers.get(tx_type)
         if handler is None:
@@ -169,21 +159,17 @@ class NexoTransactionNormalizer:
 
     def _build_handlers(self) -> dict[str, ActionHandler]:
         return {
-            **dict.fromkeys(CARD_TYPES_TO_IGNORE, self._handle_skip),
+            **dict.fromkeys(SKIPPED_TYPES, self._handle_skip),
             **dict.fromkeys(INPUT_RECEIVE_TYPES, self._handle_positive_input_receive),
             **dict.fromkeys(INPUT_REWARD_TYPES, self._handle_free_input_reward),
             **dict.fromkeys(INPUT_OUTPUT_SWAP_TYPES, self._handle_input_output_swap),
             **dict.fromkeys(INTEREST_TYPES, self._handle_interest),
-            "deposit to exchange": self._handle_skip,
             "exchange deposited on": self._handle_exchange_deposited_on,
             "nexo card purchase": self._handle_nexo_card_purchase,
             "nexo card refund": self._handle_nexo_card_refund,
             "nexo card cashback reversal": self._handle_nexo_card_cashback_reversal,
-            "exchange liquidation": self._handle_exchange_liquidation,
             "exchange to withdraw": self._handle_exchange_to_withdraw,
             "credit card fiatx exchange to withdraw": self._handle_exchange_to_withdraw,
-            "withdraw exchanged": self._handle_skip,
-            "exchange credit": self._handle_exchange_credit,
             "nexo card transaction fee": self._handle_standard_withdrawal,
             "loan withdrawal": self._handle_standard_withdrawal,
             "withdrawal": self._handle_standard_withdrawal,
@@ -195,7 +181,7 @@ class NexoTransactionNormalizer:
     @staticmethod
     def _handle_skip(row: pd.Series) -> NormalizedAction:
         del row
-        return NormalizedAction(action="skip", ins=[], outs=[], rewards=[])
+        return NormalizedAction(action="skip")
 
     def _handle_exchange_deposited_on(self, row: pd.Series) -> NormalizedAction:
         return self._build_receive_action(ins=self._normalize_exchange_deposited_on_ins(row=row))
@@ -250,18 +236,8 @@ class NexoTransactionNormalizer:
             principal_additions=additions,
         )
 
-    def _handle_exchange_liquidation(self, row: pd.Series) -> NormalizedAction:
-        ins, outs = self._normalize_exchange_liquidation_swap(row=row)
-        return self._build_swap_action(ins=ins, outs=outs)
-
     def _handle_exchange_to_withdraw(self, row: pd.Series) -> NormalizedAction:
         return self._build_send_action(outs=self._normalize_exchange_to_withdraw_outs(row=row))
-
-    def _handle_exchange_credit(self, row: pd.Series) -> NormalizedAction:
-        if self._is_card_loan_withdrawal(row=row):
-            return self._handle_skip(row)
-        ins, outs = self._normalize_input_output_swap(row=row)
-        return self._build_swap_action(ins=ins, outs=outs)
 
     def _handle_standard_withdrawal(self, row: pd.Series) -> NormalizedAction:
         return self._build_send_action(outs=self._normalize_withdrawal_outs(row=row))
@@ -324,16 +300,9 @@ class NexoTransactionNormalizer:
         )
 
     @staticmethod
-    def _should_ignore_row(*, row: pd.Series, tx_type: str) -> bool:
-        if tx_type in IGNORED_TYPES:
-            return True
-
+    def _is_internal_wallet_hop(*, row: pd.Series) -> bool:
         details = str(row.get("Details") or "").strip().lower()
-        # Internal NEXO wallet hops are non-economic moves and should not affect snapshots.
-        if re.search(r"transfer from .*wallet to .*wallet", details):
-            return True
-
-        return False
+        return bool(re.search(r"transfer from .*wallet to .*wallet", details))
 
     @staticmethod
     def _build_receive_action(*, ins: list[TxEntry]) -> NormalizedAction:
@@ -389,29 +358,6 @@ class NexoTransactionNormalizer:
         return [TxEntry(token=output_symbol, quantity=output_amount)], [
             TxEntry(token=input_symbol, quantity=input_amount)
         ]
-
-    def _normalize_exchange_liquidation_swap(
-        self, row: pd.Series
-    ) -> tuple[list[TxEntry], list[TxEntry]]:
-        """
-        Normalizes exchange liquidation as conversion into debt token (typically xUSD/USDX).
-
-        NEXO commonly exports both legs as positive. For repayment logic we interpret:
-        - input leg as source sold away (out)
-        - output leg as destination bought (in)
-        """
-        input_symbol = self._parse_symbol(value=row.get("Input Currency"))
-        output_symbol = self._parse_symbol(value=row.get("Output Currency"))
-        input_amount = self._parse_amount(value=row.get("Input Amount")).copy_abs()
-        output_amount = self._parse_amount(value=row.get("Output Amount")).copy_abs()
-
-        outs: list[TxEntry] = []
-        ins: list[TxEntry] = []
-        if input_symbol and input_amount > 0:
-            outs.append(TxEntry(token=input_symbol, quantity=input_amount))
-        if output_symbol and output_amount > 0:
-            ins.append(TxEntry(token=output_symbol, quantity=output_amount))
-        return ins, outs
 
     def _normalize_card_refund_receive(self, row: pd.Series) -> TxEntry | None:
         """
@@ -557,11 +503,6 @@ class NexoTransactionNormalizer:
         if head in {"refund", "approved", "rejected"}:
             return ""
         return head
-
-    @staticmethod
-    def _is_card_loan_withdrawal(*, row: pd.Series) -> bool:
-        details = str(row.get("Details") or "").strip().lower()
-        return "nexo card loan withdrawal" in details
 
     @staticmethod
     def _is_rejected_card_row(*, row: pd.Series) -> bool:
@@ -995,26 +936,10 @@ def _build_manual_repayment_actions(
     *,
     frame: pd.DataFrame,
     normalizer: NexoTransactionNormalizer,
-) -> tuple[dict[int, NormalizedAction], set[int], list[dict[str, object]]]:
+) -> dict[int, NormalizedAction]:
     pairs = _build_manual_repayment_pairs(frame=frame, normalizer=normalizer)
 
     pair_actions_by_row_idx: dict[int, NormalizedAction] = {}
-    liquidation_consumed_indices: set[int] = set()
-
-    liquidation_rows: list[tuple[int, pd.Timestamp, Decimal, str, str]] = []
-    for idx, row in frame.iterrows():
-        tx_type = str(row.get("Type") or "").strip().lower()
-        if tx_type != "exchange liquidation":
-            continue
-        date = pd.to_datetime(row.get("Date"), errors="coerce")
-        if pd.isna(date):
-            continue
-        usd_equivalent = normalizer._parse_usd_equivalent(value=row.get("USD Equivalent"))
-        ins, outs = normalizer._normalize_exchange_liquidation_swap(row=row)
-        in_token = ins[0].token if ins else ""
-        out_token = outs[0].token if outs else ""
-        liquidation_rows.append((idx, date, usd_equivalent, in_token, out_token))
-
     for pair in pairs:
         principal_value = round(float(pair.manual_repayment.entry.quantity), 2)
         pair_actions_by_row_idx[pair.manual_repayment.idx] = NormalizedAction(
@@ -1028,63 +953,7 @@ def _build_manual_repayment_actions(
             },
         )
 
-        candidates: list[tuple[pd.Timedelta, Decimal, int]] = []
-        for liq_idx, liq_date, liq_usd, liq_in_token, liq_out_token in liquidation_rows:
-            if liq_idx in liquidation_consumed_indices:
-                continue
-            if liq_in_token != pair.manual_repayment.entry.token:
-                continue
-            if liq_out_token != pair.manual_sell.entry.token:
-                continue
-
-            time_delta = abs(liq_date - pair.manual_repayment.date)
-            if time_delta > MANUAL_REPAYMENT_PAIR_WINDOW:
-                continue
-            usd_delta = (liq_usd - pair.manual_repayment.usd_equivalent).copy_abs()
-            if usd_delta > MANUAL_REPAYMENT_USD_TOLERANCE:
-                continue
-            candidates.append((time_delta, usd_delta, liq_idx))
-
-        if not candidates:
-            continue
-
-        _, _, matched_liq_idx = min(
-            candidates,
-            key=lambda candidate: (candidate[0], candidate[1], candidate[2]),
-        )
-        liquidation_consumed_indices.add(matched_liq_idx)
-
-    review_rows: list[dict[str, object]] = []
-    for idx, row in frame.iterrows():
-        tx_type = str(row.get("Type") or "").strip().lower()
-        if tx_type != "exchange liquidation":
-            continue
-        if idx in liquidation_consumed_indices:
-            continue
-        review_rows.append({column: row.get(column, "") for column in LIQUIDATION_REVIEW_COLUMNS})
-
-    review_rows = sorted(
-        review_rows,
-        key=lambda item: (
-            str(item.get("Date / Time (UTC)", "")),
-            str(item.get("Transaction", "")),
-        ),
-    )
-
-    return pair_actions_by_row_idx, liquidation_consumed_indices, review_rows
-
-
-def _save_liquidation_review(*, review_rows: list[dict[str, object]], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if not review_rows:
-        atomic_write_csv(
-            frame=pd.DataFrame(columns=LIQUIDATION_REVIEW_COLUMNS),
-            path=output_path,
-        )
-        return
-    frame = pd.DataFrame(review_rows)
-    frame = frame[LIQUIDATION_REVIEW_COLUMNS]
-    atomic_write_csv(frame=frame, path=output_path)
+    return pair_actions_by_row_idx
 
 
 def _save_history(history: list[dict], output_path: Path) -> None:
@@ -1095,10 +964,6 @@ def _save_history(history: list[dict], output_path: Path) -> None:
         return
 
     frame = pd.DataFrame(history)
-    if frame.empty:
-        atomic_write_csv(frame=pd.DataFrame(columns=SNAPSHOT_COLUMNS), path=output_path)
-        return
-
     frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
     frame = frame.dropna(subset=["Date"])
     frame["Date"] = frame["Date"].map(format_daily_datetime)
@@ -1128,7 +993,8 @@ def _load_nexo_transaction_exports(input_csv: Path) -> pd.DataFrame:
 
 def _apply_generic_action(
     *,
-    tracker: CryptoTracker,
+    ledger: PortfolioLedger,
+    applier: TransactionApplier,
     action: NormalizedAction,
     date: pd.Timestamp,
     touched_coins: set[str],
@@ -1139,79 +1005,57 @@ def _apply_generic_action(
     if action.action == "swap":
         if overrides:
             for entry in action.ins:
-                asset = tracker.fetch_asset(entry.token)
+                asset = ledger.fetch_asset(entry.token)
                 asset.quantity += entry.quantity
                 asset.adjust_principal(overrides.get(entry.token, 0.0))
                 touched_coins.add(asset.coin)
             for entry in action.outs:
-                asset = tracker.fetch_asset(entry.token)
+                asset = ledger.fetch_asset(entry.token)
                 asset.quantity -= entry.quantity
                 asset.adjust_principal(overrides.get(entry.token, 0.0))
                 touched_coins.add(asset.coin)
         else:
-            tracker._process_swap(
+            applier.apply_swap(
                 ins=action.ins,
                 outs=action.outs,
-                date=date,
+                date_value=date,
                 touched_coins=touched_coins,
             )
         return
 
-    if action.action == "buy":
-        if len(action.ins) != 1 or len(action.outs) != 1:
-            return
-        entry_in = action.ins[0]
-        entry_out = action.outs[0]
-        asset_in = tracker.fetch_asset(entry_in.token)
-        asset_in.buy(
-            amount_bought=entry_in.quantity,
-            fiat_spent=entry_out.quantity,
-            currency=entry_out.token,
-            date=date,
-        )
-        touched_coins.add(asset_in.coin)
-        return
-
-    if action.action == "sell":
-        if len(action.ins) != 1 or len(action.outs) != 1:
-            return
-        entry_in = action.ins[0]
-        entry_out = action.outs[0]
-        asset_out = tracker.fetch_asset(entry_out.token)
-        asset_out.sell(
-            amount_sold=entry_out.quantity,
-            fiat_received=entry_in.quantity,
-            currency=entry_in.token,
-            date=date,
-        )
-        touched_coins.add(asset_out.coin)
-        return
-
     if action.action == "receive":
         for entry in action.ins:
-            asset = tracker.fetch_asset(entry.token)
+            asset = ledger.fetch_asset(entry.token)
             if entry.token in overrides:
                 asset.quantity += entry.quantity
                 asset.adjust_principal(overrides[entry.token])
             else:
-                asset.receive(amount_received=entry.quantity, date=date)
+                applier.receive(
+                    asset=asset,
+                    amount_received=entry.quantity,
+                    date_value=date,
+                )
             touched_coins.add(asset.coin)
         return
 
     if action.action == "send":
         for entry in action.outs:
-            asset = tracker.fetch_asset(entry.token)
+            asset = ledger.fetch_asset(entry.token)
             if entry.token in overrides:
                 asset.quantity -= entry.quantity
                 asset.adjust_principal(overrides[entry.token])
             else:
-                asset.send(amount_sent=entry.quantity, date=date)
+                applier.send(
+                    asset=asset,
+                    amount_sent=entry.quantity,
+                    date_value=date,
+                )
             touched_coins.add(asset.coin)
 
     for token, principal_delta in additions.items():
         if principal_delta == 0:
             continue
-        asset = tracker.fetch_asset(token)
+        asset = ledger.fetch_asset(token)
         asset.adjust_principal(principal_delta)
         touched_coins.add(asset.coin)
 
@@ -1237,54 +1081,44 @@ def generate_nexo_raw_snapshots(input_csv: Path, output_csv: Path) -> None:
     ).reset_index(drop=True)
 
     normalizer = NexoTransactionNormalizer.from_dataframe(frame=frame)
-    pair_actions_by_row_idx, _, liquidation_review_rows = _build_manual_repayment_actions(
+    pair_actions_by_row_idx = _build_manual_repayment_actions(
         frame=frame,
         normalizer=normalizer,
     )
-    liquidation_review_path = output_csv.with_name(LIQUIDATION_REVIEW_FILENAME)
-    _save_liquidation_review(
-        review_rows=liquidation_review_rows,
-        output_path=liquidation_review_path,
-    )
 
-    tracker = CryptoTracker(chain="nexo", token_metadata={})
+    ledger = PortfolioLedger(chain="nexo", token_metadata={})
+    applier = TransactionApplier(ledger=ledger)
 
     for idx, row in frame.iterrows():
         date = row["Date"]
-        tx_type = str(row.get("Type") or "").strip().lower()
-        if idx in pair_actions_by_row_idx:
-            action = pair_actions_by_row_idx[idx]
-        elif tx_type == "exchange liquidation":
-            action = NormalizedAction(action="skip", ins=[], outs=[], rewards=[])
-        else:
-            action = normalizer.normalize_row(row=row)
+        action = pair_actions_by_row_idx.get(idx) or normalizer.normalize_row(row=row)
         if action.action == "skip":
             continue
 
         touched_coins: set[str] = set()
         if action.action == "reward":
             for reward in action.rewards:
-                tracker.apply_reward_with_allocations(
+                applier.apply_reward_with_allocations(
                     reward_token=reward.entry.token,
                     reward_quantity=reward.entry.quantity,
-                    date=date,
+                    date_value=date,
                     allocations=reward.allocations,
                     touched_coins=touched_coins,
                 )
         else:
             _apply_generic_action(
-                tracker=tracker,
+                ledger=ledger,
+                applier=applier,
                 action=action,
                 date=date,
                 touched_coins=touched_coins,
             )
 
         if touched_coins:
-            tracker._update_snapshots(touched_coins=touched_coins, date=date)
+            ledger.update_snapshots(touched_coins=touched_coins, date_value=date)
 
-    _save_history(history=tracker.history, output_path=output_csv)
+    _save_history(history=ledger.history, output_path=output_csv)
+    stale_review = output_csv.with_name("nexo_liquidation_only_review.csv")
+    if stale_review.exists():
+        stale_review.unlink()
     print(f"Portfolio snapshots successfully saved to {output_csv}")
-    print(
-        "[nexo_snapshots] Wrote exchange-liquidation review list "
-        f"({len(liquidation_review_rows)} rows) to {liquidation_review_path}"
-    )

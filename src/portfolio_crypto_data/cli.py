@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from importlib.metadata import version
 from pathlib import Path
 
@@ -14,13 +15,8 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _update(*, argv: list[str], context: PortfolioContext) -> int:
+def _refresh_nexo(*, context: PortfolioContext) -> None:
     from portfolio_crypto_data.cex.nexo_snapshots import generate_nexo_raw_snapshots
-    from portfolio_crypto_data.update import main as update_evm
-
-    result = update_evm(argv)
-    if result:
-        return result
 
     nexo_input = context.paths.crypto_transactions / "cex" / "nexo"
     if nexo_input.exists() and any(nexo_input.glob("*.csv")):
@@ -32,24 +28,29 @@ def _update(*, argv: list[str], context: PortfolioContext) -> int:
         )
     else:
         print(f"Skipping Nexo refresh; no CSV exports found in {nexo_input}")
-    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    args, remaining = _parser().parse_known_args(argv)
+    args = _parser().parse_args(argv)
     context = PortfolioContext.from_root(args.data_dir)
     validate_data_workspace(context.paths.root)
-    with context.activate(), mutation_session(
-        paths=context.paths,
-        component=f"crypto-{args.command}",
-        version=version("portfolio-crypto-data"),
-    ):
-        if args.command == "update":
-            return _update(argv=remaining, context=context)
+    try:
+        with context.activate(), mutation_session(
+            paths=context.paths,
+            component=f"crypto-{args.command}",
+            version=version("portfolio-crypto-data"),
+        ):
+            from portfolio_crypto_data.update import rebuild_derived, update_onchain
 
-        from portfolio_crypto_data.rebuild_arbitrum_derived import main as rebuild
-
-        return rebuild(remaining)
+            if args.command == "update":
+                update_onchain()
+                _refresh_nexo(context=context)
+            else:
+                rebuild_derived()
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

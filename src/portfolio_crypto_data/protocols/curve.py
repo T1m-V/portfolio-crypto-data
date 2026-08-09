@@ -9,12 +9,8 @@ from portfolio_crypto_data.pipeline_logging import PipelineLogger
 from portfolio_crypto_data.protocols.common import (
     load_block_map,
     load_chain_web3,
-    load_snapshot_ranges,
-    load_tokens,
+    protocol_token_runs,
     resolve_date_window,
-    resolve_effective_start_date,
-    resolve_protocol_end_date,
-    should_skip_date_window,
     write_protocol_history_csv,
 )
 
@@ -169,7 +165,6 @@ def get_curve_history(
     token_address: str,
     start_date: str,
     end_date: str,
-    replace_from_date: str | None = None,
     logger: PipelineLogger | None = None,
 ) -> None:
     logger = logger or PipelineLogger()
@@ -230,7 +225,6 @@ def get_curve_history(
         chain=chain,
         symbol=token_symbol,
         history_data=history_data,
-        replace_from_date=replace_from_date,
     )
     if output:
         logger.protocol_end("curve", token_symbol, output)
@@ -238,48 +232,15 @@ def get_curve_history(
 
 def process_all_curve_tokens(
     chain: str,
-    start_date: str | None = None,
-    replace_from_date: str | None = None,
     logger: PipelineLogger | None = None,
 ) -> None:
     logger = logger or PipelineLogger()
-    tokens = load_tokens(chain=chain)
-    token_ranges = load_snapshot_ranges(chain=chain)
-
-    for address, info in tokens.items():
-        if info.get("protocol") != "curve":
-            continue
-        symbol = info.get("symbol", address)
-        if symbol not in token_ranges:
-            continue
-
-        rng = token_ranges[symbol]
-        fallback_start_date = format_daily_datetime(rng["start"])
-        resolved_start_date = resolve_effective_start_date(
-            protocol="curve",
-            chain=chain,
-            symbol=symbol,
-            explicit_start_date=start_date,
-            fallback_start_date=fallback_start_date,
-        )
-        end_date = resolve_protocol_end_date(rng)
-        if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
-            logger.protocol_skip(
-                "curve",
-                symbol,
-                f"start={resolved_start_date} is after end={end_date}",
-            )
-            continue
-
-        if resolved_start_date is None:
-            continue
-
-        logger.protocol_start("curve", symbol, resolved_start_date, end_date)
+    for run in protocol_token_runs(protocol="curve", chain=chain, logger=logger):
+        logger.protocol_start("curve", run.symbol, run.start_date, run.end_date)
         get_curve_history(
             chain=chain,
-            token_address=address,
-            start_date=resolved_start_date,
-            end_date=end_date,
-            replace_from_date=replace_from_date,
+            token_address=run.address,
+            start_date=run.start_date,
+            end_date=run.end_date,
             logger=logger,
         )

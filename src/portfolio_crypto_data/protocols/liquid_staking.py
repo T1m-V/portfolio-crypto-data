@@ -35,28 +35,13 @@ class LiquidStakingTokenConfig:
     rate_scale: int = 10**18
 
 
-LIQUID_STAKING_TOKENS: dict[str, list[LiquidStakingTokenConfig]] = {
-    "arbitrum": [
-        LiquidStakingTokenConfig(
-            symbol="wstETH",
-            underlying_symbol="ETH",
-            rate_provider_address="0xf7c5c26B574063e7b098ed74fAd6779e65E3F836",
-        )
-    ]
-}
-
-
-def _resolve_fallback_start_date(
-    symbol: str,
-    token_ranges: dict[str, dict[str, object]],
-    block_map: dict[str, int],
-) -> str | None:
-    rng = token_ranges.get(symbol)
-    if rng is not None:
-        return format_daily_datetime(rng["start"])
-    if block_map:
-        return format_daily_datetime(min(block_map.keys()))
-    return None
+LIQUID_STAKING_TOKENS = (
+    LiquidStakingTokenConfig(
+        symbol="wstETH",
+        underlying_symbol="ETH",
+        rate_provider_address="0xf7c5c26B574063e7b098ed74fAd6779e65E3F836",
+    ),
+)
 
 
 def get_liquid_staking_history(
@@ -68,7 +53,6 @@ def get_liquid_staking_history(
     end_date: str,
     rate_provider_method: str = "getRate",
     rate_scale: int = 10**18,
-    replace_from_date: str | None = None,
     logger: PipelineLogger | None = None,
 ) -> None:
     logger = logger or PipelineLogger()
@@ -128,7 +112,6 @@ def get_liquid_staking_history(
         symbol=symbol,
         history_data=history_data,
         fieldnames=["date", "block", "lst_balance", f"asset_{underlying_symbol}"],
-        replace_from_date=replace_from_date,
     )
     if output:
         logger.protocol_end("liquid_staking", symbol, output)
@@ -136,35 +119,21 @@ def get_liquid_staking_history(
 
 def process_all_liquid_staking_tokens(
     chain: str,
-    start_date: str | None = None,
-    replace_from_date: str | None = None,
     logger: PipelineLogger | None = None,
 ) -> None:
     logger = logger or PipelineLogger()
-    chain_configs = LIQUID_STAKING_TOKENS.get(chain, [])
-    if not chain_configs:
-        return
-
-    try:
-        token_ranges = load_snapshot_ranges(chain=chain)
-    except FileNotFoundError:
-        token_ranges = {}
-
-    block_map = load_block_map(chain=chain)
-    for config in chain_configs:
-        fallback_start_date = _resolve_fallback_start_date(
-            symbol=config.symbol,
-            token_ranges=token_ranges,
-            block_map=block_map,
-        )
+    token_ranges = load_snapshot_ranges(chain=chain)
+    for config in LIQUID_STAKING_TOKENS:
+        rng = token_ranges.get(config.symbol)
+        if rng is None:
+            logger.protocol_skip("liquid_staking", config.symbol, "no snapshot data found")
+            continue
         resolved_start_date = resolve_effective_start_date(
             protocol="liquid_staking",
             chain=chain,
             symbol=config.symbol,
-            explicit_start_date=start_date,
-            fallback_start_date=fallback_start_date,
+            fallback_start_date=format_daily_datetime(rng["start"]),
         )
-        rng = token_ranges.get(config.symbol)
         end_date = resolve_protocol_end_date(rng)
         if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
             logger.protocol_skip(
@@ -174,10 +143,7 @@ def process_all_liquid_staking_tokens(
             )
             continue
 
-        if resolved_start_date is None:
-            logger.protocol_skip("liquid_staking", config.symbol, "no fallback start date found")
-            continue
-
+        assert resolved_start_date is not None
         logger.protocol_start("liquid_staking", config.symbol, resolved_start_date, end_date)
         get_liquid_staking_history(
             chain=chain,
@@ -188,6 +154,5 @@ def process_all_liquid_staking_tokens(
             end_date=end_date,
             rate_provider_method=config.rate_provider_method,
             rate_scale=config.rate_scale,
-            replace_from_date=replace_from_date,
             logger=logger,
         )

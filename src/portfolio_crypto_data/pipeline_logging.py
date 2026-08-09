@@ -15,9 +15,8 @@ class PipelineLogger:
     def stage_start(self, stage: str) -> None:
         self.info(f"[pipeline] Starting {stage}")
 
-    def stage_end(self, stage: str, *, errors: bool = False) -> None:
-        status = "failed" if errors else "done"
-        self.info(f"[pipeline] {stage} {status}")
+    def stage_end(self, stage: str) -> None:
+        self.info(f"[pipeline] {stage} done")
 
     def protocol_start(self, protocol: str, symbol: str, start_date: str, end_date: str) -> None:
         self.info(f"[{protocol}] Processing {symbol} ({start_date} -> {end_date})")

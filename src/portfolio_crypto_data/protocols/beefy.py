@@ -9,12 +9,8 @@ from portfolio_crypto_data.pipeline_logging import PipelineLogger
 from portfolio_crypto_data.protocols.common import (
     load_block_map,
     load_chain_web3,
-    load_snapshot_ranges,
-    load_tokens,
+    protocol_token_runs,
     resolve_date_window,
-    resolve_effective_start_date,
-    resolve_protocol_end_date,
-    should_skip_date_window,
     write_protocol_history_csv,
 )
 
@@ -222,7 +218,6 @@ def get_beefy_history(
     vault_address: str,
     start_date: str,
     end_date: str,
-    replace_from_date: str | None = None,
     logger: PipelineLogger | None = None,
 ) -> None:
     logger = logger or PipelineLogger()
@@ -289,7 +284,6 @@ def get_beefy_history(
         chain=chain,
         symbol=vault_symbol,
         history_data=history_data,
-        replace_from_date=replace_from_date,
     )
     if output:
         logger.protocol_end("beefy", vault_symbol, output)
@@ -297,48 +291,15 @@ def get_beefy_history(
 
 def process_all_beefy_tokens(
     chain: str,
-    start_date: str | None = None,
-    replace_from_date: str | None = None,
     logger: PipelineLogger | None = None,
 ) -> None:
     logger = logger or PipelineLogger()
-    tokens = load_tokens(chain=chain)
-    token_ranges = load_snapshot_ranges(chain=chain)
-    for address, info in tokens.items():
-        if info.get("protocol") != "beefy":
-            continue
-
-        symbol = info.get("symbol", address)
-        if symbol not in token_ranges:
-            continue
-
-        rng = token_ranges[symbol]
-        fallback_start_date = format_daily_datetime(rng["start"])
-        resolved_start_date = resolve_effective_start_date(
-            protocol="beefy",
-            chain=chain,
-            symbol=symbol,
-            explicit_start_date=start_date,
-            fallback_start_date=fallback_start_date,
-        )
-        end_date = resolve_protocol_end_date(rng)
-        if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
-            logger.protocol_skip(
-                "beefy",
-                symbol,
-                f"start={resolved_start_date} is after end={end_date}",
-            )
-            continue
-
-        if resolved_start_date is None:
-            continue
-
-        logger.protocol_start("beefy", symbol, resolved_start_date, end_date)
+    for run in protocol_token_runs(protocol="beefy", chain=chain, logger=logger):
+        logger.protocol_start("beefy", run.symbol, run.start_date, run.end_date)
         get_beefy_history(
             chain=chain,
-            vault_address=address,
-            start_date=resolved_start_date,
-            end_date=end_date,
-            replace_from_date=replace_from_date,
+            vault_address=run.address,
+            start_date=run.start_date,
+            end_date=run.end_date,
             logger=logger,
         )

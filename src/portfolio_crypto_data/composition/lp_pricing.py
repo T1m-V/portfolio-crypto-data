@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import date
-from decimal import Decimal
 from pathlib import Path
 
 import pandas as pd
@@ -45,22 +43,6 @@ def _load_protocol_rows(*, chain: str, protocol_root: Path) -> dict[str, pd.Data
         root=protocol_root,
         include_aave=False,
     ).rows
-
-
-def resolve_symbol_price(
-    symbol: str,
-    target_date: date,
-    ctx: PricingContext,
-    visited: set[str] | None = None,
-    depth: int = 0,
-) -> Decimal | None:
-    resolution = PriceResolver(ctx=ctx, mode="native").resolve(
-        symbol=symbol,
-        target_date=target_date,
-        visited=visited,
-        depth=depth,
-    )
-    return resolution.price
 
 
 def _build_incoming_prices(

@@ -7,7 +7,6 @@ from portfolio_crypto_data.symbols import sanitize_symbol
 
 PROTOCOL_DERIVED_PROTOCOLS: frozenset[str] = frozenset(
     {
-        "aura",
         "balancer",
         "beefy",
         "curve",

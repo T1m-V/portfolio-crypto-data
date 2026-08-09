@@ -3,6 +3,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from portfolio_core import atomic_write_text
 from web3 import Web3
 
 ERC20_ABI = [
@@ -35,7 +36,7 @@ class TokenManager:
     def __init__(self, token_path: Path, w3: Web3, flush_every: int = 25):
         self.path = token_path
         self.w3 = w3
-        self.lock = threading.Lock()  # Mutex for thread safety
+        self.lock = threading.Lock()
         self.flush_every = flush_every
         self.pending_writes = 0
         self.cache: dict[str, Any] = self._load_cache()
@@ -48,23 +49,16 @@ class TokenManager:
             Dictionary of cached token data.
         """
         if self.path.exists():
-            try:
-                with open(self.path, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                print(f"[!] Error reading token DB: {e}")
+            with open(self.path, "r", encoding="utf-8") as f:
+                return json.load(f)
         return {"native": {"symbol": "ETH", "decimals": 18, "resolved": True}}
 
     def _save_cache(self) -> None:
         """
         Saves the current cache to disk. Must be called inside a lock.
         """
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "w") as f:
-                json.dump(self.cache, f, indent=4)
-        except Exception as e:
-            print(f"[!] Error saving token DB: {e}")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(text=json.dumps(self.cache, indent=4), path=self.path)
 
     def _store_token(self, address: str, token_data: dict[str, Any]) -> dict[str, Any]:
         self.cache[address] = token_data
@@ -93,15 +87,12 @@ class TokenManager:
         """
         addr_lower = address.lower()
 
-        # 1. Fast Read (Lock-free optimization)
         if addr_lower in self.cache:
             return self.cache[addr_lower]
 
-        # 2. If we aren't allowed to fetch, return None immediately
         if not fetch_if_missing:
             return None
 
-        # 3. Fetch from Chain (Thread-Safe Section)
         with self.lock:
             if addr_lower in self.cache:
                 return self.cache[addr_lower]

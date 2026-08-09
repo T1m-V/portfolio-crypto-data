@@ -1,6 +1,6 @@
 import csv
 import json
-import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from io import StringIO
@@ -14,13 +14,22 @@ from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
     parse_daily_datetime,
 )
+from portfolio_crypto_data.pipeline_logging import PipelineLogger
 
 ACTIVE_PROTOCOL_QUANTITY_THRESHOLD = Decimal("0.00000001")
 
 
+@dataclass(frozen=True)
+class ProtocolTokenRun:
+    address: str
+    symbol: str
+    start_date: str
+    end_date: str
+
+
 def load_chain_config(chain: str) -> dict[str, str]:
     chain_config = active_context().paths.chain_config
-    if not os.path.exists(chain_config):
+    if not chain_config.exists():
         raise FileNotFoundError(f"Config '{chain_config}' not found.")
 
     with open(file=chain_config, mode="r") as f:
@@ -46,7 +55,7 @@ def load_chain_web3(chain: str) -> Web3:
 
 def load_tokens(chain: str) -> dict[str, dict[str, str]]:
     tokens_file_path = active_context().paths.tokens / f"{chain}_tokens.json"
-    if not os.path.exists(tokens_file_path):
+    if not tokens_file_path.exists():
         raise FileNotFoundError(f"Config '{tokens_file_path}' not found.")
 
     with open(file=tokens_file_path, mode="r") as f:
@@ -55,7 +64,7 @@ def load_tokens(chain: str) -> dict[str, dict[str, str]]:
 
 def load_snapshot_ranges(chain: str) -> dict[str, dict[str, object]]:
     snapshots_file_path = active_context().paths.crypto_snapshots / f"{chain}_raw_snapshots.csv"
-    if not os.path.exists(snapshots_file_path):
+    if not snapshots_file_path.exists():
         raise FileNotFoundError(f"Snapshots '{snapshots_file_path}' not found.")
 
     df = pd.read_csv(snapshots_file_path)
@@ -96,7 +105,7 @@ def resolve_date_window(
 def load_block_map(chain: str) -> dict[str, int]:
     map_file_path = active_context().paths.block_map / f"block_map_{chain}.csv"
     block_map = {}
-    if os.path.exists(path=map_file_path):
+    if map_file_path.exists():
         with open(file=map_file_path, mode="r") as f:
             reader = csv.DictReader(f=f)
             for row in reader:
@@ -173,13 +182,9 @@ def resolve_effective_start_date(
     protocol: str,
     chain: str,
     symbol: str,
-    explicit_start_date: str | None,
     fallback_start_date: str | None,
     protocol_root: Path | None = None,
 ) -> str | None:
-    if explicit_start_date:
-        return format_daily_datetime(explicit_start_date)
-
     normalized_fallback_start: str | None = None
     if fallback_start_date:
         normalized_fallback_start = format_daily_datetime(fallback_start_date)
@@ -212,14 +217,6 @@ def should_skip_date_window(start_date: str | None, end_date: str | None) -> boo
     return start > end
 
 
-def is_material_protocol_quantity(quantity: object) -> bool:
-    try:
-        value = Decimal(str(quantity))
-    except (InvalidOperation, TypeError, ValueError):
-        return False
-    return abs(value) > ACTIVE_PROTOCOL_QUANTITY_THRESHOLD
-
-
 def is_active_protocol_quantity(quantity: object) -> bool:
     try:
         value = Decimal(str(quantity))
@@ -237,6 +234,47 @@ def resolve_protocol_end_date(range_info: dict[str, object] | None) -> str:
     if is_active_protocol_quantity(range_info.get("qty")):
         return "now"
     return format_daily_datetime(range_info["end"])
+
+
+def protocol_token_runs(
+    *,
+    protocol: str,
+    chain: str,
+    logger: PipelineLogger,
+) -> list[ProtocolTokenRun]:
+    """Return configured tokens that still need protocol-history rows."""
+    ranges = load_snapshot_ranges(chain=chain)
+    runs: list[ProtocolTokenRun] = []
+    for address, metadata in load_tokens(chain=chain).items():
+        if metadata.get("protocol") != protocol:
+            continue
+
+        symbol = metadata.get("symbol", address)
+        snapshot_range = ranges.get(symbol)
+        if snapshot_range is None:
+            logger.protocol_skip(protocol, symbol, "no snapshot data found")
+            continue
+
+        start_date = resolve_effective_start_date(
+            protocol=protocol,
+            chain=chain,
+            symbol=symbol,
+            fallback_start_date=format_daily_datetime(snapshot_range["start"]),
+        )
+        end_date = resolve_protocol_end_date(snapshot_range)
+        if start_date is None or should_skip_date_window(start_date, end_date):
+            logger.protocol_skip(protocol, symbol, f"start={start_date} is after end={end_date}")
+            continue
+
+        runs.append(
+            ProtocolTokenRun(
+                address=address,
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        )
+    return runs
 
 
 def _normalize_history_row(row: dict[str, object]) -> tuple[str | None, dict[str, object]]:
@@ -262,7 +300,6 @@ def write_protocol_history_csv(
     symbol: str,
     history_data: list[dict[str, object]],
     fieldnames: list[str] | None = None,
-    replace_from_date: str | datetime | None = None,
     protocol_root: Path | None = None,
 ) -> Path | None:
     output_file = protocol_history_output_path(
@@ -271,42 +308,17 @@ def write_protocol_history_csv(
         symbol=symbol,
         protocol_root=protocol_root,
     )
-    os.makedirs(output_file.parent, exist_ok=True)
-    replacement_start = _parse_history_date(raw_value=replace_from_date)
-    if not history_data and replacement_start is None:
+    if not history_data:
         return None
+    output_file.parent.mkdir(parents=True, exist_ok=True)
 
-    existing_rows = _read_existing_history_rows(output_file=output_file)
-    existing_by_date: dict[str, dict[str, object]] = {}
-    for row in existing_rows:
+    merged_by_date: dict[str, dict[str, object]] = {}
+    for row in [*_read_existing_history_rows(output_file=output_file), *history_data]:
         date_key, normalized_row = _normalize_history_row(row=row)
-        if date_key is None:
-            continue
-        parsed_date = _parse_history_date(raw_value=date_key)
-        if (
-            replacement_start is not None
-            and parsed_date is not None
-            and parsed_date >= replacement_start
-        ):
-            continue
-        # Existing rows win when incoming data overlaps on the same date.
-        existing_by_date.setdefault(date_key, normalized_row)
-
-    incoming_by_date: dict[str, dict[str, object]] = {}
-    for row in history_data:
-        date_key, normalized_row = _normalize_history_row(row=row)
-        if date_key is None:
-            continue
-        incoming_by_date[date_key] = normalized_row
-
-    merged_by_date = dict(existing_by_date)
-    for date_key, row in incoming_by_date.items():
-        if date_key not in merged_by_date:
-            merged_by_date[date_key] = row
+        if date_key is not None:
+            merged_by_date[date_key] = normalized_row
 
     if not merged_by_date:
-        if replacement_start is not None and output_file.exists():
-            output_file.unlink()
         return None
 
     merged_rows = [merged_by_date[date_key] for date_key in sorted(merged_by_date)]
