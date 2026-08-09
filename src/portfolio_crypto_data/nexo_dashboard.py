@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from portfolio_core import active_context
@@ -65,12 +66,12 @@ def _load_usd_eur(end_dt: pd.Timestamp) -> pd.DataFrame:
     return frame[["Date", "Price"]]
 
 
-def _resolve_currency(coin: str) -> str:
+def _resolve_currency(*, coin: str, metadata: dict[str, dict[str, Any]]) -> str:
     if coin in EUR_STABLES:
         return "EUR"
     if coin in USD_STABLES:
         return "USD"
-    return str(active_context().currency_metadata().get(coin, {}).get("currency", "USD"))
+    return str(metadata.get(coin, {}).get("currency", "USD"))
 
 
 def _build_price_frame(
@@ -79,8 +80,9 @@ def _build_price_frame(
     coin_start: pd.Timestamp,
     end_dt: pd.Timestamp,
     usd_eur: pd.DataFrame,
+    metadata: dict[str, dict[str, Any]],
 ) -> pd.DataFrame:
-    currency = _resolve_currency(coin=coin)
+    currency = _resolve_currency(coin=coin, metadata=metadata)
     full_dates = pd.date_range(start=coin_start, end=end_dt, freq="D")
 
     price_path = active_context().paths.direct_price(coin)
@@ -218,6 +220,7 @@ def load_and_process_nexo_data(end_date_str: str, coins: list[str] | None = None
     if usd_eur.empty:
         raise ValueError("USD_EUR history is required for NEXO valuation.")
 
+    metadata = active_context().currency_metadata()
     price_frames: list[pd.DataFrame] = []
     for coin in sorted(snapshots["Coin"].unique().tolist()):
         coin_start = snapshots.loc[snapshots["Coin"] == coin, "Date"].min()
@@ -227,6 +230,7 @@ def load_and_process_nexo_data(end_date_str: str, coins: list[str] | None = None
                 coin_start=coin_start,
                 end_dt=end_dt,
                 usd_eur=usd_eur,
+                metadata=metadata,
             )
         )
 
@@ -237,12 +241,14 @@ def load_and_process_nexo_data(end_date_str: str, coins: list[str] | None = None
     merged["Price"] = pd.to_numeric(merged["Price"], errors="coerce").fillna(0)
 
     merged["Asset Name"] = merged["Coin"].map(
-        lambda coin: active_context().currency_metadata().get(coin, {}).get("name", coin)
+        lambda coin: metadata.get(coin, {}).get("name", coin)
     )
     merged["Asset Group"] = merged["Coin"].map(
-        lambda coin: active_context().currency_metadata().get(coin, {}).get("group", "Unknown")
+        lambda coin: metadata.get(coin, {}).get("group", "Unknown")
     )
-    merged["Currency"] = merged["Coin"].map(_resolve_currency)
+    merged["Currency"] = merged["Coin"].map(
+        lambda coin: _resolve_currency(coin=coin, metadata=metadata)
+    )
     merged["Market Value"] = merged["Quantity"] * merged["Price"]
     merged["Cumulative Fees"] = 0.0
     merged["Cumulative Taxes"] = 0.0
