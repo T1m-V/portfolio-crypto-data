@@ -1,12 +1,12 @@
 [project]
 name = "portfolio-crypto-data"
-version = "0.2.0"
+version = "0.3.0"
 description = "Crypto transaction extraction, protocol accounting, and dashboard artifacts"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "pandas>=2.3.3",
-    "portfolio-core @ git+https://github.com/T1m-V/portfolio-core.git@v0.2.0",
+    "portfolio-core @ git+https://github.com/T1m-V/portfolio-core.git@v0.3.0",
     "requests>=2.32.5",
     "tqdm>=4.67.1",
     "web3>=7.14.0",

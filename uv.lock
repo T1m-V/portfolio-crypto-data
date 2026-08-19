@@ -599,7 +599,7 @@ wheels = [
 
 [[package]]
 name = "portfolio-core"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "../portfolio-core" }
 dependencies = [
     { name = "pandas" },
@@ -622,7 +622,7 @@ dev = [
 
 [[package]]
 name = "portfolio-crypto-data"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "pandas" },

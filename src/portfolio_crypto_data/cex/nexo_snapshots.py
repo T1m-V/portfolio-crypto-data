@@ -1118,7 +1118,4 @@ def generate_nexo_raw_snapshots(input_csv: Path, output_csv: Path) -> None:
             ledger.update_snapshots(touched_coins=touched_coins, date_value=date)
 
     _save_history(history=ledger.history, output_path=output_csv)
-    stale_review = output_csv.with_name("nexo_liquidation_only_review.csv")
-    if stale_review.exists():
-        stale_review.unlink()
     print(f"Portfolio snapshots successfully saved to {output_csv}")

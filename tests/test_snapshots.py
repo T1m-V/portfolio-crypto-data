@@ -278,8 +278,6 @@ def test_nexo_generator_combines_exports_and_overwrites_same_day(
 
     output = tmp_path / "out" / "snapshots.csv"
     output.parent.mkdir()
-    stale_review = output.with_name("nexo_liquidation_only_review.csv")
-    stale_review.write_text("obsolete\n")
     generate_nexo_raw_snapshots(input_csv=tmp_path, output_csv=output)
     frame = pd.read_csv(output)
 
@@ -287,7 +285,6 @@ def test_nexo_generator_combines_exports_and_overwrites_same_day(
     assert len(nexo) == 1
     assert (nexo.iloc[0]["Quantity"], nexo.iloc[0]["Principal Invested"]) == (3.0, 1.5)
     assert frame["Date"].tolist() == sorted(frame["Date"].tolist())
-    assert not stale_review.exists()
 
 
 def test_nexo_generator_rejects_unknown_external_type(

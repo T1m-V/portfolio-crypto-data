@@ -737,9 +737,6 @@ def build_accounting_artifacts(
 
     _write_csv(paths.source_base_daily, source_base, SOURCE_BASE_DAILY_COLUMNS)
     _write_csv(paths.base_daily, base_daily, BASE_DAILY_COLUMNS)
-    stale_issues = paths.base_daily.parent / "issues.csv"
-    if stale_issues.exists():
-        stale_issues.unlink()
     if not paths.principal_events.exists():
         _write_csv(paths.principal_events, _empty(PRINCIPAL_EVENT_COLUMNS), PRINCIPAL_EVENT_COLUMNS)
     _write_csv(paths.principal_daily, principal_daily, PRINCIPAL_DAILY_COLUMNS)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from contextlib import nullcontext
 from datetime import date
 from pathlib import Path
 
@@ -80,9 +79,7 @@ def test_cli_preserves_dashboard_command_contract(
     expected: list[str],
 ) -> None:
     calls: list[str] = []
-    monkeypatch.setattr(cli, "validate_data_workspace", lambda _: None)
-    monkeypatch.setattr(cli, "mutation_session", lambda **_: nullcontext())
-    monkeypatch.setattr(cli, "version", lambda _: "test")
+    (tmp_path / "portfolio.toml").write_text("schema_version = 1\n", encoding="utf-8")
     monkeypatch.setattr(update, "update_onchain", lambda: calls.append("update"))
     monkeypatch.setattr(update, "rebuild_derived", lambda: calls.append("rebuild"))
     monkeypatch.setattr(cli, "_refresh_nexo", lambda **_: calls.append("nexo"))
@@ -91,6 +88,7 @@ def test_cli_preserves_dashboard_command_contract(
 
     assert result == 0
     assert calls == expected
+    assert not (tmp_path / "runtime" / "mutation.lock").exists()
 
 
 def test_rebuild_requires_transactions() -> None:

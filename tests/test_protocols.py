@@ -164,7 +164,7 @@ def test_aave_aliases_and_closed_positions_have_explicit_zeroes() -> None:
     }
 
 
-def test_balancer_uses_legacy_supply_and_ignores_phantom_bpt() -> None:
+def test_balancer_uses_total_supply_for_standard_pools_and_ignores_phantom_bpt() -> None:
     bpt = "0xbpt"
     vault = "0xvault"
     usdc = "0xusdc"

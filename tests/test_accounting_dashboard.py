@@ -63,8 +63,6 @@ def test_accounting_collapses_btc_wrappers_and_allocates_principal() -> None:
         ],
     )
     _price("BTC", 40_000)
-    stale_issues = active_context().paths.accounting / CHAIN / "issues.csv"
-    stale_issues.write_text("obsolete\n")
 
     result = accounting.build_accounting_artifacts(chain=CHAIN, as_of_date="2025-01-01")
     row = pd.read_csv(result.paths.base_daily).iloc[0]
@@ -75,7 +73,6 @@ def test_accounting_collapses_btc_wrappers_and_allocates_principal() -> None:
         120_000.0,
         120_000.0,
     ]
-    assert not stale_issues.exists()
 
 
 def test_accounting_fails_immediately_for_material_missing_price() -> None:

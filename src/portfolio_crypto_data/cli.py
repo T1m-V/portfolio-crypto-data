@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from importlib.metadata import version
 from pathlib import Path
 
 from portfolio_core import PortfolioContext, mutation_session, validate_data_workspace
@@ -35,11 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     context = PortfolioContext.from_root(args.data_dir)
     validate_data_workspace(context.paths.root)
     try:
-        with context.activate(), mutation_session(
-            paths=context.paths,
-            component=f"crypto-{args.command}",
-            version=version("portfolio-crypto-data"),
-        ):
+        with context.activate(), mutation_session(paths=context.paths):
             from portfolio_crypto_data.update import rebuild_derived, update_onchain
 
             if args.command == "update":

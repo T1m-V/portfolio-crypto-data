@@ -76,8 +76,8 @@ directories.
 Never expose RPC credentials, API keys, wallet-specific configuration, or private transaction
 content in logs, fixtures, commits, or review output.
 
-Both CLI commands acquire the core-owned workspace mutation lock and publish a run manifest.
-Persisted outputs must use atomic replacement so dashboard readers never observe partial files.
+Both CLI commands acquire the core-owned workspace mutation lock. Persisted outputs must use
+atomic replacement so dashboard readers never observe partial files.
 
 ## Release Coordination
 

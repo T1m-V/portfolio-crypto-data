@@ -572,8 +572,5 @@ def build_arbitrum_dashboard_artifacts(chain: str = CHAIN) -> ArbitrumDashboardA
         TRANSACTIONS_DASHBOARD_COLUMNS,
     )
     _write_artifact(paths.assets, assets, ASSETS_COLUMNS)
-    stale_data_quality_path = paths.asset_daily.parent / "data_quality.csv"
-    if stale_data_quality_path.exists():
-        stale_data_quality_path.unlink()
     print(f"[dashboard_artifacts] Saved Arbitrum artifacts to {paths.asset_daily.parent}")
     return paths
