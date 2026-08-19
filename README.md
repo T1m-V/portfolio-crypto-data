@@ -6,7 +6,7 @@ The dashboard and data workspace install the immutable `v0.3.0` package from Git
 checkout is not required. To install the CLI by itself:
 
 ```powershell
-uv tool install "portfolio-crypto-data @ git+https://github.com/T1m-V/portfolio-crypto-data.git@v0.3.0"
+uv tool install --no-sources "portfolio-crypto-data @ git+https://github.com/T1m-V/portfolio-crypto-data.git@v0.3.0"
 portfolio-crypto --help
 ```
 
