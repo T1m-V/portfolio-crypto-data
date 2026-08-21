@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -32,6 +33,28 @@ OUTPUT_COLUMNS = [
     "Fee",
     "Fee Token",
 ]
+
+
+@dataclass(frozen=True)
+class TransactionAnalysisFailure:
+    """Machine-readable details for a transaction that could not be analyzed."""
+
+    tx_hash: str
+    error_type: str
+    message: str
+
+
+@dataclass(frozen=True)
+class TransactionRetrievalReport:
+    """Summary returned after processing every transaction in a refresh."""
+
+    chain: str
+    transaction_count: int
+    failures: tuple[TransactionAnalysisFailure, ...]
+
+    @property
+    def successful_count(self) -> int:
+        return self.transaction_count - len(self.failures)
 
 
 def _fetch_explorer_data(
@@ -197,7 +220,7 @@ def build_internal_eth_map(txs_internal: list[dict], my_address: str) -> dict[st
     return internal_map
 
 
-async def retrieve_transactions(chain: str) -> None:
+async def retrieve_transactions(chain: str) -> TransactionRetrievalReport | None:
     """
     Main entry point to fetch and analyze transactions for a chain.
 
@@ -259,7 +282,7 @@ async def retrieve_transactions(chain: str) -> None:
     print(f"-> Found {len(all_hashes)} unique transactions.")
     if not all_hashes:
         print("No transactions found.")
-        return
+        return TransactionRetrievalReport(chain=chain, transaction_count=0, failures=())
 
     # 4. Processing Setup
     std_list = list(std_hashes)
@@ -267,56 +290,80 @@ async def retrieve_transactions(chain: str) -> None:
 
     token_manager = TokenManager(token_path=token_path, w3=w3)
     results = []
+    failures: list[TransactionAnalysisFailure] = []
 
     # RPC Rate Limit Protection
     semaphore = asyncio.Semaphore(5)
 
-    # Helper function to wrap the sync analysis in a thread with a semaphore
-    async def analyze_wrapper(tx_hash: str, fetch_meta: bool) -> dict[str, Any] | None:
+    # Wrap sync analysis so a failed transaction can be reported without stopping
+    # the rest of the batch.
+    async def analyze_wrapper(
+        tx_hash: str,
+        fetch_meta: bool,
+    ) -> tuple[str, dict[str, Any] | None, Exception | None]:
         async with semaphore:
-            # Run the synchronous function in a separate thread
-            return await asyncio.to_thread(
-                analyze_transaction,
+            try:
+                result = await asyncio.to_thread(
+                    analyze_transaction,
+                    tx_hash=tx_hash,
+                    w3=w3,
+                    my_address=my_address,
+                    token_manager=token_manager,
+                    internal_eth_map=internal_map,
+                    fetch_metadata=fetch_meta,
+                )
+                return tx_hash, result, None
+            except Exception as exc:
+                return tx_hash, None, exc
+
+    async def analyze_batch(
+        tx_hashes: list[str],
+        *,
+        fetch_meta: bool,
+        description: str,
+    ) -> tuple[list[dict[str, Any]], list[TransactionAnalysisFailure]]:
+        outcomes = await tqdm_asyncio.gather(
+            *(analyze_wrapper(tx_hash=tx_hash, fetch_meta=fetch_meta) for tx_hash in tx_hashes),
+            desc=description,
+            unit="tx",
+        )
+        batch_failures = [
+            TransactionAnalysisFailure(
                 tx_hash=tx_hash,
-                w3=w3,
-                my_address=my_address,
-                token_manager=token_manager,
-                internal_eth_map=internal_map,
-                fetch_metadata=fetch_meta,
+                error_type=type(error).__name__,
+                message=str(error),
             )
-
-    # 5. Phase A: Process Standard Transactions
-    # We process these first and ALLOW fetching metadata (updating token DB)
-    if std_list:
-        print(f"Processing {len(std_list)} Standard TXs (Async)...")
-        tasks_std = [
-            analyze_wrapper(
-                tx_hash=tx,
-                fetch_meta=True,
-            )
-            for tx in std_list
+            for tx_hash, _, error in outcomes
+            if error is not None
         ]
+        batch_results = [result for _, result, _ in outcomes if result is not None]
+        return batch_results, batch_failures
 
-        # tqdm_asyncio.gather displays a progress bar for async tasks
-        batch_results = await tqdm_asyncio.gather(*tasks_std, desc="Standard TXs", unit="tx")
-        results.extend([r for r in batch_results if r])
-
-    # 6. Phase B: Process Passive Transactions
-    if others_list:
-        print(f"Processing {len(others_list)} Passive TXs (Async)...")
-        tasks_others = [
-            analyze_wrapper(
-                tx_hash=tx,
-                fetch_meta=False,
-            )
-            for tx in others_list
-        ]
-
-        batch_results = await tqdm_asyncio.gather(*tasks_others, desc="Passive TXs", unit="tx")
-        results.extend([r for r in batch_results if r])
-
-    # 7. Export
     try:
+        # 5. Phase A: Process Standard Transactions
+        # We process these first and ALLOW fetching metadata (updating token DB)
+        if std_list:
+            print(f"Processing {len(std_list)} Standard TXs (Async)...")
+            batch_results, batch_failures = await analyze_batch(
+                std_list,
+                fetch_meta=True,
+                description="Standard TXs",
+            )
+            results.extend(batch_results)
+            failures.extend(batch_failures)
+
+        # 6. Phase B: Process Passive Transactions
+        if others_list:
+            print(f"Processing {len(others_list)} Passive TXs (Async)...")
+            batch_results, batch_failures = await analyze_batch(
+                others_list,
+                fetch_meta=False,
+                description="Passive TXs",
+            )
+            results.extend(batch_results)
+            failures.extend(batch_failures)
+
+        # 7. Export every successfully analyzed transaction.
         if results:
             new_results_df = _normalize_results_frame(pd.DataFrame(results))
 
@@ -337,5 +384,19 @@ async def retrieve_transactions(chain: str) -> None:
             print(f"Done. Saved {len(results_df)} rows to {output_path}")
         else:
             print("No results generated.")
+
+        if failures:
+            print(f"[!] Failed to analyze {len(failures)} transaction(s):")
+            for failure in failures:
+                print(
+                    f"[!] {failure.tx_hash}: "
+                    f"{failure.error_type}: {failure.message}"
+                )
     finally:
         token_manager.flush()
+
+    return TransactionRetrievalReport(
+        chain=chain,
+        transaction_count=len(all_hashes),
+        failures=tuple(failures),
+    )
