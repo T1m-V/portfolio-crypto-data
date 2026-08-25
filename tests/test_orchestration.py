@@ -70,7 +70,10 @@ def test_rebuild_is_local_and_uses_requested_date(monkeypatch: pytest.MonkeyPatc
 
 @pytest.mark.parametrize(
     ("command", "expected"),
-    [("update", ["update", "nexo"]), ("rebuild", ["rebuild"])],
+    [
+        ("update", ["update", "nexo", "crypto_com_app"]),
+        ("rebuild", ["rebuild"]),
+    ],
 )
 def test_cli_preserves_dashboard_command_contract(
     monkeypatch: pytest.MonkeyPatch,
@@ -83,6 +86,11 @@ def test_cli_preserves_dashboard_command_contract(
     monkeypatch.setattr(update, "update_onchain", lambda: calls.append("update"))
     monkeypatch.setattr(update, "rebuild_derived", lambda: calls.append("rebuild"))
     monkeypatch.setattr(cli, "_refresh_nexo", lambda **_: calls.append("nexo"))
+    monkeypatch.setattr(
+        cli,
+        "_refresh_crypto_com_app",
+        lambda **_: calls.append("crypto_com_app"),
+    )
 
     result = cli.main(["--data-dir", str(tmp_path), command])
 

@@ -2,21 +2,27 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from decimal import Decimal
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pandas as pd
-from portfolio_core import atomic_write_csv
 
-from portfolio_crypto_data.datetime_utils import (
-    format_daily_datetime,
-    parse_transaction_datetime_series,
+from portfolio_crypto_data.cex.actions import (
+    NormalizedAction,
+    RewardInstruction,
+    apply_normalized_action,
 )
+from portfolio_crypto_data.cex.export_loader import (
+    CexExportSpec,
+    load_cex_exports,
+    prepare_cex_dates,
+)
+from portfolio_crypto_data.cex.snapshot_io import save_cex_snapshot_history
+from portfolio_crypto_data.datetime_utils import parse_transaction_datetime_series
 from portfolio_crypto_data.raw_snapshots import PortfolioLedger, TransactionApplier, TxEntry
 from portfolio_crypto_data.symbols import sanitize_symbol
 
-MAX_INVALID_DATE_RATIO = 0.1
 INTEREST_TYPES = {"interest", "fixed term interest", "interest additional"}
 SKIPPED_TYPES = {
     "credit card withdrawal credit",
@@ -43,29 +49,38 @@ INPUT_REWARD_TYPES = {
 INPUT_OUTPUT_SWAP_TYPES = {
     "exchange",
 }
-SNAPSHOT_COLUMNS = ["Date", "Coin", "Quantity", "Principal Invested"]
 MANUAL_REPAYMENT_PAIR_WINDOW = pd.Timedelta(hours=6)
 MANUAL_REPAYMENT_USD_TOLERANCE = Decimal("0.05")
 MANUAL_REPAYMENT_USD_TOLERANCE_BY_TOKEN = {
     "USDC": Decimal("0.60"),
 }
 ActionHandler = Callable[[pd.Series], "NormalizedAction"]
-
-
-@dataclass
-class RewardInstruction:
-    entry: TxEntry
-    allocations: list[tuple[str | None, float]]
-
-
-@dataclass
-class NormalizedAction:
-    action: str
-    ins: list[TxEntry] = field(default_factory=list)
-    outs: list[TxEntry] = field(default_factory=list)
-    rewards: list[RewardInstruction] = field(default_factory=list)
-    principal_overrides: dict[str, float] | None = None
-    principal_additions: dict[str, float] | None = None
+NEXO_EXPORT_SPEC = CexExportSpec(
+    provider_name="NEXO",
+    required_columns=frozenset(
+        {
+            "Date / Time (UTC)",
+            "Type",
+            "Input Currency",
+            "Input Amount",
+            "Output Currency",
+            "Output Amount",
+        }
+    ),
+    optional_columns=("USD Equivalent", "Fee", "Fee Currency", "Details"),
+    fingerprint_columns=(
+        "Date / Time (UTC)",
+        "Type",
+        "Input Currency",
+        "Input Amount",
+        "Output Currency",
+        "Output Amount",
+        "USD Equivalent",
+        "Fee",
+        "Fee Currency",
+        "Details",
+    ),
+)
 
 
 @dataclass
@@ -785,23 +800,29 @@ class NexoTransactionNormalizer:
 
     @staticmethod
     def _parse_amount(value: object) -> Decimal:
-        text = str(value or "").strip()
+        text = "" if pd.isna(value) else str(value).strip()
         if not text:
             return Decimal(0)
         try:
             return Decimal(text)
-        except Exception:
-            return Decimal(0)
+        except InvalidOperation as exc:
+            raise ValueError("Invalid non-empty numeric value in NEXO amount field.") from exc
 
     @staticmethod
     def _parse_usd_equivalent(value: object) -> Decimal:
-        text = str(value or "").strip().replace("$", "").replace(",", "")
+        text = (
+            ""
+            if pd.isna(value)
+            else str(value).strip().replace("$", "").replace(",", "")
+        )
         if not text:
             return Decimal(0)
         try:
             return Decimal(text)
-        except Exception:
-            return Decimal(0)
+        except InvalidOperation as exc:
+            raise ValueError(
+                "Invalid non-empty numeric value in NEXO USD-equivalent field."
+            ) from exc
 
 
 def _extract_manual_sell_leg(
@@ -956,129 +977,18 @@ def _build_manual_repayment_actions(
     return pair_actions_by_row_idx
 
 
-def _save_history(history: list[dict], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not history:
-        atomic_write_csv(frame=pd.DataFrame(columns=SNAPSHOT_COLUMNS), path=output_path)
-        return
-
-    frame = pd.DataFrame(history)
-    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-    frame = frame.dropna(subset=["Date"])
-    frame["Date"] = frame["Date"].map(format_daily_datetime)
-    frame["Quantity"] = pd.to_numeric(frame["Quantity"], errors="coerce")
-    frame["Principal Invested"] = pd.to_numeric(frame["Principal Invested"], errors="coerce")
-    frame = frame.dropna(subset=["Quantity", "Principal Invested"])
-    frame = frame.sort_values(by=["Date", "Coin"], ascending=[True, True])
-    frame = frame[SNAPSHOT_COLUMNS]
-    atomic_write_csv(frame=frame, path=output_path)
-
-
 def _load_nexo_transaction_exports(input_csv: Path) -> pd.DataFrame:
-    transaction_folder = input_csv if input_csv.is_dir() else input_csv.parent
-    csv_paths = sorted(path for path in transaction_folder.glob("*.csv") if path.is_file())
-    if not csv_paths:
-        raise FileNotFoundError(f"No NEXO transaction CSV files found in {transaction_folder}")
-
-    frames: list[pd.DataFrame] = []
-    for csv_path in csv_paths:
-        frame = pd.read_csv(csv_path, dtype=str)
-        frame["__source_file"] = csv_path.name
-        frame["__source_row"] = range(len(frame))
-        frames.append(frame)
-
-    return pd.concat(frames, ignore_index=True, sort=False)
-
-
-def _apply_generic_action(
-    *,
-    ledger: PortfolioLedger,
-    applier: TransactionApplier,
-    action: NormalizedAction,
-    date: pd.Timestamp,
-    touched_coins: set[str],
-) -> None:
-    overrides = action.principal_overrides or {}
-    additions = action.principal_additions or {}
-
-    if action.action == "swap":
-        if overrides:
-            for entry in action.ins:
-                asset = ledger.fetch_asset(entry.token)
-                asset.quantity += entry.quantity
-                asset.adjust_principal(overrides.get(entry.token, 0.0))
-                touched_coins.add(asset.coin)
-            for entry in action.outs:
-                asset = ledger.fetch_asset(entry.token)
-                asset.quantity -= entry.quantity
-                asset.adjust_principal(overrides.get(entry.token, 0.0))
-                touched_coins.add(asset.coin)
-        else:
-            applier.apply_swap(
-                ins=action.ins,
-                outs=action.outs,
-                date_value=date,
-                touched_coins=touched_coins,
-            )
-        return
-
-    if action.action == "receive":
-        for entry in action.ins:
-            asset = ledger.fetch_asset(entry.token)
-            if entry.token in overrides:
-                asset.quantity += entry.quantity
-                asset.adjust_principal(overrides[entry.token])
-            else:
-                applier.receive(
-                    asset=asset,
-                    amount_received=entry.quantity,
-                    date_value=date,
-                )
-            touched_coins.add(asset.coin)
-        return
-
-    if action.action == "send":
-        for entry in action.outs:
-            asset = ledger.fetch_asset(entry.token)
-            if entry.token in overrides:
-                asset.quantity -= entry.quantity
-                asset.adjust_principal(overrides[entry.token])
-            else:
-                applier.send(
-                    asset=asset,
-                    amount_sent=entry.quantity,
-                    date_value=date,
-                )
-            touched_coins.add(asset.coin)
-
-    for token, principal_delta in additions.items():
-        if principal_delta == 0:
-            continue
-        asset = ledger.fetch_asset(token)
-        asset.adjust_principal(principal_delta)
-        touched_coins.add(asset.coin)
+    return load_cex_exports(input_csv=input_csv, spec=NEXO_EXPORT_SPEC)
 
 
 def generate_nexo_raw_snapshots(input_csv: Path, output_csv: Path) -> None:
     frame = _load_nexo_transaction_exports(input_csv=input_csv)
-    parsed_dates = parse_transaction_datetime_series(frame["Date / Time (UTC)"])
-    invalid_date_count = int(parsed_dates.isna().sum())
-    total_rows = len(frame)
-    if total_rows > 0 and (invalid_date_count / total_rows) > MAX_INVALID_DATE_RATIO:
-        raise ValueError(
-            f"Aborting snapshot generation: invalid dates={invalid_date_count}/{total_rows} "
-            f"({invalid_date_count / total_rows:.1%})."
-        )
-    if invalid_date_count:
-        print(f"[nexo_snapshots] Dropping {invalid_date_count} rows with invalid Date values.")
-
-    frame["Date"] = parsed_dates
-    frame = frame.dropna(subset=["Date"])
-    frame = frame.sort_values(
-        by=["Date", "__source_file", "__source_row"],
-        ascending=[True, True, True],
-    ).reset_index(drop=True)
+    frame = prepare_cex_dates(
+        frame=frame,
+        parsed_dates=parse_transaction_datetime_series(frame["Date / Time (UTC)"]),
+        provider_name="nexo_snapshots",
+        source_column="Date / Time (UTC)",
+    )
 
     normalizer = NexoTransactionNormalizer.from_dataframe(frame=frame)
     pair_actions_by_row_idx = _build_manual_repayment_actions(
@@ -1092,30 +1002,15 @@ def generate_nexo_raw_snapshots(input_csv: Path, output_csv: Path) -> None:
     for idx, row in frame.iterrows():
         date = row["Date"]
         action = pair_actions_by_row_idx.get(idx) or normalizer.normalize_row(row=row)
-        if action.action == "skip":
-            continue
-
-        touched_coins: set[str] = set()
-        if action.action == "reward":
-            for reward in action.rewards:
-                applier.apply_reward_with_allocations(
-                    reward_token=reward.entry.token,
-                    reward_quantity=reward.entry.quantity,
-                    date_value=date,
-                    allocations=reward.allocations,
-                    touched_coins=touched_coins,
-                )
-        else:
-            _apply_generic_action(
-                ledger=ledger,
-                applier=applier,
-                action=action,
-                date=date,
-                touched_coins=touched_coins,
-            )
+        touched_coins = apply_normalized_action(
+            ledger=ledger,
+            applier=applier,
+            action=action,
+            date=date,
+        )
 
         if touched_coins:
             ledger.update_snapshots(touched_coins=touched_coins, date_value=date)
 
-    _save_history(history=ledger.history, output_path=output_csv)
+    save_cex_snapshot_history(history=ledger.history, output_csv=output_csv)
     print(f"Portfolio snapshots successfully saved to {output_csv}")
