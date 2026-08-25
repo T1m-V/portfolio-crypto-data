@@ -19,6 +19,8 @@ from portfolio_crypto_data.extraction.evm_reader import (
     _derive_start_date,
     _fetch_explorer_data,
     _normalize_results_frame,
+    build_internal_native_map,
+    get_all_transaction_hashes,
 )
 
 
@@ -63,6 +65,34 @@ def test_explorer_no_transactions_is_not_an_error(monkeypatch: pytest.MonkeyPatc
 
     assert _fetch_explorer_data("https://example.test", {"action": "txlist"}) == []
     assert get.call_count == 1
+
+
+def test_explorer_chain_id_parameter_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fetch(_url: str, params: dict[str, object]) -> list[object]:
+        requests.append(params)
+        return []
+
+    monkeypatch.setattr(
+        "portfolio_crypto_data.extraction.evm_reader._fetch_explorer_data",
+        fetch,
+    )
+
+    get_all_transaction_hashes(
+        api_url="https://example.test",
+        api_key="",
+        chain_id="25",
+        address="0xwallet",
+        start_ts=0,
+        end_ts=1,
+        include_chain_id=False,
+    )
+
+    assert len(requests) == 3
+    assert all("chainid" not in params for params in requests)
 
 
 class TokenManager:
@@ -127,13 +157,32 @@ def test_analyzer_emits_canonical_utc_transaction(monkeypatch: pytest.MonkeyPatc
         w3=None,
         my_address=wallet,
         token_manager=TokenManager(),
-        internal_eth_map={},
+        internal_native_map={},
         fetch_metadata=False,
+        native_symbol="CRO",
+        native_decimals=18,
     )
 
     assert result is not None
     assert (result["Date"], result["Type"], result["Fee Token"]) == (
         "01/01/1970 00:00:00",
         "Send",
-        "ETH",
+        "CRO",
     )
+
+
+def test_internal_native_transfers_use_configured_decimals() -> None:
+    wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    result = build_internal_native_map(
+        txs_internal=[
+            {
+                "hash": "0xhash",
+                "to": wallet,
+                "value": "123000000",
+            }
+        ],
+        my_address=wallet,
+        native_decimals=8,
+    )
+
+    assert result == {"0xhash": Decimal("1.23")}

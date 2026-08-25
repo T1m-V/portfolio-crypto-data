@@ -332,7 +332,7 @@ def get_aave_daily_exposure(
 
     cfg = load_chain_config(chain=chain)
     w3 = load_chain_web3(chain=chain)
-    wallet = w3.to_checksum_address(cfg["my_address"])
+    wallet = w3.to_checksum_address(cfg.wallet_address)
     tokens = load_tokens(chain=chain)
     block_map = load_block_map(chain=chain)
     symbol_family = build_symbol_family_map(token_metadata=tokens)

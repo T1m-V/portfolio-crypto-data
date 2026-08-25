@@ -17,6 +17,10 @@ from portfolio_crypto_data.composition.core import (
 )
 from portfolio_crypto_data.datetime_utils import format_daily_datetime, parse_daily_datetime
 from portfolio_crypto_data.principal_ledger import PRINCIPAL_DAILY_COLUMNS, PRINCIPAL_EVENT_COLUMNS
+from portfolio_crypto_data.shared.aave_symbols import (
+    aave_base_symbol,
+    is_aave_debt_symbol,
+)
 from portfolio_crypto_data.shared.prices import clear_price_cache
 from portfolio_crypto_data.shared.token_metadata import load_token_metadata
 from portfolio_crypto_data.shared.valuation_routes import ValuationRoute
@@ -25,9 +29,6 @@ from portfolio_crypto_data.symbols import canonicalize_symbol, price_proxy_symbo
 MATERIAL_QUANTITY_THRESHOLD = Decimal("0.0000000001")
 MATERIAL_VALUE_THRESHOLD_EUR = Decimal("1.0")
 VALUE_DUST_EUR = Decimal("0.01")
-AAVE_EXPOSURE_PREFIXES = ("variableDebtArb", "stableDebtArb", "aArb")
-AAVE_DEBT_PREFIXES = ("variableDebtArb", "stableDebtArb")
-AAVE_SYMBOL_ALIASES: dict[str, str] = {"USD0": "USDT", "USDT0": "USDT", "USDT": "USDT"}
 
 SOURCE_BASE_DAILY_COLUMNS = [
     "Date",
@@ -250,33 +251,11 @@ def _metadata_by_symbol(token_metadata: dict[str, dict[str, Any]]) -> dict[str, 
 
 
 def _normalize_aave_symbol(symbol: str) -> str:
-    normalized = sanitize_symbol(symbol)
-    if not normalized:
-        return ""
-    return AAVE_SYMBOL_ALIASES.get(normalized.upper(), normalized)
+    return sanitize_symbol(symbol)
 
 
-def _is_aave_debt_symbol(symbol: str) -> bool:
-    normalized = sanitize_symbol(symbol).lower()
-    return any(normalized.startswith(prefix.lower()) for prefix in AAVE_DEBT_PREFIXES)
-
-
-def _aave_multiplier(symbol: str) -> Decimal:
-    return Decimal("-1") if _is_aave_debt_symbol(symbol) else Decimal("1")
-
-
-def _aave_base_symbol(symbol: str, meta: dict[str, Any] | None) -> str:
-    explicit = ""
-    if meta:
-        explicit = sanitize_symbol(meta.get("price_source")) or sanitize_symbol(meta.get("family"))
-    if not explicit:
-        upper_symbol = sanitize_symbol(symbol).upper()
-        for prefix in AAVE_EXPOSURE_PREFIXES:
-            if upper_symbol.startswith(prefix.upper()):
-                explicit = sanitize_symbol(symbol[len(prefix) :])
-                break
-    normalized = _normalize_aave_symbol(explicit or symbol)
-    return price_proxy_symbol(normalized) or normalized
+def _aave_multiplier(symbol: str, meta: dict[str, Any] | None) -> Decimal:
+    return Decimal("-1") if is_aave_debt_symbol(symbol, meta) else Decimal("1")
 
 
 def _is_material(
@@ -396,8 +375,12 @@ def _build_aave_overlay_rows(
         source = sanitize_symbol(row["Coin"])
         if not source:
             continue
-        base_coin = _aave_base_symbol(symbol=source, meta=metadata.get(source))
-        signed_principal = Decimal(str(row["Principal Invested"])) * _aave_multiplier(source)
+        meta = metadata.get(source)
+        base_coin = aave_base_symbol(symbol=source, meta=meta)
+        signed_principal = Decimal(str(row["Principal Invested"])) * _aave_multiplier(
+            source,
+            meta,
+        )
         quantity = Decimal(str(row["Quantity"]))
         if abs(quantity) > DUST:
             principal_by_base[base_coin] = (

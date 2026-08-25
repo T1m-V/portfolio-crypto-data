@@ -8,12 +8,14 @@ from portfolio_crypto_data.protocols.common import (
     load_block_map,
     load_chain_web3,
     load_snapshot_ranges,
+    load_tokens,
     resolve_date_window,
     resolve_effective_start_date,
     resolve_protocol_end_date,
     should_skip_date_window,
     write_protocol_history_csv,
 )
+from portfolio_crypto_data.symbols import sanitize_symbol
 
 RATE_PROVIDER_ABI = [
     {
@@ -35,13 +37,37 @@ class LiquidStakingTokenConfig:
     rate_scale: int = 10**18
 
 
-LIQUID_STAKING_TOKENS = (
-    LiquidStakingTokenConfig(
-        symbol="wstETH",
-        underlying_symbol="ETH",
-        rate_provider_address="0xf7c5c26B574063e7b098ed74fAd6779e65E3F836",
-    ),
-)
+def _load_liquid_staking_configs(chain: str) -> tuple[LiquidStakingTokenConfig, ...]:
+    configs: list[LiquidStakingTokenConfig] = []
+    for meta in load_tokens(chain=chain).values():
+        if sanitize_symbol(meta.get("protocol")).lower() != "liquid_staking":
+            continue
+
+        symbol = sanitize_symbol(meta.get("symbol"))
+        underlying = sanitize_symbol(meta.get("underlying_symbol")) or sanitize_symbol(
+            meta.get("price_source") or meta.get("family")
+        )
+        rate_provider = str(meta.get("rate_provider_address") or "").strip()
+        if not symbol or not underlying or not rate_provider:
+            raise ValueError(
+                f"Chain '{chain}' has incomplete liquid-staking token metadata."
+            )
+        try:
+            rate_scale = int(meta.get("rate_scale", 10**18))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Chain '{chain}' has an invalid liquid-staking rate scale."
+            ) from exc
+        configs.append(
+            LiquidStakingTokenConfig(
+                symbol=symbol,
+                underlying_symbol=underlying,
+                rate_provider_address=rate_provider,
+                rate_provider_method=str(meta.get("rate_provider_method") or "getRate"),
+                rate_scale=rate_scale,
+            )
+        )
+    return tuple(sorted(configs, key=lambda config: config.symbol))
 
 
 def get_liquid_staking_history(
@@ -123,7 +149,7 @@ def process_all_liquid_staking_tokens(
 ) -> None:
     logger = logger or PipelineLogger()
     token_ranges = load_snapshot_ranges(chain=chain)
-    for config in LIQUID_STAKING_TOKENS:
+    for config in _load_liquid_staking_configs(chain=chain):
         rng = token_ranges.get(config.symbol)
         if rng is None:
             logger.protocol_skip("liquid_staking", config.symbol, "no snapshot data found")

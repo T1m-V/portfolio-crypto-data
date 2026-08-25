@@ -33,9 +33,22 @@ class TokenManager:
         w3: Web3 instance.
     """
 
-    def __init__(self, token_path: Path, w3: Web3, flush_every: int = 25):
+    def __init__(
+        self,
+        token_path: Path,
+        w3: Web3,
+        *,
+        native_symbol: str,
+        native_decimals: int,
+        flush_every: int = 25,
+    ):
         self.path = token_path
         self.w3 = w3
+        self.native_token = {
+            "symbol": native_symbol,
+            "decimals": native_decimals,
+            "resolved": True,
+        }
         self.lock = threading.Lock()
         self.flush_every = flush_every
         self.pending_writes = 0
@@ -50,8 +63,10 @@ class TokenManager:
         """
         if self.path.exists():
             with open(self.path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return {"native": {"symbol": "ETH", "decimals": 18, "resolved": True}}
+                cache = json.load(f)
+                cache["native"] = self.native_token
+                return cache
+        return {"native": self.native_token}
 
     def _save_cache(self) -> None:
         """

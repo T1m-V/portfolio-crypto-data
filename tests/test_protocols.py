@@ -8,7 +8,7 @@ import pytest
 from portfolio_core import active_context
 
 from portfolio_crypto_data.composition.lp_pricing import generate_protocol_lp_price_files
-from portfolio_crypto_data.protocols import aave, balancer, beefy, common, curve
+from portfolio_crypto_data.protocols import aave, balancer, beefy, common, curve, liquid_staking
 
 
 class _Call:
@@ -261,3 +261,35 @@ def test_protocol_ratio_generates_derived_price() -> None:
     assert pd.read_csv(outputs[0]).to_dict("records") == [
         {"Date": "2025-01-01", "Price": 1_100.0}
     ]
+
+
+def test_liquid_staking_tokens_are_configured_by_chain_metadata() -> None:
+    paths = active_context().paths
+    (paths.tokens / "cronos_tokens.json").write_text(
+        json.dumps(
+            {
+                "0xignored": {"symbol": "IGNORED", "protocol": "beefy"},
+                "0xlst": {
+                    "symbol": "stCRO",
+                    "protocol": "liquid_staking",
+                    "underlying_symbol": "CRO",
+                    "rate_provider_address": "0xrate",
+                    "rate_provider_method": "exchangeRate",
+                    "rate_scale": 10**8,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    configs = liquid_staking._load_liquid_staking_configs(chain="cronos")
+
+    assert configs == (
+        liquid_staking.LiquidStakingTokenConfig(
+            symbol="stCRO",
+            underlying_symbol="CRO",
+            rate_provider_address="0xrate",
+            rate_provider_method="exchangeRate",
+            rate_scale=10**8,
+        ),
+    )
