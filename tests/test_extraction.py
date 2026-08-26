@@ -72,7 +72,8 @@ def test_explorer_chain_id_parameter_is_configurable(
 ) -> None:
     requests: list[dict[str, object]] = []
 
-    def fetch(_url: str, params: dict[str, object]) -> list[object]:
+    def fetch(*, api_url: str, params: dict[str, object]) -> list[object]:
+        del api_url
         requests.append(params)
         return []
 
