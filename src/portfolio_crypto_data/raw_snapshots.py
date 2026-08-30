@@ -664,7 +664,10 @@ class TransactionApplier:
             )
 
         elif tx_type_lower.startswith("approve"):
-            return
+            # Approval transactions have no portfolio asset movement, but they still
+            # consume the native token as gas. Continue into fee handling so the
+            # wallet balance and daily snapshot include that cost.
+            pass
 
         elif tx_type_lower == "interaction":
             pass

@@ -402,58 +402,54 @@ def analyze_transaction(
         native_decimals: Decimal precision of the chain's native asset.
 
     returns:
-        Dictionary of transaction details or None on error.
+        Dictionary of transaction details, or None when the transaction has no
+        relevant movements. Analysis errors propagate to the ingestion batch.
     """
-    try:
-        data = _fetch_transaction_data(w3=w3, tx_hash=tx_hash)
-        tx, receipt, block = data.tx, data.receipt, data.block
+    data = _fetch_transaction_data(w3=w3, tx_hash=tx_hash)
+    tx, receipt, block = data.tx, data.receipt, data.block
 
-        date_str = datetime.fromtimestamp(block["timestamp"], tz=timezone.utc).strftime(
-            "%d/%m/%Y %H:%M:%S"
-        )
-        fee_val, fee_token = _calculate_fee(
-            tx=tx,
-            receipt=receipt,
-            my_address=my_address,
-            native_symbol=native_symbol,
-            native_decimals=native_decimals,
-        )
+    date_str = datetime.fromtimestamp(block["timestamp"], tz=timezone.utc).strftime(
+        "%d/%m/%Y %H:%M:%S"
+    )
+    fee_val, fee_token = _calculate_fee(
+        tx=tx,
+        receipt=receipt,
+        my_address=my_address,
+        native_symbol=native_symbol,
+        native_decimals=native_decimals,
+    )
 
-        raw_ins, raw_outs = _process_native_transfer(
-            tx=tx,
-            my_address=my_address,
-            native_symbol=native_symbol,
-            native_decimals=native_decimals,
-        )
-        raw_ins.extend(
-            _process_internal_native_transfer(
-                tx_hash=tx_hash,
-                internal_native_map=internal_native_map,
-                native_symbol=native_symbol,
-            )
-        )
-
-        log_ins, log_outs, approvals = _get_token_movements(
-            receipt=receipt,
-            my_address=my_address,
-            token_manager=token_manager,
-            fetch_metadata=fetch_metadata,
-        )
-        raw_ins.extend(log_ins)
-        raw_outs.extend(log_outs)
-
-        final_ins, final_outs = _net_token_movements(raw_ins=raw_ins, raw_outs=raw_outs)
-
-        return _classify_and_format_transaction(
+    raw_ins, raw_outs = _process_native_transfer(
+        tx=tx,
+        my_address=my_address,
+        native_symbol=native_symbol,
+        native_decimals=native_decimals,
+    )
+    raw_ins.extend(
+        _process_internal_native_transfer(
             tx_hash=tx_hash,
-            date_str=date_str,
-            final_ins=final_ins,
-            final_outs=final_outs,
-            fee_val=fee_val,
-            fee_token=fee_token,
-            approvals=approvals,
+            internal_native_map=internal_native_map,
+            native_symbol=native_symbol,
         )
+    )
 
-    except Exception as e:
-        print(f"[!] Error processing {tx_hash}: {e}")
-        return None
+    log_ins, log_outs, approvals = _get_token_movements(
+        receipt=receipt,
+        my_address=my_address,
+        token_manager=token_manager,
+        fetch_metadata=fetch_metadata,
+    )
+    raw_ins.extend(log_ins)
+    raw_outs.extend(log_outs)
+
+    final_ins, final_outs = _net_token_movements(raw_ins=raw_ins, raw_outs=raw_outs)
+
+    return _classify_and_format_transaction(
+        tx_hash=tx_hash,
+        date_str=date_str,
+        final_ins=final_ins,
+        final_outs=final_outs,
+        fee_val=fee_val,
+        fee_token=fee_token,
+        approvals=approvals,
+    )

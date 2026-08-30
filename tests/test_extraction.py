@@ -1,27 +1,48 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from unittest.mock import Mock
 
 import pandas as pd
 import pytest
+import requests
+from portfolio_core import active_context
 from web3 import Web3
 
+from portfolio_crypto_data.chain_config import EvmChainConfig
 from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
     parse_daily_datetime,
     parse_transaction_datetime,
     parse_transaction_datetime_series,
 )
-from portfolio_crypto_data.extraction import transaction_analyzer
+from portfolio_crypto_data.extraction import evm_reader, transaction_analyzer
 from portfolio_crypto_data.extraction.evm_reader import (
     OUTPUT_COLUMNS,
+    ExplorerAPIError,
     _derive_start_date,
     _fetch_explorer_data,
     _normalize_results_frame,
     build_internal_native_map,
     get_all_transaction_hashes,
+    retrieve_transactions,
 )
+
+
+def _chain_config() -> EvmChainConfig:
+    return EvmChainConfig(
+        chain="arbitrum",
+        chain_id="42161",
+        wallet_address="0xabc",
+        rpc_url="https://rpc.example.test",
+        explorer_api_url="https://example.test",
+        explorer_api_key="test",
+        native_symbol="ETH",
+        native_decimals=18,
+        protocols=(),
+        explorer_include_chain_id=True,
+    )
 
 
 @pytest.mark.parametrize("value", ["05/01/2026 11:30", "05/01/2026 11:30:12"])
@@ -94,6 +115,139 @@ def test_explorer_chain_id_parameter_is_configurable(
 
     assert len(requests) == 3
     assert all("chainid" not in params for params in requests)
+
+
+def test_explorer_request_failure_aborts_ingestion(monkeypatch: pytest.MonkeyPatch) -> None:
+    get = Mock(side_effect=requests.ConnectionError("temporarily unavailable"))
+    monkeypatch.setattr(evm_reader.requests, "get", get)
+
+    with pytest.raises(ExplorerAPIError, match="action=txlist"):
+        _fetch_explorer_data(
+            "https://example.test",
+            {"action": "txlist"},
+            max_retries=0,
+        )
+
+
+def test_unexpected_explorer_response_aborts_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {
+        "status": "0",
+        "message": "NOTOK",
+        "result": "Rate limit reached",
+    }
+    monkeypatch.setattr(evm_reader.requests, "get", Mock(return_value=response))
+
+    with pytest.raises(ExplorerAPIError, match="Unexpected explorer response"):
+        _fetch_explorer_data(
+            "https://example.test",
+            {"action": "tokentx"},
+            max_retries=0,
+        )
+
+
+def test_non_object_explorer_response_aborts_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = []
+    monkeypatch.setattr(evm_reader.requests, "get", Mock(return_value=response))
+
+    with pytest.raises(ExplorerAPIError, match="expected an object, got list"):
+        _fetch_explorer_data(
+            "https://example.test",
+            {"action": "tokentx"},
+            max_retries=0,
+        )
+
+
+def test_rpc_connection_failure_aborts_ingestion(monkeypatch: pytest.MonkeyPatch) -> None:
+    class DisconnectedWeb3:
+        HTTPProvider = staticmethod(lambda endpoint_uri: endpoint_uri)
+
+        def __init__(self, provider: object) -> None:
+            self.provider = provider
+
+        def is_connected(self) -> bool:
+            return False
+
+    monkeypatch.setattr(evm_reader, "Web3", DisconnectedWeb3)
+
+    with pytest.raises(ConnectionError, match="RPC connection failed"):
+        asyncio.run(retrieve_transactions(config=_chain_config()))
+
+
+def test_transaction_analysis_error_is_reported_without_stopping_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    output_path = active_context().paths.crypto_transactions / "arbitrum_transactions.csv"
+    output_path.write_text(
+        "TX Hash,Date,Qty in,Token in,Qty out,Token out,Type,Fee,Fee Token\n"
+        "existing,01/01/2026 00:00:00,,,,,Interaction,0,\n",
+        encoding="utf-8",
+    )
+
+    class ConnectedWeb3:
+        HTTPProvider = staticmethod(lambda endpoint_uri: endpoint_uri)
+
+        def __init__(self, provider: object) -> None:
+            self.provider = provider
+
+        def is_connected(self) -> bool:
+            return True
+
+    class TrackingTokenManager:
+        instance: "TrackingTokenManager | None" = None
+
+        def __init__(self, **_: object) -> None:
+            self.flushed = False
+            TrackingTokenManager.instance = self
+
+        def flush(self) -> None:
+            self.flushed = True
+
+    monkeypatch.setattr(evm_reader, "Web3", ConnectedWeb3)
+    monkeypatch.setattr(evm_reader, "TokenManager", TrackingTokenManager)
+    monkeypatch.setattr(
+        evm_reader,
+        "get_all_transaction_hashes",
+        lambda **_: ({"successful", "failed"}, {"successful", "failed"}, []),
+    )
+
+    def analyze(*, tx_hash: str, **_: object) -> dict[str, object]:
+        if tx_hash == "failed":
+            raise RuntimeError("malformed receipt")
+        return {
+            "TX Hash": tx_hash,
+            "Date": "02/01/2026 00:00:00",
+            "Type": "Interaction",
+            "Fee": "0",
+        }
+
+    monkeypatch.setattr(evm_reader, "analyze_transaction", analyze)
+
+    report = asyncio.run(retrieve_transactions(config=_chain_config()))
+
+    assert report.chain == "arbitrum"
+    assert report.transaction_count == 2
+    assert report.successful_count == 1
+    assert len(report.failures) == 1
+    assert report.failures[0].tx_hash == "failed"
+    assert report.failures[0].error_type == "RuntimeError"
+    assert report.failures[0].message == "malformed receipt"
+
+    saved = pd.read_csv(output_path, dtype=str).fillna("")
+    assert saved["TX Hash"].tolist() == ["existing", "successful"]
+    output = capsys.readouterr().out
+    assert "[!] Failed to analyze 1 transaction(s):" in output
+    assert "[!] failed: RuntimeError: malformed receipt" in output
+    assert TrackingTokenManager.instance is not None
+    assert TrackingTokenManager.instance.flushed is True
 
 
 class TokenManager:
@@ -187,3 +341,25 @@ def test_internal_native_transfers_use_configured_decimals() -> None:
     )
 
     assert result == {"0xhash": Decimal("1.23")}
+
+
+def test_analyzer_propagates_transaction_fetch_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        transaction_analyzer,
+        "_fetch_transaction_data",
+        Mock(side_effect=RuntimeError("malformed receipt")),
+    )
+
+    with pytest.raises(RuntimeError, match="malformed receipt"):
+        transaction_analyzer.analyze_transaction(
+            tx_hash="failed",
+            w3=None,
+            my_address="0xabc",
+            token_manager=TokenManager(),
+            internal_native_map={},
+            fetch_metadata=False,
+            native_symbol="ETH",
+            native_decimals=18,
+        )
