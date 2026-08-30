@@ -34,6 +34,10 @@ OUTPUT_COLUMNS = [
 ]
 
 
+class ExplorerAPIError(RuntimeError):
+    """Raised when an explorer request cannot be completed reliably."""
+
+
 def _fetch_explorer_data(
     api_url: str,
     params: dict[str, Any],
@@ -59,8 +63,20 @@ def _fetch_explorer_data(
             data = response.json()
         except (requests.RequestException, ValueError) as e:
             if attempt == max_retries:
-                print(f"[!] API Request Error for action={params.get('action')}: {e}")
-                return []
+                action = params.get("action")
+                raise ExplorerAPIError(
+                    f"Explorer request failed for action={action}: {e}"
+                ) from e
+            time.sleep(0.4 * (2**attempt))
+            continue
+
+        if not isinstance(data, dict):
+            if attempt == max_retries:
+                action = params.get("action")
+                raise ExplorerAPIError(
+                    "Unexpected explorer response "
+                    f"for action={action}: expected an object, got {type(data).__name__}."
+                )
             time.sleep(0.4 * (2**attempt))
             continue
 
@@ -69,17 +85,18 @@ def _fetch_explorer_data(
         result = data.get(result_key, [])
         result_str = str(result).lower()
 
-        if status == "1":
-            if isinstance(result, list):
-                return result
-            return []
+        if status == "1" and isinstance(result, list):
+            return result
 
         if status == "0" and "no transactions found" in (message + result_str):
             return []
 
         if attempt == max_retries:
-            print(f"[!] Unexpected explorer payload for action={params.get('action')}: {data}")
-            return []
+            action = params.get("action")
+            raise ExplorerAPIError(
+                "Unexpected explorer response "
+                f"for action={action}: status={status!r}, message={data.get('message')!r}"
+            )
         time.sleep(0.4 * (2**attempt))
 
     return []
@@ -233,8 +250,7 @@ async def retrieve_transactions(chain: str) -> None:
 
     w3 = Web3(Web3.HTTPProvider(cfg["rpc_url"]))
     if not w3.is_connected():
-        print("No RPC connection.")
-        return
+        raise ConnectionError(f"RPC connection failed for chain '{chain}'.")
 
     end_date = datetime.now(tz=timezone.utc).strftime(TRANSACTION_DATETIME_FORMAT)
     start_date = _derive_start_date(output_path=output_path, overlap_days=1)
