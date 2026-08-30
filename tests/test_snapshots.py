@@ -73,6 +73,24 @@ def test_onchain_applier_handles_only_emitted_transaction_kinds(
         applier.process_transaction(_chain_row("Buy"))
 
 
+def test_approval_fee_reduces_native_token_balance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(raw_snapshots, "get_crypto_price", lambda **_: 10.0)
+    ledger = PortfolioLedger(chain="arbitrum", token_metadata={})
+    applier = TransactionApplier(ledger=ledger)
+
+    applier.process_transaction(
+        _chain_row("Receive", **{"Qty in": "2", "Token in": "ETH"})
+    )
+    applier.process_transaction(
+        _chain_row("Approve ARB", **{"Fee": "0.01", "Fee Token": "ETH"})
+    )
+
+    assert ledger.assets["ETH"].quantity == Decimal("1.99")
+    assert ledger.history[-1]["Quantity"] == Decimal("1.99")
+
+
 def test_transaction_parser_rejects_mismatched_external_fields() -> None:
     parser = TransactionParser()
     assert [(entry.token, entry.quantity) for entry in parser.parse_entries(
