@@ -152,6 +152,96 @@ def test_rpc_connection_failure_aborts_ingestion(monkeypatch: pytest.MonkeyPatch
         asyncio.run(retrieve_transactions(chain="arbitrum"))
 
 
+def test_transaction_analysis_error_is_reported_without_stopping_output(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paths = active_context().paths
+    paths.chain_config.parent.mkdir(parents=True, exist_ok=True)
+    paths.chain_config.write_text(
+        json.dumps(
+            {
+                "arbitrum": {
+                    "my_address": "0xabc",
+                    "api_url": "https://example.test",
+                    "api_key": "test",
+                    "chain_id": "42161",
+                    "rpc_url": "https://rpc.example.test",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = paths.crypto_transactions / "arbitrum_transactions.csv"
+    original_output = (
+        "TX Hash,Date,Qty in,Token in,Qty out,Token out,Type,Fee,Fee Token\n"
+        "existing,01/01/2026 00:00:00,,,,,Interaction,0,\n"
+    )
+    output_path.write_text(original_output, encoding="utf-8")
+
+    class ConnectedWeb3:
+        HTTPProvider = staticmethod(lambda endpoint_uri: endpoint_uri)
+
+        def __init__(self, provider: object) -> None:
+            self.provider = provider
+
+        def is_connected(self) -> bool:
+            return True
+
+    class TrackingTokenManager:
+        instance: "TrackingTokenManager | None" = None
+
+        def __init__(self, **_: object) -> None:
+            self.flushed = False
+            TrackingTokenManager.instance = self
+
+        def flush(self) -> None:
+            self.flushed = True
+
+    monkeypatch.setattr(evm_reader, "Web3", ConnectedWeb3)
+    monkeypatch.setattr(evm_reader, "TokenManager", TrackingTokenManager)
+    monkeypatch.setattr(
+        evm_reader,
+        "get_all_transaction_hashes",
+        lambda **_: ({"successful", "failed"}, {"successful", "failed"}, []),
+    )
+
+    def analyze(*, tx_hash: str, **_: object) -> dict[str, object]:
+        if tx_hash == "failed":
+            raise RuntimeError("malformed receipt")
+        return {
+            "TX Hash": tx_hash,
+            "Date": "02/01/2026 00:00:00",
+            "Type": "Interaction",
+            "Fee": "0",
+        }
+
+    monkeypatch.setattr(
+        evm_reader,
+        "analyze_transaction",
+        analyze,
+    )
+
+    report = asyncio.run(retrieve_transactions(chain="arbitrum"))
+
+    assert report is not None
+    assert report.chain == "arbitrum"
+    assert report.transaction_count == 2
+    assert report.successful_count == 1
+    assert len(report.failures) == 1
+    assert report.failures[0].tx_hash == "failed"
+    assert report.failures[0].error_type == "RuntimeError"
+    assert report.failures[0].message == "malformed receipt"
+
+    saved = pd.read_csv(output_path, dtype=str).fillna("")
+    assert saved["TX Hash"].tolist() == ["existing", "successful"]
+    output = capsys.readouterr().out
+    assert "[!] Failed to analyze 1 transaction(s):" in output
+    assert "[!] failed: RuntimeError: malformed receipt" in output
+    assert TrackingTokenManager.instance is not None
+    assert TrackingTokenManager.instance.flushed is True
+
+
 class TokenManager:
     def get_token(self, address: str, fetch_if_missing: bool = False):
         del address, fetch_if_missing
@@ -224,3 +314,23 @@ def test_analyzer_emits_canonical_utc_transaction(monkeypatch: pytest.MonkeyPatc
         "Send",
         "ETH",
     )
+
+
+def test_analyzer_propagates_transaction_fetch_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        transaction_analyzer,
+        "_fetch_transaction_data",
+        Mock(side_effect=RuntimeError("malformed receipt")),
+    )
+
+    with pytest.raises(RuntimeError, match="malformed receipt"):
+        transaction_analyzer.analyze_transaction(
+            tx_hash="failed",
+            w3=None,
+            my_address="0xabc",
+            token_manager=TokenManager(),
+            internal_eth_map={},
+            fetch_metadata=False,
+        )
