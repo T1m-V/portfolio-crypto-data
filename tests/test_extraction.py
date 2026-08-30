@@ -103,6 +103,22 @@ def test_unexpected_explorer_response_aborts_ingestion(
         )
 
 
+def test_non_object_explorer_response_aborts_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = []
+    monkeypatch.setattr(evm_reader.requests, "get", Mock(return_value=response))
+
+    with pytest.raises(ExplorerAPIError, match="expected an object, got list"):
+        _fetch_explorer_data(
+            "https://example.test",
+            {"action": "tokentx"},
+            max_retries=0,
+        )
+
+
 def test_rpc_connection_failure_aborts_ingestion(monkeypatch: pytest.MonkeyPatch) -> None:
     paths = active_context().paths
     paths.chain_config.parent.mkdir(parents=True, exist_ok=True)

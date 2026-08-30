@@ -70,6 +70,16 @@ def _fetch_explorer_data(
             time.sleep(0.4 * (2**attempt))
             continue
 
+        if not isinstance(data, dict):
+            if attempt == max_retries:
+                action = params.get("action")
+                raise ExplorerAPIError(
+                    "Unexpected explorer response "
+                    f"for action={action}: expected an object, got {type(data).__name__}."
+                )
+            time.sleep(0.4 * (2**attempt))
+            continue
+
         status = data.get("status")
         message = str(data.get("message", "")).lower()
         result = data.get(result_key, [])
