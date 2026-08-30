@@ -231,7 +231,8 @@ def get_balancer_history(
             row = {
                 "date": format_daily_datetime(current_dt),
                 "block": block_num,
-                "bpt_balance": float(Decimal(value=10**bpt_decimals) / Decimal(value=10**18)),
+                # Underlying amounts above are calculated for exactly one whole BPT.
+                "bpt_balance": 1.0,
             }
             # Flatten assets into the row
             for sym, amt in assets.items():

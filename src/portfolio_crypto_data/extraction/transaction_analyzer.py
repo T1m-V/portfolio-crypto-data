@@ -17,7 +17,7 @@ APPROVAL_TOPIC = Web3.keccak(text="Approval(address,address,uint256)").hex()
 
 @dataclass
 class AssetMovement:
-    """Represents a movement of an asset (ETH or Token)."""
+    """Represents a movement of a native asset or token."""
 
     symbol: str
     qty: Decimal
@@ -59,7 +59,12 @@ def _fetch_transaction_data(w3: Web3, tx_hash: str) -> TransactionContext:
 
 
 def _calculate_fee(
-    tx: dict[str, Any], receipt: dict[str, Any], my_address: str
+    *,
+    tx: dict[str, Any],
+    receipt: dict[str, Any],
+    my_address: str,
+    native_symbol: str,
+    native_decimals: int,
 ) -> tuple[Decimal, str]:
     """
     Calculates the transaction fee in native currency.
@@ -74,52 +79,62 @@ def _calculate_fee(
     """
     gas_used = Decimal(receipt["gasUsed"])
     gas_price = Decimal(receipt["effectiveGasPrice"])
-    fee_native = (gas_used * gas_price) / Decimal(10**18)
+    fee_native = (gas_used * gas_price) / (Decimal(10) ** native_decimals)
 
     if tx["from"].lower() == my_address.lower():
-        return fee_native, "ETH"
+        return fee_native, native_symbol
     return Decimal(0), ""
 
 
-def _process_native_eth_transfer(
-    tx: dict[str, Any], my_address: str
+def _process_native_transfer(
+    *,
+    tx: dict[str, Any],
+    my_address: str,
+    native_symbol: str,
+    native_decimals: int,
 ) -> tuple[list[AssetMovement], list[AssetMovement]]:
     """
-    Identifies native ETH transfers involving the user.
+    Identifies native-asset transfers involving the user.
 
     args:
         tx: Transaction data.
         my_address: User's wallet address.
+        native_symbol: Symbol used by the chain's native asset.
+        native_decimals: Decimal precision of the chain's native asset.
 
     returns:
         Tuple of (incoming_movements, outgoing_movements).
     """
     raw_ins, raw_outs = [], []
     if tx["value"] > 0:
-        val = Decimal(tx["value"]) / Decimal(10**18)
+        val = Decimal(tx["value"]) / (Decimal(10) ** native_decimals)
         if tx["to"] and tx["to"].lower() == my_address.lower():
-            raw_ins.append(AssetMovement(symbol="ETH", qty=val))
+            raw_ins.append(AssetMovement(symbol=native_symbol, qty=val))
         elif tx["from"].lower() == my_address.lower():
-            raw_outs.append(AssetMovement(symbol="ETH", qty=val))
+            raw_outs.append(AssetMovement(symbol=native_symbol, qty=val))
     return raw_ins, raw_outs
 
 
-def _process_internal_eth_transfer(
-    tx_hash: str, internal_eth_map: dict[str, Decimal]
+def _process_internal_native_transfer(
+    *,
+    tx_hash: str,
+    internal_native_map: dict[str, Decimal],
+    native_symbol: str,
 ) -> list[AssetMovement]:
     """
-    Identifies internal ETH transfers from the pre-fetched map.
+    Identifies internal native-asset transfers from the pre-fetched map.
 
     args:
         tx_hash: Hash of the transaction.
-        internal_eth_map: Map of tx_hash to internal ETH value.
+        internal_native_map: Map of transaction hash to internal native-asset value.
+        native_symbol: Symbol used by the chain's native asset.
 
     returns:
-        List of internal ETH movements.
+        List of internal native-asset movements.
     """
-    if tx_hash in internal_eth_map:
-        internal_val = Decimal(str(internal_eth_map[tx_hash]))
-        return [AssetMovement(symbol="ETH", qty=internal_val)]
+    if tx_hash in internal_native_map:
+        internal_val = Decimal(str(internal_native_map[tx_hash]))
+        return [AssetMovement(symbol=native_symbol, qty=internal_val)]
     return []
 
 
@@ -363,12 +378,15 @@ def _classify_and_format_transaction(
 
 
 def analyze_transaction(
+    *,
     tx_hash: str,
     w3: Web3,
     my_address: str,
     token_manager: TokenManager,
-    internal_eth_map: dict[str, Decimal],
+    internal_native_map: dict[str, Decimal],
     fetch_metadata: bool,
+    native_symbol: str,
+    native_decimals: int,
 ) -> dict[str, Any] | None:
     """
     Orchestrates the analysis of a single transaction.
@@ -378,8 +396,10 @@ def analyze_transaction(
         w3: Web3 instance.
         my_address: User's wallet address.
         token_manager: Manager for token metadata.
-        internal_eth_map: Map of internal ETH transfers.
+        internal_native_map: Map of internal native-asset transfers.
         fetch_metadata: Whether to fetch missing token info.
+        native_symbol: Symbol used by the chain's native asset.
+        native_decimals: Decimal precision of the chain's native asset.
 
     returns:
         Dictionary of transaction details, or None when the transaction has no
@@ -391,11 +411,26 @@ def analyze_transaction(
     date_str = datetime.fromtimestamp(block["timestamp"], tz=timezone.utc).strftime(
         "%d/%m/%Y %H:%M:%S"
     )
-    fee_val, fee_token = _calculate_fee(tx=tx, receipt=receipt, my_address=my_address)
+    fee_val, fee_token = _calculate_fee(
+        tx=tx,
+        receipt=receipt,
+        my_address=my_address,
+        native_symbol=native_symbol,
+        native_decimals=native_decimals,
+    )
 
-    raw_ins, raw_outs = _process_native_eth_transfer(tx=tx, my_address=my_address)
+    raw_ins, raw_outs = _process_native_transfer(
+        tx=tx,
+        my_address=my_address,
+        native_symbol=native_symbol,
+        native_decimals=native_decimals,
+    )
     raw_ins.extend(
-        _process_internal_eth_transfer(tx_hash=tx_hash, internal_eth_map=internal_eth_map)
+        _process_internal_native_transfer(
+            tx_hash=tx_hash,
+            internal_native_map=internal_native_map,
+            native_symbol=native_symbol,
+        )
     )
 
     log_ins, log_outs, approvals = _get_token_movements(

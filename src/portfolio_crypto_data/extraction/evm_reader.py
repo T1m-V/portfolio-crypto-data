@@ -1,5 +1,4 @@
 import asyncio
-import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -13,6 +12,7 @@ from portfolio_core import active_context, atomic_write_csv
 from tqdm.asyncio import tqdm_asyncio
 from web3 import Web3
 
+from portfolio_crypto_data.chain_config import EvmChainConfig
 from portfolio_crypto_data.datetime_utils import (
     TRANSACTION_DATETIME_FORMAT,
     parse_transaction_datetime,
@@ -150,6 +150,7 @@ def _derive_start_date(output_path: Path, overlap_days: int = 1) -> str:
     except (ValueError, KeyError, pd.errors.ParserError):
         return DEFAULT_START_DATE
 
+
 def _normalize_results_frame(frame: pd.DataFrame) -> pd.DataFrame:
     normalized = frame.copy()
     for col in OUTPUT_COLUMNS:
@@ -169,7 +170,14 @@ def _safe_timestamp(tx: dict[str, Any]) -> int:
 
 
 def get_all_transaction_hashes(
-    api_url: str, api_key: str, chain_id: str, address: str, start_ts: int, end_ts: int
+    *,
+    api_url: str,
+    api_key: str,
+    chain_id: str,
+    address: str,
+    start_ts: int,
+    end_ts: int,
+    include_chain_id: bool,
 ) -> tuple[set[str], set[str], list[Any]]:
     """
     Retrieves transaction hashes from multiple API endpoints.
@@ -185,15 +193,16 @@ def get_all_transaction_hashes(
     returns:
         Tuple of (standard_hashes, all_hashes, internal_txs).
     """
-    base_params = {
+    base_params: dict[str, Any] = {
         "module": "account",
         "address": address,
         "startblock": 0,
         "endblock": 99999999,
         "sort": "asc",
         "apikey": api_key,
-        "chainid": chain_id,
     }
+    if include_chain_id:
+        base_params["chainid"] = chain_id
 
     # 1. Standard TX List
     p_std = {**base_params, "action": "txlist"}
@@ -215,16 +224,22 @@ def get_all_transaction_hashes(
     return hashes_std, all_hashes, txs_int
 
 
-def build_internal_eth_map(txs_internal: list[dict], my_address: str) -> dict[str, Decimal]:
+def build_internal_native_map(
+    *,
+    txs_internal: list[dict],
+    my_address: str,
+    native_decimals: int,
+) -> dict[str, Decimal]:
     """
-    Maps internal transaction hashes to ETH values.
+    Maps internal transaction hashes to native-asset values.
 
     args:
         txs_internal: List of raw internal transactions.
         my_address: User's wallet address.
+        native_decimals: Decimal precision of the chain's native asset.
 
     returns:
-        Dictionary mapping tx_hash to ETH amount.
+        Dictionary mapping transaction hashes to native-asset amounts.
     """
     internal_map = {}
     for tx in txs_internal:
@@ -232,38 +247,23 @@ def build_internal_eth_map(txs_internal: list[dict], my_address: str) -> dict[st
         value = Decimal(str(tx.get("value", "0")))
         if tx.get("to") and tx["to"].lower() == my_address and value > 0:
             tx_hash = tx["hash"]
-            amount = value / Decimal(10**18)
+            amount = value / (Decimal(10) ** native_decimals)
             internal_map[tx_hash] = internal_map.get(tx_hash, Decimal(0)) + amount
     return internal_map
 
 
-async def retrieve_transactions(chain: str) -> TransactionRetrievalReport | None:
+async def retrieve_transactions(config: EvmChainConfig) -> TransactionRetrievalReport:
     """
     Main entry point to fetch and analyze transactions for a chain.
 
     args:
-        chain: Chain identifier (e.g., 'arbitrum').
+        config: Runtime configuration for one EVM chain.
     """
+    chain = config.chain
     print(f"--- START PROCESSING: {chain.upper()} ---")
 
-    # 1. Load Config
     paths = active_context().paths
-    if not paths.chain_config.exists():
-        raise FileNotFoundError(f"Config '{paths.chain_config}' not found.")
-
-    with open(paths.chain_config, "r") as f:
-        config_data = json.load(f)
-
-    if chain not in config_data:
-        raise ValueError(f"Chain '{chain}' not found.")
-
-    cfg: dict[str, str] = config_data[chain]
-    my_address = cfg["my_address"].lower()
-    api_url = cfg.get("api_url")
-    api_key = cfg.get("api_key")
-    chain_id = cfg.get("chain_id")
-    if not api_url:
-        raise ValueError(f"Chain '{chain}' missing 'api_url' in config.")
+    my_address = config.wallet_address
 
     # Setup Paths & Connection
     token_path = paths.tokens / f"{chain}_tokens.json"
@@ -271,7 +271,7 @@ async def retrieve_transactions(chain: str) -> TransactionRetrievalReport | None
     paths.crypto_transactions.mkdir(parents=True, exist_ok=True)
     paths.tokens.mkdir(parents=True, exist_ok=True)
 
-    w3 = Web3(Web3.HTTPProvider(cfg["rpc_url"]))
+    w3 = Web3(Web3.HTTPProvider(config.rpc_url))
     if not w3.is_connected():
         raise ConnectionError(f"RPC connection failed for chain '{chain}'.")
 
@@ -285,15 +285,20 @@ async def retrieve_transactions(chain: str) -> TransactionRetrievalReport | None
     # 3. Fetch Hashes
     print("Fetching transaction lists...")
     std_hashes, all_hashes, raw_internal_txs = get_all_transaction_hashes(
-        api_url=api_url,
-        api_key=api_key,
-        chain_id=chain_id,
+        api_url=config.explorer_api_url,
+        api_key=config.explorer_api_key,
+        chain_id=config.chain_id,
         address=my_address,
         start_ts=start_ts,
         end_ts=end_ts,
+        include_chain_id=config.explorer_include_chain_id,
     )
 
-    internal_map = build_internal_eth_map(txs_internal=raw_internal_txs, my_address=my_address)
+    internal_map = build_internal_native_map(
+        txs_internal=raw_internal_txs,
+        my_address=my_address,
+        native_decimals=config.native_decimals,
+    )
 
     print(f"-> Found {len(all_hashes)} unique transactions.")
     if not all_hashes:
@@ -304,7 +309,12 @@ async def retrieve_transactions(chain: str) -> TransactionRetrievalReport | None
     std_list = list(std_hashes)
     others_list = list(all_hashes - std_hashes)
 
-    token_manager = TokenManager(token_path=token_path, w3=w3)
+    token_manager = TokenManager(
+        token_path=token_path,
+        w3=w3,
+        native_symbol=config.native_symbol,
+        native_decimals=config.native_decimals,
+    )
     results = []
     failures: list[TransactionAnalysisFailure] = []
 
@@ -325,8 +335,10 @@ async def retrieve_transactions(chain: str) -> TransactionRetrievalReport | None
                     w3=w3,
                     my_address=my_address,
                     token_manager=token_manager,
-                    internal_eth_map=internal_map,
+                    internal_native_map=internal_map,
                     fetch_metadata=fetch_meta,
+                    native_symbol=config.native_symbol,
+                    native_decimals=config.native_decimals,
                 )
                 return tx_hash, result, None
             except Exception as exc:

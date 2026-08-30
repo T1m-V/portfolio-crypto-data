@@ -14,6 +14,7 @@ from portfolio_crypto_data.datetime_utils import (
     parse_transaction_datetime_series,
 )
 from portfolio_crypto_data.principal_ledger import EconomicPrincipalLedger, PrincipalResolver
+from portfolio_crypto_data.shared.aave_symbols import aave_base_symbol
 from portfolio_crypto_data.shared.prices import (
     STABLE_PRICE_SYMBOLS,
     get_price_eur_on_or_before,
@@ -27,7 +28,6 @@ from portfolio_crypto_data.shared.valuation_routes import (
 from portfolio_crypto_data.symbols import price_proxy_symbol, sanitize_symbol
 
 MAX_INVALID_DATE_RATIO = 0.1
-AAVE_PRICE_SOURCE_PREFIXES = ("variableDebtArb", "stableDebtArb", "aArb")
 SWAP_UNDERVALUED_ALLOCATION_RATIO = 0.01
 SWAP_VALUE_DUST_EUR = 0.01
 
@@ -105,18 +105,7 @@ def get_crypto_price(
 
 
 def _derive_aave_price_source(symbol: str, meta: dict[str, Any] | None) -> str:
-    if meta:
-        explicit = sanitize_symbol(meta.get("price_source")) or sanitize_symbol(meta.get("family"))
-        if explicit:
-            return explicit
-
-    for prefix in AAVE_PRICE_SOURCE_PREFIXES:
-        if symbol.startswith(prefix):
-            underlying = sanitize_symbol(symbol.removeprefix(prefix))
-            if underlying:
-                return underlying
-
-    return symbol
+    return aave_base_symbol(symbol, meta)
 
 
 @dataclass
@@ -216,7 +205,13 @@ class TransactionParser:
 
 
 class PortfolioLedger:
-    def __init__(self, chain: str, token_metadata: dict[str, dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        chain: str,
+        token_metadata: dict[str, dict[str, Any]] | None = None,
+        *,
+        track_economic_principal: bool = False,
+    ):
         self.chain = chain
         paths = active_context().paths
         self.token_metadata = (
@@ -226,7 +221,7 @@ class PortfolioLedger:
         )
         self.symbol_to_meta: dict[str, dict[str, Any]] = {}
         self.symbol_protocol = build_symbol_protocol_map(token_metadata=self.token_metadata)
-        self.use_dual_principal = chain == "arbitrum"
+        self.track_economic_principal = track_economic_principal
         self.principal_ledger = EconomicPrincipalLedger(
             resolver=PrincipalResolver(
                 chain=chain,
@@ -285,7 +280,7 @@ class PortfolioLedger:
         action: str,
         tx_hash: str = "",
     ) -> None:
-        if not self.use_dual_principal:
+        if not self.track_economic_principal:
             asset.adjust_principal(amount_eur)
             return
 
@@ -731,7 +726,11 @@ def generate_raw_snapshots(
     df = df.dropna(subset=["Date"])
     df = df.sort_values(by=["Date"], ascending=True)
 
-    ledger = PortfolioLedger(chain=chain, token_metadata=token_metadata)
+    ledger = PortfolioLedger(
+        chain=chain,
+        token_metadata=token_metadata,
+        track_economic_principal=True,
+    )
     applier = TransactionApplier(ledger=ledger)
     for _, row in df.iterrows():
         applier.process_transaction(row)

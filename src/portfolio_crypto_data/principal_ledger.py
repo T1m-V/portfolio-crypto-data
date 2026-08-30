@@ -15,11 +15,12 @@ from portfolio_crypto_data.composition.core import (
     component_value_weights,
 )
 from portfolio_crypto_data.datetime_utils import format_daily_datetime
+from portfolio_crypto_data.shared.aave_symbols import (
+    aave_base_symbol,
+    is_aave_debt_symbol,
+)
 from portfolio_crypto_data.shared.valuation_routes import ValuationRoute
 from portfolio_crypto_data.symbols import canonicalize_symbol, price_proxy_symbol, sanitize_symbol
-
-AAVE_EXPOSURE_PREFIXES = ("variableDebtArb", "stableDebtArb", "aArb")
-AAVE_DEBT_PREFIXES = ("variableDebtArb", "stableDebtArb")
 
 PRINCIPAL_EVENT_COLUMNS = [
     "Date",
@@ -31,26 +32,6 @@ PRINCIPAL_EVENT_COLUMNS = [
     "PrincipalBalanceEUR",
 ]
 PRINCIPAL_DAILY_COLUMNS = ["Date", "Coin", "PrincipalInvestedEUR"]
-
-
-def is_aave_debt_symbol(symbol: str) -> bool:
-    normalized = sanitize_symbol(symbol).lower()
-    return any(normalized.startswith(prefix.lower()) for prefix in AAVE_DEBT_PREFIXES)
-
-
-def aave_base_symbol(symbol: str, meta: dict[str, Any] | None) -> str:
-    explicit = ""
-    if meta:
-        explicit = sanitize_symbol(meta.get("price_source")) or sanitize_symbol(meta.get("family"))
-    if not explicit:
-        normalized = sanitize_symbol(symbol)
-        upper_symbol = normalized.upper()
-        for prefix in AAVE_EXPOSURE_PREFIXES:
-            if upper_symbol.startswith(prefix.upper()):
-                explicit = sanitize_symbol(normalized[len(prefix) :])
-                break
-    base = explicit or sanitize_symbol(symbol)
-    return price_proxy_symbol(base) or base
 
 
 @dataclass(frozen=True)
@@ -82,14 +63,17 @@ class PrincipalResolver:
         if not normalized:
             return []
 
-        multiplier = Decimal("-1") if is_aave_debt_symbol(normalized) else Decimal("1")
+        meta = self.metadata.get(normalized)
+        multiplier = (
+            Decimal("-1") if is_aave_debt_symbol(normalized, meta) else Decimal("1")
+        )
         route = self.ctx.route_for(normalized)
         expansion_symbol = normalized
         has_aave = route == ValuationRoute.AAVE
         if has_aave:
             expansion_symbol = aave_base_symbol(
                 symbol=normalized,
-                meta=self.metadata.get(normalized),
+                meta=meta,
             )
 
         exposures = ExposureExpander(ctx=self.ctx).expand(

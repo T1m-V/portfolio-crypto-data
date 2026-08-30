@@ -16,13 +16,12 @@ from portfolio_crypto_data.datetime_utils import (
     parse_daily_datetime,
     parse_transaction_datetime_series,
 )
+from portfolio_crypto_data.shared.aave_symbols import aave_base_symbol
 from portfolio_crypto_data.shared.token_metadata import load_token_metadata
-from portfolio_crypto_data.symbols import price_proxy_symbol, sanitize_symbol
+from portfolio_crypto_data.symbols import sanitize_symbol
 
-CHAIN = "arbitrum"
 MATERIAL_QUANTITY_THRESHOLD = 1e-10
 MATERIAL_VALUE_THRESHOLD_EUR = 1.0
-AAVE_EXPOSURE_PREFIXES = ("variableDebtArb", "stableDebtArb", "aArb")
 
 ASSET_DAILY_COLUMNS = [
     "Date",
@@ -88,7 +87,7 @@ ASSETS_COLUMNS = ["Label", "Value"]
 
 
 @dataclass(frozen=True)
-class ArbitrumDashboardArtifactPaths:
+class ChainDashboardArtifactPaths:
     asset_daily: Path
     timeseries_daily: Path
     composition_daily: Path
@@ -97,9 +96,9 @@ class ArbitrumDashboardArtifactPaths:
     assets: Path
 
 
-def artifact_paths(chain: str = CHAIN) -> ArbitrumDashboardArtifactPaths:
+def artifact_paths(chain: str) -> ChainDashboardArtifactPaths:
     root = active_context().paths.dashboard_artifacts / chain
-    return ArbitrumDashboardArtifactPaths(
+    return ChainDashboardArtifactPaths(
         asset_daily=root / "asset_daily.csv",
         timeseries_daily=root / "timeseries_daily.csv",
         composition_daily=root / "composition_daily.csv",
@@ -163,19 +162,7 @@ def _metadata_by_symbol(token_metadata: dict[str, dict[str, Any]]) -> dict[str, 
 
 
 def _aave_exposure_symbol(symbol: str, meta: dict[str, Any] | None = None) -> str:
-    normalized = sanitize_symbol(symbol)
-    explicit = ""
-    if meta:
-        explicit = sanitize_symbol(meta.get("price_source")) or sanitize_symbol(meta.get("family"))
-
-    if not explicit:
-        upper_symbol = normalized.upper()
-        for prefix in AAVE_EXPOSURE_PREFIXES:
-            if upper_symbol.startswith(prefix.upper()):
-                explicit = sanitize_symbol(normalized[len(prefix) :])
-                break
-
-    return price_proxy_symbol(explicit or normalized) or explicit or normalized
+    return aave_base_symbol(symbol=symbol, meta=meta)
 
 
 def _exposure_label(row: pd.Series) -> str:
@@ -508,9 +495,9 @@ def _write_artifact(path: Path, frame: pd.DataFrame, columns: list[str]) -> None
     atomic_write_csv(frame=output, path=path)
 
 
-def build_arbitrum_dashboard_artifacts(chain: str = CHAIN) -> ArbitrumDashboardArtifactPaths:
+def build_chain_dashboard_artifacts(chain: str) -> ChainDashboardArtifactPaths:
     """
-    Builds dashboard-ready Arbitrum CSV artifacts from generated blockchain CSVs.
+    Builds dashboard-ready CSV artifacts for one EVM chain.
 
     args:
         chain: Chain identifier.
@@ -572,5 +559,5 @@ def build_arbitrum_dashboard_artifacts(chain: str = CHAIN) -> ArbitrumDashboardA
         TRANSACTIONS_DASHBOARD_COLUMNS,
     )
     _write_artifact(paths.assets, assets, ASSETS_COLUMNS)
-    print(f"[dashboard_artifacts] Saved Arbitrum artifacts to {paths.asset_daily.parent}")
+    print(f"[dashboard_artifacts] Saved {chain} artifacts to {paths.asset_daily.parent}")
     return paths

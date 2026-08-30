@@ -5,11 +5,13 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 from portfolio_core import active_context, atomic_write_text
 from web3 import Web3
 
+from portfolio_crypto_data.chain_config import EvmChainConfig, load_evm_chain_config
 from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
     parse_daily_datetime,
@@ -27,38 +29,24 @@ class ProtocolTokenRun:
     end_date: str
 
 
-def load_chain_config(chain: str) -> dict[str, str]:
-    chain_config = active_context().paths.chain_config
-    if not chain_config.exists():
-        raise FileNotFoundError(f"Config '{chain_config}' not found.")
-
-    with open(file=chain_config, mode="r") as f:
-        config_data = json.load(fp=f)
-
-    if chain not in config_data:
-        raise ValueError(f"Chain '{chain}' not found in config.")
-
-    return config_data[chain]
+def load_chain_config(chain: str) -> EvmChainConfig:
+    return load_evm_chain_config(chain=chain)
 
 
 def load_chain_web3(chain: str) -> Web3:
     cfg = load_chain_config(chain=chain)
-    rpc_url = cfg.get("alchemy_url") or cfg.get("rpc_url")
-    if not rpc_url:
-        raise ValueError(f"Chain '{chain}' is missing both 'alchemy_url' and 'rpc_url'.")
-
-    w3 = Web3(provider=Web3.HTTPProvider(endpoint_uri=rpc_url))
+    w3 = Web3(provider=Web3.HTTPProvider(endpoint_uri=cfg.rpc_url))
     if not w3.is_connected():
         raise ConnectionError(f"Connection failed for chain '{chain}'.")
     return w3
 
 
-def load_tokens(chain: str) -> dict[str, dict[str, str]]:
+def load_tokens(chain: str) -> dict[str, dict[str, Any]]:
     tokens_file_path = active_context().paths.tokens / f"{chain}_tokens.json"
     if not tokens_file_path.exists():
         raise FileNotFoundError(f"Config '{tokens_file_path}' not found.")
 
-    with open(file=tokens_file_path, mode="r") as f:
+    with open(file=tokens_file_path, mode="r", encoding="utf-8") as f:
         return json.load(fp=f)
 
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from decimal import Decimal
 from unittest.mock import Mock
 
@@ -11,6 +10,7 @@ import requests
 from portfolio_core import active_context
 from web3 import Web3
 
+from portfolio_crypto_data.chain_config import EvmChainConfig
 from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
     parse_daily_datetime,
@@ -24,8 +24,25 @@ from portfolio_crypto_data.extraction.evm_reader import (
     _derive_start_date,
     _fetch_explorer_data,
     _normalize_results_frame,
+    build_internal_native_map,
+    get_all_transaction_hashes,
     retrieve_transactions,
 )
+
+
+def _chain_config() -> EvmChainConfig:
+    return EvmChainConfig(
+        chain="arbitrum",
+        chain_id="42161",
+        wallet_address="0xabc",
+        rpc_url="https://rpc.example.test",
+        explorer_api_url="https://example.test",
+        explorer_api_key="test",
+        native_symbol="ETH",
+        native_decimals=18,
+        protocols=(),
+        explorer_include_chain_id=True,
+    )
 
 
 @pytest.mark.parametrize("value", ["05/01/2026 11:30", "05/01/2026 11:30:12"])
@@ -69,6 +86,35 @@ def test_explorer_no_transactions_is_not_an_error(monkeypatch: pytest.MonkeyPatc
 
     assert _fetch_explorer_data("https://example.test", {"action": "txlist"}) == []
     assert get.call_count == 1
+
+
+def test_explorer_chain_id_parameter_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def fetch(*, api_url: str, params: dict[str, object]) -> list[object]:
+        del api_url
+        requests.append(params)
+        return []
+
+    monkeypatch.setattr(
+        "portfolio_crypto_data.extraction.evm_reader._fetch_explorer_data",
+        fetch,
+    )
+
+    get_all_transaction_hashes(
+        api_url="https://example.test",
+        api_key="",
+        chain_id="25",
+        address="0xwallet",
+        start_ts=0,
+        end_ts=1,
+        include_chain_id=False,
+    )
+
+    assert len(requests) == 3
+    assert all("chainid" not in params for params in requests)
 
 
 def test_explorer_request_failure_aborts_ingestion(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -120,23 +166,6 @@ def test_non_object_explorer_response_aborts_ingestion(
 
 
 def test_rpc_connection_failure_aborts_ingestion(monkeypatch: pytest.MonkeyPatch) -> None:
-    paths = active_context().paths
-    paths.chain_config.parent.mkdir(parents=True, exist_ok=True)
-    paths.chain_config.write_text(
-        json.dumps(
-            {
-                "arbitrum": {
-                    "my_address": "0xabc",
-                    "api_url": "https://example.test",
-                    "api_key": "test",
-                    "chain_id": "42161",
-                    "rpc_url": "https://rpc.example.test",
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-
     class DisconnectedWeb3:
         HTTPProvider = staticmethod(lambda endpoint_uri: endpoint_uri)
 
@@ -149,35 +178,19 @@ def test_rpc_connection_failure_aborts_ingestion(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(evm_reader, "Web3", DisconnectedWeb3)
 
     with pytest.raises(ConnectionError, match="RPC connection failed"):
-        asyncio.run(retrieve_transactions(chain="arbitrum"))
+        asyncio.run(retrieve_transactions(config=_chain_config()))
 
 
 def test_transaction_analysis_error_is_reported_without_stopping_output(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    paths = active_context().paths
-    paths.chain_config.parent.mkdir(parents=True, exist_ok=True)
-    paths.chain_config.write_text(
-        json.dumps(
-            {
-                "arbitrum": {
-                    "my_address": "0xabc",
-                    "api_url": "https://example.test",
-                    "api_key": "test",
-                    "chain_id": "42161",
-                    "rpc_url": "https://rpc.example.test",
-                }
-            }
-        ),
+    output_path = active_context().paths.crypto_transactions / "arbitrum_transactions.csv"
+    output_path.write_text(
+        "TX Hash,Date,Qty in,Token in,Qty out,Token out,Type,Fee,Fee Token\n"
+        "existing,01/01/2026 00:00:00,,,,,Interaction,0,\n",
         encoding="utf-8",
     )
-    output_path = paths.crypto_transactions / "arbitrum_transactions.csv"
-    original_output = (
-        "TX Hash,Date,Qty in,Token in,Qty out,Token out,Type,Fee,Fee Token\n"
-        "existing,01/01/2026 00:00:00,,,,,Interaction,0,\n"
-    )
-    output_path.write_text(original_output, encoding="utf-8")
 
     class ConnectedWeb3:
         HTTPProvider = staticmethod(lambda endpoint_uri: endpoint_uri)
@@ -216,15 +229,10 @@ def test_transaction_analysis_error_is_reported_without_stopping_output(
             "Fee": "0",
         }
 
-    monkeypatch.setattr(
-        evm_reader,
-        "analyze_transaction",
-        analyze,
-    )
+    monkeypatch.setattr(evm_reader, "analyze_transaction", analyze)
 
-    report = asyncio.run(retrieve_transactions(chain="arbitrum"))
+    report = asyncio.run(retrieve_transactions(config=_chain_config()))
 
-    assert report is not None
     assert report.chain == "arbitrum"
     assert report.transaction_count == 2
     assert report.successful_count == 1
@@ -304,16 +312,35 @@ def test_analyzer_emits_canonical_utc_transaction(monkeypatch: pytest.MonkeyPatc
         w3=None,
         my_address=wallet,
         token_manager=TokenManager(),
-        internal_eth_map={},
+        internal_native_map={},
         fetch_metadata=False,
+        native_symbol="CRO",
+        native_decimals=18,
     )
 
     assert result is not None
     assert (result["Date"], result["Type"], result["Fee Token"]) == (
         "01/01/1970 00:00:00",
         "Send",
-        "ETH",
+        "CRO",
     )
+
+
+def test_internal_native_transfers_use_configured_decimals() -> None:
+    wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    result = build_internal_native_map(
+        txs_internal=[
+            {
+                "hash": "0xhash",
+                "to": wallet,
+                "value": "123000000",
+            }
+        ],
+        my_address=wallet,
+        native_decimals=8,
+    )
+
+    assert result == {"0xhash": Decimal("1.23")}
 
 
 def test_analyzer_propagates_transaction_fetch_errors(
@@ -331,6 +358,8 @@ def test_analyzer_propagates_transaction_fetch_errors(
             w3=None,
             my_address="0xabc",
             token_manager=TokenManager(),
-            internal_eth_map={},
+            internal_native_map={},
             fetch_metadata=False,
+            native_symbol="ETH",
+            native_decimals=18,
         )

@@ -6,66 +6,119 @@ from pathlib import Path
 import pytest
 
 from portfolio_crypto_data import cli, update
+from portfolio_crypto_data.chain_config import EvmChainConfig
 
 
-def test_update_runs_one_fixed_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+def _chain_config(
+    chain: str,
+    *,
+    native_symbol: str,
+    protocols: tuple[str, ...] = (),
+) -> EvmChainConfig:
+    return EvmChainConfig(
+        chain=chain,
+        chain_id="1",
+        wallet_address="0xwallet",
+        rpc_url="https://rpc.test",
+        explorer_api_url="https://explorer.test/api",
+        explorer_api_key="",
+        native_symbol=native_symbol,
+        native_decimals=18,
+        protocols=protocols,
+        explorer_include_chain_id=True,
+    )
+
+
+def test_update_runs_each_configured_chain_with_its_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[str] = []
+    arbitrum = _chain_config("arbitrum", native_symbol="ETH", protocols=("one",))
+    cronos = _chain_config("cronos", native_symbol="CRO")
 
-    async def retrieve(*, chain: str) -> None:
-        calls.append(f"transactions:{chain}")
+    async def retrieve(*, config: EvmChainConfig) -> None:
+        calls.append(f"transactions:{config.chain}:{config.native_symbol}")
 
     monkeypatch.setattr(update, "retrieve_transactions", retrieve)
-    monkeypatch.setattr(update, "_build_snapshots", lambda: calls.append("snapshots"))
+    monkeypatch.setattr(
+        update,
+        "_build_snapshots",
+        lambda *, config: calls.append(f"snapshots:{config.chain}"),
+    )
     monkeypatch.setattr(
         update,
         "PROTOCOL_PROCESSORS",
-        (("one", lambda **_: calls.append("protocol:one")),),
+        {"one": lambda **kwargs: calls.append(f"protocol:{kwargs['chain']}:one")},
     )
     monkeypatch.setattr(
         update,
         "generate_protocol_lp_price_files",
-        lambda **_: calls.append("lp_prices"),
+        lambda **kwargs: calls.append(f"lp_prices:{kwargs['chain']}"),
     )
     monkeypatch.setattr(
         update,
         "build_accounting_artifacts",
-        lambda **_: calls.append("accounting"),
+        lambda **kwargs: calls.append(f"accounting:{kwargs['chain']}"),
     )
     monkeypatch.setattr(
         update,
-        "build_arbitrum_dashboard_artifacts",
-        lambda **_: calls.append("dashboard"),
+        "build_chain_dashboard_artifacts",
+        lambda **kwargs: calls.append(f"dashboard:{kwargs['chain']}"),
     )
 
-    update.update_onchain()
+    update.update_onchain(chain_configs=(arbitrum, cronos))
 
     assert calls == [
-        "transactions:arbitrum",
-        "snapshots",
-        "protocol:one",
-        "lp_prices",
-        "accounting",
-        "dashboard",
+        "transactions:arbitrum:ETH",
+        "snapshots:arbitrum",
+        "protocol:arbitrum:one",
+        "lp_prices:arbitrum",
+        "accounting:arbitrum",
+        "dashboard:arbitrum",
+        "transactions:cronos:CRO",
+        "snapshots:cronos",
+        "accounting:cronos",
+        "dashboard:cronos",
     ]
 
 
-def test_rebuild_is_local_and_uses_requested_date(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_rebuild_is_local_for_every_configured_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[object] = []
-    monkeypatch.setattr(update, "_build_snapshots", lambda: calls.append("snapshots"))
+    configs = (
+        _chain_config("arbitrum", native_symbol="ETH"),
+        _chain_config("cronos", native_symbol="CRO"),
+    )
+    monkeypatch.setattr(
+        update,
+        "_build_snapshots",
+        lambda *, config: calls.append(f"snapshots:{config.chain}"),
+    )
     monkeypatch.setattr(
         update,
         "build_accounting_artifacts",
-        lambda **kwargs: calls.append(kwargs["as_of_date"]),
+        lambda **kwargs: calls.append((kwargs["chain"], kwargs["as_of_date"])),
     )
     monkeypatch.setattr(
         update,
-        "build_arbitrum_dashboard_artifacts",
-        lambda **_: calls.append("dashboard"),
+        "build_chain_dashboard_artifacts",
+        lambda **kwargs: calls.append(f"dashboard:{kwargs['chain']}"),
     )
 
-    update.rebuild_derived(as_of_date=date(2026, 8, 8))
+    update.rebuild_derived(
+        as_of_date=date(2026, 8, 8),
+        chain_configs=configs,
+    )
 
-    assert calls == ["snapshots", date(2026, 8, 8), "dashboard"]
+    assert calls == [
+        "snapshots:arbitrum",
+        ("arbitrum", date(2026, 8, 8)),
+        "dashboard:arbitrum",
+        "snapshots:cronos",
+        ("cronos", date(2026, 8, 8)),
+        "dashboard:cronos",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -100,5 +153,17 @@ def test_cli_preserves_dashboard_command_contract(
 
 
 def test_rebuild_requires_transactions() -> None:
+    config = _chain_config("cronos", native_symbol="CRO")
     with pytest.raises(FileNotFoundError, match="missing transaction file"):
-        update.rebuild_derived()
+        update.rebuild_derived(chain_configs=(config,))
+
+
+def test_update_rejects_unsupported_protocol_before_running_pipeline() -> None:
+    config = _chain_config(
+        "cronos",
+        native_symbol="CRO",
+        protocols=("unknown",),
+    )
+
+    with pytest.raises(ValueError, match="unsupported protocol.*unknown"):
+        update.update_onchain(chain_configs=(config,))

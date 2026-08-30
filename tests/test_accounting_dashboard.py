@@ -90,7 +90,14 @@ def test_accounting_fails_immediately_for_material_missing_price() -> None:
 
 def test_accounting_requires_protocol_state_for_aave_positions() -> None:
     _write_workspace(
-        metadata={"debt": {"symbol": "variableDebtArbLINK", "protocol": "aave"}},
+        metadata={
+            "debt": {
+                "symbol": "variableDebtArbLINK",
+                "protocol": "aave",
+                "price_source": "LINK",
+                "position_type": "debt",
+            }
+        },
         snapshots=[
             {
                 "Date": "2025-01-01",
@@ -111,7 +118,11 @@ def test_accounting_expands_aave_liquid_staking_to_eth() -> None:
         metadata={
             "eth": {"symbol": "ETH"},
             "wsteth": {"symbol": "wstETH", "protocol": "liquid_staking"},
-            "aave": {"symbol": "aArbwstETH", "protocol": "aave"},
+            "aave": {
+                "symbol": "aArbwstETH",
+                "protocol": "aave",
+                "price_source": "wstETH",
+            },
         },
         snapshots=[
             {
@@ -184,7 +195,7 @@ def test_dashboard_builder_preserves_six_file_read_contract() -> None:
     ).to_csv(active_context().paths.crypto_transactions / f"{CHAIN}_transactions.csv", index=False)
     accounting.build_accounting_artifacts(chain=CHAIN, as_of_date="2025-01-01")
 
-    paths = dashboard_artifacts.build_arbitrum_dashboard_artifacts(chain=CHAIN)
+    paths = dashboard_artifacts.build_chain_dashboard_artifacts(chain=CHAIN)
 
     contracts = {
         paths.asset_daily: dashboard_artifacts.ASSET_DAILY_COLUMNS,
@@ -242,7 +253,12 @@ def test_dashboard_debt_is_negative_exposure() -> None:
     _write_workspace(
         metadata={
             "link": {"symbol": "LINK"},
-            "debt": {"symbol": "variableDebtArbLINK", "protocol": "aave"},
+            "debt": {
+                "symbol": "variableDebtArbLINK",
+                "protocol": "aave",
+                "price_source": "LINK",
+                "position_type": "debt",
+            },
         },
         snapshots=[
             {
@@ -278,7 +294,7 @@ def test_dashboard_debt_is_negative_exposure() -> None:
     )
     accounting.build_accounting_artifacts(chain=CHAIN, as_of_date="2025-01-01")
 
-    paths = dashboard_artifacts.build_arbitrum_dashboard_artifacts(chain=CHAIN)
+    paths = dashboard_artifacts.build_chain_dashboard_artifacts(chain=CHAIN)
     link = pd.read_csv(paths.timeseries_daily).set_index("Selection").loc["LINK"]
 
     assert link[["MarketValueEUR", "PrincipalInvestedEUR", "ProfitLossEUR"]].tolist() == [
