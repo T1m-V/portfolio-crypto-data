@@ -80,12 +80,8 @@ def test_approval_fee_reduces_native_token_balance(
     ledger = PortfolioLedger(chain="arbitrum", token_metadata={})
     applier = TransactionApplier(ledger=ledger)
 
-    applier.process_transaction(
-        _chain_row("Receive", **{"Qty in": "2", "Token in": "ETH"})
-    )
-    applier.process_transaction(
-        _chain_row("Approve ARB", **{"Fee": "0.01", "Fee Token": "ETH"})
-    )
+    applier.process_transaction(_chain_row("Receive", **{"Qty in": "2", "Token in": "ETH"}))
+    applier.process_transaction(_chain_row("Approve ARB", **{"Fee": "0.01", "Fee Token": "ETH"}))
 
     assert ledger.assets["ETH"].quantity == Decimal("1.99")
     assert ledger.history[-1]["Quantity"] == Decimal("1.99")
@@ -93,9 +89,10 @@ def test_approval_fee_reduces_native_token_balance(
 
 def test_transaction_parser_rejects_mismatched_external_fields() -> None:
     parser = TransactionParser()
-    assert [(entry.token, entry.quantity) for entry in parser.parse_entries(
-        qty_val="1, 2", token_val="ETH, USDC"
-    )] == [("ETH", Decimal("1")), ("USDC", Decimal("2"))]
+    assert [
+        (entry.token, entry.quantity)
+        for entry in parser.parse_entries(qty_val="1, 2", token_val="ETH, USDC")
+    ] == [("ETH", Decimal("1")), ("USDC", Decimal("2"))]
     with pytest.raises(ValueError, match="Mismatched"):
         parser.parse_entries(qty_val="1, 2", token_val="ETH")
 
@@ -114,9 +111,7 @@ def test_principal_ledger_distributes_exactly_and_keeps_daily_last_state() -> No
     ledger.adjust(
         symbol="LP", amount_eur=100, date_value="2026-01-01", action="receive", tx_hash="a"
     )
-    ledger.adjust(
-        symbol="LP", amount_eur=-20, date_value="2026-01-01", action="send", tx_hash="b"
-    )
+    ledger.adjust(symbol="LP", amount_eur=-20, date_value="2026-01-01", action="send", tx_hash="b")
 
     assert ledger.balances == {"ETH": Decimal("60.00"), "BTC": Decimal("20.00")}
     daily = ledger.daily_frame().set_index("Coin")
@@ -369,6 +364,25 @@ def test_nexo_generator_rejects_unknown_external_type(
 
 
 ACTUAL_CRYPTO_COM_APP_KINDS = {
+    "admin_wallet_credited",
+    "card_top_up",
+    "crypto_earn_interest_paid",
+    "crypto_earn_program_created",
+    "crypto_earn_program_withdrawn",
+    "crypto_viban_exchange",
+    "finance.lockup.dpos_non_compound_interest.crypto_wallet",
+    "lockup_lock",
+    "lockup_unlock",
+    "lockup_upgrade",
+    "mco_stake_reward",
+    "referral_gift",
+    "reimbursement",
+    "reimbursement_reverted",
+    "supercharger_deposit",
+    "supercharger_reward_to_app_credited",
+    "supercharger_withdrawal",
+    "transfer.p2p_transfer.crypto_wallet.crypto_wallet.debit",
+    "viban_purchase",
     "card_cashback_reverted",
     "crypto_deposit",
     "crypto_exchange",
@@ -481,16 +495,152 @@ def test_crypto_com_app_dust_legs_become_one_swap() -> None:
 
     assert consumed == {0, 1}
     assert list(actions) == [0]
-    assert [(entry.token, entry.quantity) for entry in actions[0].outs] == [
-        ("USDC", Decimal("1"))
-    ]
-    assert [(entry.token, entry.quantity) for entry in actions[0].ins] == [
-        ("CRO", Decimal("0.5"))
-    ]
+    assert [(entry.token, entry.quantity) for entry in actions[0].outs] == [("USDC", Decimal("1"))]
+    assert [(entry.token, entry.quantity) for entry in actions[0].ins] == [("CRO", Decimal("0.5"))]
 
 
 def _write_crypto_com_app_export(path: Path, rows: list[pd.Series]) -> None:
     pd.DataFrame(rows).drop(columns=["Date"]).to_csv(path, index=False)
+
+
+def test_crypto_com_app_historical_accounting(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(raw_snapshots, "get_crypto_price", lambda **_: 1.0)
+    rows = [
+        _crypto_com_app_row(
+            "viban_purchase",
+            **{
+                "Currency": "EUR",
+                "Amount": "-100",
+                "To Currency": "CRO",
+                "To Amount": "100",
+            },
+        ),
+    ]
+    for kind, amount in [
+        ("crypto_earn_program_created", "-30"),
+        ("crypto_earn_program_withdrawn", "30"),
+        ("lockup_lock", "-20"),
+        ("lockup_upgrade", "-10"),
+        ("lockup_unlock", "30"),
+        ("supercharger_deposit", "-10"),
+        ("supercharger_withdrawal", "10"),
+        ("finance.lockup.dpos_lock.crypto_wallet", "-20"),
+        ("finance.lockup.dpos_lock_upgrade.crypto_wallet", "-5"),
+        ("admin_wallet_credited", "3"),
+        ("crypto_transfer", "4"),
+        ("crypto_transfer", "-2"),
+        ("card_top_up", "-5"),
+        ("crypto_viban_exchange", "-10"),
+        ("transfer.p2p_transfer.crypto_wallet.crypto_wallet.debit", "-7"),
+    ]:
+        rows.append(
+            _crypto_com_app_row(
+                kind,
+                **{
+                    "Amount": amount,
+                    "To Currency": "CRO",
+                    "To Amount": "7",
+                },
+            )
+        )
+    for kind in [
+        "crypto_earn_interest_paid",
+        "finance.lockup.dpos_non_compound_interest.crypto_wallet",
+        "mco_stake_reward",
+        "referral_gift",
+        "reimbursement",
+        "supercharger_reward_to_app_credited",
+    ]:
+        rows.append(_crypto_com_app_row(kind, **{"Amount": "2"}))
+    rows.append(_crypto_com_app_row("reimbursement_reverted", **{"Amount": "-1"}))
+    # Separate dates ensure internal moves preserve both quantity and principal
+    # throughout the history, rather than merely cancelling at the end.
+    for idx, row in enumerate(rows):
+        row["Timestamp (UTC)"] = str(pd.Timestamp("2026-01-01") + pd.Timedelta(days=idx))
+    source = tmp_path / "history.csv"
+    output = tmp_path / "out.csv"
+    _write_crypto_com_app_export(source, rows)
+    generate_crypto_com_app_raw_snapshots(source, output)
+    snapshots = pd.read_csv(output)
+    assert set(snapshots["Coin"]) == {"CRO"}
+    assert snapshots.iloc[0]["Quantity"] == 100
+    assert snapshots.iloc[1]["Quantity"] == 103
+    assert snapshots.iloc[-1]["Quantity"] == 94
+    assert snapshots.iloc[-1]["Principal Invested"] == 83
+
+
+@pytest.mark.parametrize(
+    ("kind", "amount"),
+    [
+        ("crypto_transfer", "0"),
+        ("crypto_transfer", "NaN"),
+        ("crypto_transfer", "Infinity"),
+        ("crypto_earn_program_created", "1"),
+        ("lockup_unlock", "-1"),
+        ("reimbursement_reverted", "1"),
+    ],
+)
+def test_crypto_com_app_rejects_invalid_historical_amounts(kind: str, amount: str) -> None:
+    with pytest.raises(ValueError, match="Crypto.com App amount"):
+        CryptoComAppTransactionNormalizer().normalize_row(
+            _crypto_com_app_row(kind, **{"Amount": amount})
+        )
+
+
+def test_crypto_com_app_multi_asset_dust_preserves_principal(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(raw_snapshots, "get_crypto_price", lambda **_: 1.0)
+    rows = [
+        _crypto_com_app_row("crypto_deposit", **{"Currency": coin, "Amount": "2"})
+        for coin in ("BTC", "ETH")
+    ]
+    rows.extend(
+        [
+            _crypto_com_app_row(
+                "dust_conversion_debited",
+                **{
+                    "Currency": coin,
+                    "Amount": "-2",
+                    "Timestamp (UTC)": "2026-01-02 10:00:00",
+                },
+            )
+            for coin in ("BTC", "ETH")
+        ]
+    )
+    rows.append(
+        _crypto_com_app_row(
+            "dust_conversion_credited",
+            **{
+                "Amount": "3",
+                "Timestamp (UTC)": "2026-01-02 10:00:01",
+            },
+        )
+    )
+    source, output = tmp_path / "dust.csv", tmp_path / "out.csv"
+    _write_crypto_com_app_export(source, rows)
+    generate_crypto_com_app_raw_snapshots(source, output)
+    latest = pd.read_csv(output).groupby("Coin").tail(1).set_index("Coin")
+    assert latest["Quantity"].to_dict() == {"BTC": 0, "CRO": 3, "ETH": 0}
+    assert latest["Principal Invested"].to_dict() == {"BTC": 0, "CRO": 4, "ETH": 0}
+
+
+@pytest.mark.parametrize("offset", [0, 3])
+def test_crypto_com_app_rejects_ambiguous_or_distant_dust(offset: int) -> None:
+    rows = [
+        _crypto_com_app_row("dust_conversion_credited"),
+        _crypto_com_app_row(
+            "dust_conversion_debited",
+            **{
+                "Amount": "-1",
+                "Date": pd.Timestamp("2026-01-01 10:00:00") + pd.Timedelta(seconds=offset),
+            },
+        ),
+    ]
+    if offset == 0:
+        rows.append(_crypto_com_app_row("dust_conversion_credited"))
+    with pytest.raises(ValueError, match="Unmatched Crypto.com App dust conversion"):
+        _build_dust_actions(
+            frame=pd.DataFrame(rows), normalizer=CryptoComAppTransactionNormalizer()
+        )
 
 
 def test_crypto_com_app_generator_keeps_entities_separate_and_pairs_dust(

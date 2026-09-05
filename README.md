@@ -97,3 +97,13 @@ Nonstandard debt-wrapper names must also use `position_type: "debt"`; standard `
 The method and scale are optional and default to `getRate` and `10^18`. Generated files remain
 separate per chain, using the chain name in transaction, snapshot, protocol, accounting, and
 dashboard paths.
+
+Crypto.com App snapshots include crypto held in Earn, staking, and Supercharger; transfers
+between these products and the app wallet do not change total holdings or principal. Rewards
+increase holdings without adding invested principal, and reward reversals undo only quantity.
+Fiat purchases add the received crypto; fiat sales, card top-ups, and outgoing peer transfers
+remove crypto without creating a fiat or recipient balance. Incoming and outgoing legacy
+`crypto_transfer` rows follow the sign of the exported amount.
+
+Dust conversions combine one credit with one or more debits sharing its description within
+one second. Missing or ambiguous matches and unknown transaction types stop ingestion.
