@@ -238,6 +238,17 @@ def test_crypto_com_app_dashboard_read_contract() -> None:
             },
             {
                 **base,
+                "Timestamp (UTC)": "2025-01-02 09:00:00",
+                "Transaction Kind": "crypto_earn_program_created",
+                "Amount": "-1",
+            },
+            {
+                **base,
+                "Timestamp (UTC)": "2025-01-03 09:00:00",
+                "Transaction Kind": "crypto_earn_program_withdrawn",
+            },
+            {
+                **base,
                 "Timestamp (UTC)": "2025-01-02 10:00:00",
                 "Transaction Description": "USDC > CRO",
                 "Transaction Kind": "crypto_exchange",

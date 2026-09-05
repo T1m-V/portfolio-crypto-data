@@ -9,7 +9,8 @@ from portfolio_core import active_context
 
 from portfolio_crypto_data.cex.crypto_com_app_snapshots import (
     APP_TIMESTAMP_FORMAT,
-    SKIPPED_KINDS,
+    INTERNAL_RECEIVE_KINDS,
+    INTERNAL_SEND_KINDS,
     _load_crypto_com_app_exports,
 )
 from portfolio_crypto_data.cex.dashboard_projection import (
@@ -52,7 +53,7 @@ def _parse_transaction_dates(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _filter_supported_activity(frame: pd.DataFrame) -> pd.DataFrame:
     kinds = frame["Transaction Kind"].fillna("").str.strip().str.lower()
-    return frame[~kinds.isin(SKIPPED_KINDS)]
+    return frame[~kinds.isin(INTERNAL_SEND_KINDS | INTERNAL_RECEIVE_KINDS)]
 
 
 def _filter_coins(frame: pd.DataFrame, coins: list[str] | None) -> pd.DataFrame:

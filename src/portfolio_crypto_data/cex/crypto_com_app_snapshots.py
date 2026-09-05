@@ -55,6 +55,12 @@ CRYPTO_COM_APP_EXPORT_SPEC = CexExportSpec(
 )
 
 REWARD_KINDS = {
+    "crypto_earn_interest_paid",
+    "finance.lockup.dpos_non_compound_interest.crypto_wallet",
+    "mco_stake_reward",
+    "referral_gift",
+    "reimbursement",
+    "supercharger_reward_to_app_credited",
     "finance.lockup.dpos_compound_interest.crypto_wallet",
     "referral_bonus",
     "referral_card_cashback",
@@ -62,18 +68,32 @@ REWARD_KINDS = {
     "transfer_cashback",
 }
 RECEIVE_KINDS = {
+    "admin_wallet_credited",
     "crypto_deposit",
     "exchange_to_crypto_transfer",
 }
 SEND_KINDS = {
+    "card_top_up",
+    "crypto_viban_exchange",
+    "transfer.p2p_transfer.crypto_wallet.crypto_wallet.debit",
     "crypto_to_exchange_transfer",
-    "crypto_transfer",
     "crypto_withdrawal",
 }
-SKIPPED_KINDS = {
+INTERNAL_SEND_KINDS = {
+    "crypto_earn_program_created",
+    "lockup_lock",
+    "lockup_upgrade",
+    "supercharger_deposit",
     "finance.lockup.dpos_lock.crypto_wallet",
     "finance.lockup.dpos_lock_upgrade.crypto_wallet",
 }
+INTERNAL_RECEIVE_KINDS = {
+    "crypto_earn_program_withdrawn",
+    "lockup_unlock",
+    "supercharger_withdrawal",
+}
+REVERSAL_KINDS = {"card_cashback_reverted", "reimbursement_reverted"}
+DUST_MATCH_WINDOW = pd.Timedelta(seconds=1)
 DUST_KINDS = {
     "dust_conversion_credited",
     "dust_conversion_debited",
@@ -82,9 +102,12 @@ SUPPORTED_APP_KINDS = {
     *REWARD_KINDS,
     *RECEIVE_KINDS,
     *SEND_KINDS,
-    *SKIPPED_KINDS,
+    *INTERNAL_SEND_KINDS,
+    *INTERNAL_RECEIVE_KINDS,
+    *REVERSAL_KINDS,
     *DUST_KINDS,
-    "card_cashback_reverted",
+    "crypto_transfer",
+    "viban_purchase",
     "crypto_exchange",
 }
 
@@ -102,10 +125,22 @@ class CryptoComAppTransactionNormalizer:
             return NormalizedAction(action="receive", ins=[self._positive_primary(row)])
         if kind in SEND_KINDS:
             return NormalizedAction(action="send", outs=[self._negative_primary(row)])
-        if kind in SKIPPED_KINDS:
+        if kind in INTERNAL_SEND_KINDS:
             self._negative_primary(row)
             return NormalizedAction(action="skip")
-        if kind == "card_cashback_reverted":
+        if kind in INTERNAL_RECEIVE_KINDS:
+            self._positive_primary(row)
+            return NormalizedAction(action="skip")
+        if kind == "crypto_transfer":
+            entry = self._entry(symbol=row.get("Currency"), amount=row.get("Amount"))
+            if entry.quantity > 0:
+                return NormalizedAction(action="receive", ins=[entry])
+            entry.quantity = entry.quantity.copy_abs()
+            return NormalizedAction(action="send", outs=[entry])
+        if kind == "viban_purchase":
+            self._negative_primary(row)
+            return NormalizedAction(action="receive", ins=[self._positive_to(row)])
+        if kind in REVERSAL_KINDS:
             entry = self._negative_primary(row)
             return NormalizedAction(
                 action="send",
@@ -126,16 +161,16 @@ class CryptoComAppTransactionNormalizer:
         self,
         *,
         credited: pd.Series,
-        debited: pd.Series,
+        debited: list[pd.Series],
     ) -> NormalizedAction:
         if self._kind(credited) != "dust_conversion_credited":
             raise ValueError("Invalid credited dust-conversion leg.")
-        if self._kind(debited) != "dust_conversion_debited":
+        if not debited or any(self._kind(row) != "dust_conversion_debited" for row in debited):
             raise ValueError("Invalid debited dust-conversion leg.")
         return NormalizedAction(
             action="swap",
             ins=[self._positive_primary(credited)],
-            outs=[self._negative_primary(debited)],
+            outs=[self._negative_primary(row) for row in debited],
         )
 
     @staticmethod
@@ -168,7 +203,7 @@ class CryptoComAppTransactionNormalizer:
         )
 
     @staticmethod
-    def _entry(*, symbol: object, amount: object, expected_sign: int) -> TxEntry:
+    def _entry(*, symbol: object, amount: object, expected_sign: int | None = None) -> TxEntry:
         token = sanitize_symbol(symbol)
         if not token:
             raise ValueError("Crypto.com App transaction is missing an asset symbol.")
@@ -179,12 +214,18 @@ class CryptoComAppTransactionNormalizer:
         except (InvalidOperation, ValueError) as exc:
             raise ValueError("Invalid Crypto.com App amount.") from exc
 
-        if quantity == 0 or (quantity > 0) != (expected_sign > 0):
-            direction = "positive" if expected_sign > 0 else "negative"
-            raise ValueError(
-                f"Expected a {direction} Crypto.com App amount for {token}."
+        if not quantity.is_finite():
+            raise ValueError("Invalid Crypto.com App amount.")
+        if quantity == 0 or (expected_sign is not None and (quantity > 0) != (expected_sign > 0)):
+            direction = (
+                "nonzero"
+                if expected_sign is None
+                else ("positive" if expected_sign > 0 else "negative")
             )
-        return TxEntry(token=token, quantity=quantity.copy_abs())
+            raise ValueError(f"Expected a {direction} Crypto.com App amount for {token}.")
+        return TxEntry(
+            token=token, quantity=quantity if expected_sign is None else quantity.copy_abs()
+        )
 
 
 def _load_crypto_com_app_exports(input_csv: Path) -> pd.DataFrame:
@@ -202,25 +243,32 @@ def _build_dust_actions(
     if dust.empty:
         return actions, consumed
 
-    group_columns = ["Date", "Transaction Description"]
-    for _, group in dust.groupby(group_columns, sort=False, dropna=False):
-        kinds = group["Transaction Kind"].str.lower()
-        credited = group[kinds == "dust_conversion_credited"]
-        debited = group[kinds == "dust_conversion_debited"]
-        if len(credited) != 1 or len(debited) != 1 or len(group) != 2:
+    # App exports may record a multi-asset conversion's debits one second
+    # apart from its single CRO credit. Require a unique matching credit.
+    kinds = dust["Transaction Kind"].str.lower()
+    credits = dust[kinds == "dust_conversion_credited"]
+    debits = dust[kinds == "dust_conversion_debited"]
+    matched: dict[int, list[int]] = {int(idx): [] for idx in credits.index}
+    for debit_idx, debit in debits.iterrows():
+        candidates = credits[
+            credits["Transaction Description"].eq(debit["Transaction Description"])
+            & credits["Date"].sub(debit["Date"]).abs().le(DUST_MATCH_WINDOW)
+        ]
+        if len(candidates) != 1:
             raise ValueError(
-                "Unmatched Crypto.com App dust conversion: "
-                f"credited legs={len(credited)}, debited legs={len(debited)}."
+                "Unmatched Crypto.com App dust conversion: expected one matching credit."
             )
+        matched[int(candidates.index[0])].append(int(debit_idx))
 
-        credited_idx = int(credited.index[0])
-        debited_idx = int(debited.index[0])
-        action_idx = min(credited_idx, debited_idx)
-        actions[action_idx] = normalizer.build_dust_action(
-            credited=credited.iloc[0],
-            debited=debited.iloc[0],
+    for credit_idx, debit_indices in matched.items():
+        if not debit_indices:
+            raise ValueError("Unmatched Crypto.com App dust conversion: credit has no debits.")
+        indices = {credit_idx, *debit_indices}
+        actions[min(indices)] = normalizer.build_dust_action(
+            credited=frame.loc[credit_idx],
+            debited=[frame.loc[idx] for idx in debit_indices],
         )
-        consumed.update({credited_idx, debited_idx})
+        consumed.update(indices)
     return actions, consumed
 
 
