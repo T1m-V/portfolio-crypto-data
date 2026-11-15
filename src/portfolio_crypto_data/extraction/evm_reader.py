@@ -130,6 +130,7 @@ def _fetch_explorer_data(
 def _fetch_cronos_table_data(
     endpoint_url: str,
     address: str,
+    start_ts: int = 0,
     timeout_seconds: int = 20,
     max_retries: int = 4,
 ) -> list[dict[str, Any]]:
@@ -178,6 +179,10 @@ def _fetch_cronos_table_data(
         if not isinstance(rows, list) or not rows:
             break
         all_rows.extend(rows)
+        if start_ts > 0:
+            timestamps = [_safe_timestamp(tx) for tx in rows if _safe_timestamp(tx) > 0]
+            if timestamps and min(timestamps) < start_ts:
+                break
         pag = data.get("pagination") or {}
         total_page = pag.get("totalPage", 1)
         if page >= total_page:
@@ -264,9 +269,9 @@ def get_all_transaction_hashes(
         if not base_url.endswith("/table"):
             base_url = f"{base_url}/table"
 
-        std_rows = _fetch_cronos_table_data(f"{base_url}/getTransactions", address)
-        tok_rows = _fetch_cronos_table_data(f"{base_url}/addressTransfers", address)
-        int_rows = _fetch_cronos_table_data(f"{base_url}/getInternalTransactions", address)
+        std_rows = _fetch_cronos_table_data(f"{base_url}/getTransactions", address, start_ts=start_ts)
+        tok_rows = _fetch_cronos_table_data(f"{base_url}/addressTransfers", address, start_ts=start_ts)
+        int_rows = _fetch_cronos_table_data(f"{base_url}/getInternalTransactions", address, start_ts=start_ts)
 
         hashes_std = set()
         for tx in std_rows:

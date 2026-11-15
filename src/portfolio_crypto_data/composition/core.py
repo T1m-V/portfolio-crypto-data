@@ -119,7 +119,7 @@ class CompositionContext:
     aave_wrapper_symbols: set[str] = field(default_factory=set)
     known_symbols: set[str] = field(default_factory=set)
     symbol_metadata: dict[str, SymbolMetadata] = field(default_factory=dict)
-    price_cache: dict[tuple[str, bool], pd.DataFrame] = field(default_factory=dict)
+    price_cache: dict[str, pd.DataFrame] = field(default_factory=dict)
     currency_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def route_for(self, symbol: str) -> ValuationRoute:
@@ -503,6 +503,18 @@ class PriceResolver:
             return self._empty_resolution(symbol=normalized)
 
         route = self.ctx.route_for(normalized)
+        current_visited = visited or set()
+        if normalized in current_visited:
+            return self._empty_resolution(symbol=normalized, route=route)
+
+        if route == ValuationRoute.PROTOCOL_DERIVED:
+            return self._resolve_from_protocol(
+                symbol=normalized,
+                target_date=target_date,
+                visited=current_visited,
+                depth=depth,
+            )
+
         resolution = self._resolve_direct_candidates(
             symbol=normalized,
             route=route,
@@ -510,16 +522,6 @@ class PriceResolver:
         )
         if resolution.price is not None:
             return resolution
-
-        if route == ValuationRoute.PROTOCOL_DERIVED:
-            protocol_resolution = self._resolve_from_protocol(
-                symbol=normalized,
-                target_date=target_date,
-                visited=visited or set(),
-                depth=depth,
-            )
-            if protocol_resolution.price is not None:
-                return protocol_resolution
 
         metadata = self.ctx.symbol_metadata.get(normalized)
         metadata_candidates: list[str] = []
@@ -529,28 +531,21 @@ class PriceResolver:
             if metadata.family not in {normalized, metadata.price_source}:
                 metadata_candidates.append(metadata.family)
 
+        next_visited = current_visited | {normalized}
         for candidate in metadata_candidates:
-            price = self._price_from_history(
+            resolved = self.resolve(
                 symbol=candidate,
                 target_date=target_date,
-                use_lp_prices=False,
+                visited=next_visited,
+                depth=depth + 1,
             )
-            if price is not None:
+            if resolved.price is not None:
                 return PriceResolution(
                     route=route,
-                    price_symbol=candidate,
-                    price=price,
+                    price_symbol=resolved.price_symbol,
+                    price=resolved.price,
                     currency=self.currency,
                 )
-
-        protocol_resolution = self._resolve_from_protocol(
-            symbol=normalized,
-            target_date=target_date,
-            visited=visited or set(),
-            depth=depth,
-        )
-        if protocol_resolution.price is not None:
-            return protocol_resolution
 
         return self._empty_resolution(symbol=normalized, route=route)
 
@@ -591,7 +586,6 @@ class PriceResolver:
             price = self._price_from_history(
                 symbol=candidate,
                 target_date=target_date,
-                use_lp_prices=candidate in self.ctx.protocol_derived_symbols,
             )
             if price is not None:
                 return PriceResolution(
@@ -619,6 +613,10 @@ class PriceResolver:
             symbol=symbol,
             target_date=target_date,
         )
+        if row is None and self.fallback_to_oldest:
+            frame = self.ctx.protocol_rows.get(sanitize_symbol(symbol))
+            if frame is not None and not frame.empty:
+                row = frame.iloc[0]
         if row is None:
             return self._empty_resolution(symbol=symbol, route=ValuationRoute.PROTOCOL_DERIVED)
 
@@ -679,15 +677,12 @@ class PriceResolver:
         *,
         symbol: str,
         target_date: object,
-        use_lp_prices: bool,
     ) -> Decimal | None:
         if self.mode == "eur":
             return get_price_eur_on_or_before(
                 symbol=symbol,
                 as_of_date=target_date,
                 prices_folder=self.prices_folder,
-                chain=self.ctx.chain,
-                use_lp_prices=use_lp_prices,
                 currency_metadata=self.ctx.currency_metadata,
                 fallback_to_oldest=self.fallback_to_oldest,
             )
@@ -696,7 +691,7 @@ class PriceResolver:
         if stable_price is not None:
             return stable_price
 
-        history = self._load_native_history(symbol=symbol, use_lp_prices=use_lp_prices)
+        history = self._load_native_history(symbol=symbol)
         if history.empty:
             return None
 
@@ -706,26 +701,21 @@ class PriceResolver:
             return None
         return Decimal(str(eligible.iloc[-1]["Price"]))
 
-    def _load_native_history(self, *, symbol: str, use_lp_prices: bool) -> pd.DataFrame:
-        cache_key = (symbol, use_lp_prices)
-        if cache_key in self.ctx.price_cache:
-            return self.ctx.price_cache[cache_key]
+    def _load_native_history(self, *, symbol: str) -> pd.DataFrame:
+        if symbol in self.ctx.price_cache:
+            return self.ctx.price_cache[symbol]
 
-        file_path = (
-            self.prices_folder / "lp_prices" / self.ctx.chain / f"{symbol}.csv"
-            if use_lp_prices
-            else self.prices_folder / f"{symbol}.csv"
-        )
+        file_path = self.prices_folder / f"{symbol}.csv"
         frame = load_price_csv(file_path=file_path)
         if frame.empty:
-            self.ctx.price_cache[cache_key] = frame
+            self.ctx.price_cache[symbol] = frame
             return frame
 
         frame = frame.copy()
         frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce").dt.date
         frame["Price"] = pd.to_numeric(frame["Price"], errors="coerce")
         frame = frame.dropna(subset=["Date", "Price"])[["Date", "Price"]].sort_values("Date")
-        self.ctx.price_cache[cache_key] = frame
+        self.ctx.price_cache[symbol] = frame
         return frame
 
 

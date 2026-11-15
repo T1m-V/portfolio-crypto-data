@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -152,7 +153,7 @@ def _nexo_row(kind: str, **overrides: object) -> pd.Series:
         ("Withdrawal", {"Input Amount": "-2"}, "send"),
         ("Loan Withdrawal", {"Input Amount": "-2"}, "send"),
         ("Nexo Card Transaction Fee", {"Input Amount": "-2"}, "send"),
-        ("Deposit Over Repayment", {}, "send"),
+        ("Deposit Over Repayment", {}, "skip"),
         ("Exchange To Withdraw", {}, "send"),
         ("Transfer Out", {}, "skip"),
         ("Locking Term Deposit", {}, "skip"),
@@ -188,7 +189,8 @@ def test_nexo_special_accounting_rules() -> None:
     assert rejected.action == "skip"
 
 
-def test_manual_repayment_pair_becomes_one_swap() -> None:
+def test_manual_repayment_pair_becomes_one_swap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(raw_snapshots, "get_crypto_price", lambda **_: 0.9)
     frame = pd.DataFrame(
         [
             _nexo_row(
@@ -218,7 +220,7 @@ def test_manual_repayment_pair_becomes_one_swap() -> None:
     action = actions[2]
     assert [(entry.token, entry.quantity) for entry in action.ins] == [("USD", Decimal("100"))]
     assert [(entry.token, entry.quantity) for entry in action.outs] == [("BTC", Decimal("1"))]
-    assert action.principal_overrides == {"USD": 100.0, "BTC": -100.0}
+    assert action.principal_overrides == {"USD": 90.0, "BTC": -90.0}
 
 
 def test_nexo_generator_combines_exports_and_overwrites_same_day(
@@ -237,6 +239,10 @@ def test_nexo_generator_combines_exports_and_overwrites_same_day(
                 }
             ]
         ).drop(columns=["Date"]).to_csv(tmp_path / file_name, index=False)
+    (tmp_path / "nexo_debt_reconciliation.json").write_text(
+        json.dumps({"checkpoints": [{"at_utc": "2026-01-01T11:00:00Z", "target_usd": "10"}]}),
+        encoding="utf-8",
+    )
 
     output = tmp_path / "out" / "snapshots.csv"
     output.parent.mkdir()
@@ -246,6 +252,7 @@ def test_nexo_generator_combines_exports_and_overwrites_same_day(
     nexo = frame[frame["Coin"] == "NEXO"]
     assert len(nexo) == 1
     assert (nexo.iloc[0]["Quantity"], nexo.iloc[0]["Principal Invested"]) == (3.0, 1.5)
+    assert frame.loc[frame["Coin"] == "USD", "Quantity"].iloc[-1] == 10.0
     assert frame["Date"].tolist() == sorted(frame["Date"].tolist())
 
 
@@ -645,4 +652,190 @@ def test_compound_v2_supply_tokens_resolve_dynamic_underlying_ratio(
     assert ledger.resolve_underlying_ratio("tCDCETH") == pytest.approx(0.102)
     # 5.0 tCDCETH * 0.102 * 2000 EUR = 1020 EUR removed -> remaining principal = 980 EUR
     assert ledger.assets["tCDCETH"].principal == pytest.approx(980.0)
+
+
+def test_raw_snapshots_value_protocol_derived_assets_from_underlying_prices() -> None:
+    from portfolio_core import active_context
+
+    from portfolio_crypto_data.shared.prices import clear_price_cache
+
+    paths = active_context().paths
+    (paths.tokens / "cronos_tokens.json").write_text(
+        json.dumps(
+            {
+                "native": {"symbol": "CRO", "decimals": 18},
+                "0xcdceth": {
+                    "symbol": "CDCETH",
+                    "decimals": 18,
+                    "family": "ETH",
+                    "underlying_symbol": "ETH",
+                    "protocol": "liquid_staking",
+                },
+                "0xtcdceth": {
+                    "symbol": "tCDCETH",
+                    "decimals": 8,
+                    "family": "CDCETH",
+                    "price_source": "CDCETH",
+                    "protocol": "aave",
+                    "position_type": "supply",
+                    "contract_style": "compound_v2",
+                    "underlying_symbol": "CDCETH",
+                    "underlying_decimals": 18,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ls_dir = paths.protocol_underlying_tokens / "liquid_staking"
+    ls_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {"date": "2026-01-01 00:00:00", "asset_ETH": 1.1},
+            {"date": "2026-01-02 00:00:00", "asset_ETH": 1.2},
+        ]
+    ).to_csv(ls_dir / "cronos_CDCETH.csv", index=False)
+    aave_dir = paths.protocol_underlying_tokens / "aave"
+    aave_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {"date": "2026-01-01 00:00:00", "supply_CDCETH": 1.0, "net_CDCETH": 1.0},
+            {"date": "2026-01-02 00:00:00", "supply_CDCETH": 1.05, "net_CDCETH": 1.05},
+        ]
+    ).to_csv(aave_dir / "cronos_aave_daily_exposure.csv", index=False)
+
+    pd.DataFrame(
+        [
+            {"Date": "2026-01-01", "Price": 2000.0},
+            {"Date": "2026-01-02", "Price": 2500.0},
+        ]
+    ).to_csv(paths.prices / "ETH.csv", index=False)
+    pd.DataFrame([{"Date": "2026-01-01", "Price": 0.9}]).to_csv(
+        paths.prices / "USD_EUR.csv", index=False
+    )
+    # Any stale direct file must not override protocol-derived valuation.
+    pd.DataFrame([{"Date": "2026-01-01", "Price": 9999.0}]).to_csv(
+        paths.prices / "CDCETH.csv", index=False
+    )
+    clear_price_cache()
+
+    tx_csv = paths.crypto_transactions / "cronos_transactions.csv"
+    pd.DataFrame(
+        [
+            {
+                "TX Hash": "0x1",
+                "Date": "01/01/2026 10:00:00",
+                "Qty in": "1.0",
+                "Token in": "CDCETH",
+                "Qty out": "",
+                "Token out": "",
+                "Type": "Receive",
+                "Fee": "0",
+                "Fee Token": "",
+            },
+            {
+                "TX Hash": "0x2",
+                "Date": "02/01/2026 10:00:00",
+                "Qty in": "10.0",
+                "Token in": "tCDCETH",
+                "Qty out": "1.0",
+                "Token out": "CDCETH",
+                "Type": "Swap",
+                "Fee": "0",
+                "Fee Token": "",
+            },
+        ]
+    ).to_csv(tx_csv, index=False)
+
+    out_csv = paths.crypto_snapshots / "cronos_raw_snapshots.csv"
+    events_csv = paths.accounting / "cronos" / "principal_events.csv"
+    daily_csv = paths.accounting / "cronos" / "principal_daily.csv"
+    raw_snapshots.generate_raw_snapshots(
+        input_csv=tx_csv,
+        output_csv=out_csv,
+        chain="cronos",
+        principal_events_csv=events_csv,
+        principal_daily_csv=daily_csv,
+    )
+
+    events = pd.read_csv(events_csv)
+    # 01/01 receive 1.0 CDCETH = 1.1 * 2000 * 0.9 = 1980.0 EUR
+    assert events.loc[events["TX Hash"] == "0x1", "PrincipalDeltaEUR"].iloc[0] == pytest.approx(
+        1980.0
+    )
+    # 02/01 swap 1.0 CDCETH -> 10.0 tCDCETH = 1.2 * 2500 * 0.9 = 2700.0 EUR
+    swap_in = events.loc[(events["TX Hash"] == "0x2") & (events["Action"] == "swap_in")]
+    assert swap_in["PrincipalDeltaEUR"].iloc[0] == pytest.approx(2700.0)
+
+
+def test_single_token_unpriced_intermediate_swap_infers_without_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prices_by_coin: dict[str, float] = {
+        "LP_IN": 100.0,
+        "USDT": 1.0,
+        "USDC": 1.0,
+        "ETH": 2000.0,
+    }
+    monkeypatch.setattr(
+        raw_snapshots,
+        "get_crypto_price",
+        lambda *, coin, **_: prices_by_coin.get(coin),
+    )
+    ledger = PortfolioLedger(chain="arbitrum", token_metadata={})
+    applier = TransactionApplier(ledger=ledger)
+
+    # 1-to-1 into unpriced intermediate token, then 1-to-2 out into priced tokens
+    applier.process_transaction(
+        _chain_row(
+            "Swap",
+            TX_Hash="0x1",
+            **{"Qty in": "4", "Token in": "UNK-0x10", "Qty out": "2", "Token out": "LP_IN"},
+        )
+    )
+    applier.process_transaction(
+        _chain_row(
+            "Swap",
+            TX_Hash="0x2",
+            **{
+                "Qty in": "100, 100",
+                "Token in": "USDT, USDC",
+                "Qty out": "4",
+                "Token out": "UNK-0x10",
+            },
+        )
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert ledger.unresolved_prices == []
+    assert ledger.assets["LP_IN"].principal == pytest.approx(-200.0)
+    assert ledger.assets["UNK-0x10"].quantity == Decimal("0")
+    assert ledger.assets["UNK-0x10"].principal == pytest.approx(0.0)
+    assert ledger.assets["USDT"].principal == pytest.approx(100.0)
+    assert ledger.assets["USDC"].principal == pytest.approx(100.0)
+
+    # Both legs unpriced must still warn and record unresolved prices
+    applier.process_transaction(
+        _chain_row(
+            "Swap",
+            **{"Qty in": "1", "Token in": "UNK-A", "Qty out": "1", "Token out": "UNK-B"},
+        )
+    )
+    # Multi-token leg with an unpriced entry alongside a priced entry must still warn
+    applier.process_transaction(
+        _chain_row(
+            "Swap",
+            **{
+                "Qty in": "1, 10",
+                "Token in": "UNK-C, USDT",
+                "Qty out": "1",
+                "Token out": "ETH",
+            },
+        )
+    )
+    captured = capsys.readouterr()
+    assert "Warning: No data for UNK-A. Price is unresolved." in captured.out
+    assert "Warning: No data for UNK-B. Price is unresolved." in captured.out
+    assert "Warning: No data for UNK-C. Price is unresolved." in captured.out
+    assert [event.coin for event in ledger.unresolved_prices] == ["UNK-A", "UNK-B", "UNK-C"]
 

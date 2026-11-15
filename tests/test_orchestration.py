@@ -55,3 +55,46 @@ def test_build_snapshots_fails_fast_when_direct_token_lacks_price(
         match="Missing EUR price for direct token 'MAGIC' on 2025-10-06",
     ):
         update._build_snapshots(config=config)
+
+
+def test_update_chain_rebuilds_snapshots_after_refreshing_protocols(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    config = _chain_config("cronos", native_symbol="CRO", protocols=("liquid_staking",))
+
+    async def fake_retrieve(*, config: EvmChainConfig) -> None:
+        calls.append(f"tx:{config.chain}")
+
+    monkeypatch.setattr(update, "retrieve_transactions", fake_retrieve)
+    monkeypatch.setattr(
+        update, "_build_snapshots", lambda *, config: calls.append(f"snap:{config.chain}")
+    )
+    monkeypatch.setattr(
+        update, "sync_block_map", lambda *, chain, config: calls.append(f"bmap:{chain}")
+    )
+    monkeypatch.setattr(
+        update, "_refresh_protocols", lambda *, config, logger: calls.append(f"prot:{config.chain}")
+    )
+    monkeypatch.setattr(
+        update,
+        "build_accounting_artifacts",
+        lambda *, chain, **_: calls.append(f"acct:{chain}"),
+    )
+    monkeypatch.setattr(
+        update,
+        "build_chain_dashboard_artifacts",
+        lambda *, chain: calls.append(f"dash:{chain}"),
+    )
+
+    update._update_chain(config=config, logger=update.PipelineLogger())
+
+    assert calls == [
+        "tx:cronos",
+        "snap:cronos",
+        "bmap:cronos",
+        "prot:cronos",
+        "snap:cronos",
+        "acct:cronos",
+        "dash:cronos",
+    ]

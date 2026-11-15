@@ -12,7 +12,6 @@ from portfolio_crypto_data.accounting import (
     validate_direct_snapshot_prices,
 )
 from portfolio_crypto_data.chain_config import EvmChainConfig, load_evm_chain_configs
-from portfolio_crypto_data.composition.lp_pricing import generate_protocol_lp_price_files
 from portfolio_crypto_data.dashboard_artifacts import build_chain_dashboard_artifacts
 from portfolio_crypto_data.extraction.evm_reader import retrieve_transactions
 from portfolio_crypto_data.pipeline_logging import PipelineLogger
@@ -121,12 +120,12 @@ def _update_chain(*, config: EvmChainConfig, logger: PipelineLogger) -> None:
         _refresh_protocols(config=config, logger=logger)
         logger.stage_end(f"{chain}:protocols")
 
-        logger.stage_start(f"{chain}:lp_prices")
-        generate_protocol_lp_price_files(chain=chain, context=active_context())
-        logger.stage_end(f"{chain}:lp_prices")
+        logger.stage_start(f"{chain}:snapshots_rebuild")
+        _build_snapshots(config=config)
+        logger.stage_end(f"{chain}:snapshots_rebuild")
 
     logger.stage_start(f"{chain}:accounting")
-    build_accounting_artifacts(chain=chain, as_of_date=date.today())
+    build_accounting_artifacts(chain=chain, as_of_date=date.today(), incremental=True)
     logger.stage_end(f"{chain}:accounting")
 
     logger.stage_start(f"{chain}:dashboard")

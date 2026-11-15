@@ -8,6 +8,7 @@ PRICE_SYMBOL_ALIASES: dict[str, str] = {
     "tBTC": "BTC",
     "renBTC": "BTC",
     "CDCBTC": "BTC",
+    "MATIC": "POL",
 }
 
 

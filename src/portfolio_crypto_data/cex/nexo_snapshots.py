@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from portfolio_crypto_data import raw_snapshots
 from portfolio_crypto_data.cex.actions import (
     NormalizedAction,
     RewardInstruction,
@@ -26,6 +28,7 @@ from portfolio_crypto_data.symbols import sanitize_symbol
 INTEREST_TYPES = {"interest", "fixed term interest", "interest additional"}
 SKIPPED_TYPES = {
     "credit card withdrawal credit",
+    "deposit over repayment",
     "deposit to exchange",
     "exchange credit",
     "exchange liquidation",
@@ -54,6 +57,7 @@ MANUAL_REPAYMENT_USD_TOLERANCE = Decimal("0.05")
 MANUAL_REPAYMENT_USD_TOLERANCE_BY_TOKEN = {
     "USDC": Decimal("0.60"),
 }
+NEXO_RECONCILIATION_FILENAME = "nexo_debt_reconciliation.json"
 ActionHandler = Callable[[pd.Series], "NormalizedAction"]
 NEXO_EXPORT_SPEC = CexExportSpec(
     provider_name="NEXO",
@@ -188,7 +192,6 @@ class NexoTransactionNormalizer:
             "nexo card transaction fee": self._handle_standard_withdrawal,
             "loan withdrawal": self._handle_standard_withdrawal,
             "withdrawal": self._handle_standard_withdrawal,
-            "deposit over repayment": self._handle_deposit_over_repayment,
             "cashback": self._handle_cashback,
             "exchange cashback": self._handle_free_input_reward,
         }
@@ -256,9 +259,6 @@ class NexoTransactionNormalizer:
 
     def _handle_standard_withdrawal(self, row: pd.Series) -> NormalizedAction:
         return self._build_send_action(outs=self._normalize_withdrawal_outs(row=row))
-
-    def _handle_deposit_over_repayment(self, row: pd.Series) -> NormalizedAction:
-        return self._build_send_action(outs=self._positive_input_entries(row=row))
 
     def _handle_cashback(self, row: pd.Series) -> NormalizedAction:
         return self._build_reward_action(
@@ -373,9 +373,9 @@ class NexoTransactionNormalizer:
 
         This models refunds as debt reduction in the card debt bucket rather than EUR holdings.
         """
-        quantity = self._parse_usd_equivalent(value=row.get("USD Equivalent"))
+        quantity = self._infer_refund_quantity_from_stable_leg(row=row)
         if quantity <= 0:
-            quantity = self._infer_refund_quantity_from_stable_leg(row=row)
+            quantity = self._parse_usd_equivalent(value=row.get("USD Equivalent"))
         if quantity <= 0:
             return None
 
@@ -450,9 +450,9 @@ class NexoTransactionNormalizer:
         return [TxEntry(token=output_symbol, quantity=output_amount)]
 
     def _normalize_card_cashback_reversal_outs(self, row: pd.Series) -> list[TxEntry]:
-        quantity = self._parse_usd_equivalent(value=row.get("USD Equivalent"))
+        quantity = self._infer_refund_quantity_from_stable_leg(row=row)
         if quantity <= 0:
-            quantity = self._infer_refund_quantity_from_stable_leg(row=row)
+            quantity = self._parse_usd_equivalent(value=row.get("USD Equivalent"))
         if quantity <= 0:
             return []
 
@@ -955,15 +955,43 @@ def _build_manual_repayment_actions(
 
     pair_actions_by_row_idx: dict[int, NormalizedAction] = {}
     for pair in pairs:
-        principal_value = round(float(pair.manual_repayment.entry.quantity), 2)
+        source = pair.manual_sell.entry
+        destination = pair.manual_repayment.entry
+        if source.token == destination.token and source.quantity == destination.quantity:
+            pair_actions_by_row_idx[pair.manual_repayment.idx] = NormalizedAction(action="skip")
+            continue
+
+        usd_eur = raw_snapshots.get_crypto_price(
+            coin=NexoTransactionNormalizer.CANONICAL_DEBT_TOKEN,
+            date=pair.manual_repayment.date.strftime("%Y-%m-%d"),
+            chain="nexo",
+        )
+        if usd_eur is None:
+            raise ValueError(
+                "Cannot value NEXO manual repayment principal without a USD/EUR rate "
+                f"for {pair.manual_repayment.date:%Y-%m-%d}."
+            )
+
+        if source.token == destination.token:
+            net_quantity = destination.quantity - source.quantity
+            entry = TxEntry(token=destination.token, quantity=net_quantity.copy_abs())
+            pair_actions_by_row_idx[pair.manual_repayment.idx] = NormalizedAction(
+                action="receive" if net_quantity > 0 else "send",
+                ins=[entry] if net_quantity > 0 else [],
+                outs=[entry] if net_quantity < 0 else [],
+                principal_overrides={destination.token: round(float(net_quantity) * usd_eur, 2)},
+            )
+            continue
+
+        principal_value = round(float(destination.quantity) * usd_eur, 2)
         pair_actions_by_row_idx[pair.manual_repayment.idx] = NormalizedAction(
             action="swap",
-            ins=[pair.manual_repayment.entry],
-            outs=[pair.manual_sell.entry],
+            ins=[destination],
+            outs=[source],
             rewards=[],
             principal_overrides={
-                pair.manual_repayment.entry.token: principal_value,
-                pair.manual_sell.entry.token: -principal_value,
+                destination.token: principal_value,
+                source.token: -principal_value,
             },
         )
 
@@ -974,7 +1002,31 @@ def _load_nexo_transaction_exports(input_csv: Path) -> pd.DataFrame:
     return load_cex_exports(input_csv=input_csv, spec=NEXO_EXPORT_SPEC)
 
 
-def generate_nexo_raw_snapshots(input_csv: Path, output_csv: Path) -> None:
+def _load_reconciliation_checkpoints(
+    reconciliation_path: Path | None,
+) -> dict[pd.Timestamp, Decimal]:
+    if reconciliation_path is None or not reconciliation_path.exists():
+        return {}
+    data = json.loads(reconciliation_path.read_text(encoding="utf-8"))
+    checkpoints: dict[pd.Timestamp, Decimal] = {}
+    for cp in data.get("checkpoints", []):
+        ts = pd.Timestamp(cp["at_utc"])
+        if ts.tzinfo is not None:
+            ts = ts.tz_localize(None)
+        checkpoints[ts] = Decimal(str(cp["target_usd"]))
+    return checkpoints
+
+
+def generate_nexo_raw_snapshots(
+    input_csv: Path,
+    output_csv: Path,
+    *,
+    reconciliation_path: Path | None = None,
+) -> None:
+    if reconciliation_path is None and input_csv.is_dir():
+        reconciliation_path = input_csv / NEXO_RECONCILIATION_FILENAME
+    checkpoints = _load_reconciliation_checkpoints(reconciliation_path)
+
     frame = _load_nexo_transaction_exports(input_csv=input_csv)
     frame = prepare_cex_dates(
         frame=frame,
@@ -992,18 +1044,24 @@ def generate_nexo_raw_snapshots(input_csv: Path, output_csv: Path) -> None:
     ledger = PortfolioLedger(chain="nexo", token_metadata={})
     applier = TransactionApplier(ledger=ledger)
 
-    for idx, row in frame.iterrows():
-        date = row["Date"]
-        action = pair_actions_by_row_idx.get(idx) or normalizer.normalize_row(row=row)
-        touched_coins = apply_normalized_action(
-            ledger=ledger,
-            applier=applier,
-            action=action,
-            date=date,
-        )
+    for date, same_time_rows in frame.groupby("Date", sort=False):
+        for idx, row in same_time_rows.iterrows():
+            action = pair_actions_by_row_idx.get(int(idx)) or normalizer.normalize_row(row=row)
+            touched_coins = apply_normalized_action(
+                ledger=ledger,
+                applier=applier,
+                action=action,
+                date=date,
+            )
 
-        if touched_coins:
-            ledger.update_snapshots(touched_coins=touched_coins, date_value=date)
+            if touched_coins:
+                ledger.update_snapshots(touched_coins=touched_coins, date_value=date)
+
+        target_usd = checkpoints.get(pd.Timestamp(date))
+        if target_usd is not None:
+            usd_asset = ledger.fetch_asset(NexoTransactionNormalizer.CANONICAL_DEBT_TOKEN)
+            usd_asset.quantity = target_usd
+            ledger.update_snapshots(touched_coins={usd_asset.coin}, date_value=date)
 
     save_cex_snapshot_history(history=ledger.history, output_csv=output_csv)
     print(f"Portfolio snapshots successfully saved to {output_csv}")

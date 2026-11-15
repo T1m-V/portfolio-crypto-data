@@ -302,3 +302,41 @@ def test_dashboard_debt_is_negative_exposure() -> None:
         -200.0,
         0.0,
     ]
+
+
+def test_incremental_accounting_matches_full_rebuild() -> None:
+    _write_workspace(
+        metadata={"btc": {"symbol": "BTC"}},
+        snapshots=[
+            {"Date": "2025-01-01", "Coin": "BTC", "Quantity": 1, "Principal Invested": 0},
+            {"Date": "2025-01-03", "Coin": "BTC", "Quantity": 2, "Principal Invested": 0},
+        ],
+        principal=[
+            {"Date": "2025-01-01", "Coin": "BTC", "PrincipalInvestedEUR": 40_000},
+            {"Date": "2025-01-03", "Coin": "BTC", "PrincipalInvestedEUR": 90_000},
+        ],
+    )
+    _price("BTC", 40_000, "2025-01-01")
+    pd.DataFrame(
+        [
+            {"Date": "2025-01-01", "Price": 40_000},
+            {"Date": "2025-01-02", "Price": 42_000},
+            {"Date": "2025-01-03", "Price": 45_000},
+        ]
+    ).to_csv(active_context().paths.prices / "BTC.csv", index=False)
+
+    accounting.build_accounting_artifacts(chain=CHAIN, as_of_date="2025-01-02")
+    incremental = accounting.build_accounting_artifacts(
+        chain=CHAIN,
+        as_of_date="2025-01-03",
+        incremental=True,
+    )
+    inc_source = pd.read_csv(incremental.paths.source_base_daily)
+    inc_base = pd.read_csv(incremental.paths.base_daily)
+
+    full = accounting.build_accounting_artifacts(chain=CHAIN, as_of_date="2025-01-03")
+    full_source = pd.read_csv(full.paths.source_base_daily)
+    full_base = pd.read_csv(full.paths.base_daily)
+
+    pd.testing.assert_frame_equal(inc_source, full_source)
+    pd.testing.assert_frame_equal(inc_base, full_base)

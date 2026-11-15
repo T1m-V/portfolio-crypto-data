@@ -1,11 +1,12 @@
 import functools
+import json
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from portfolio_core import active_context, get_forex_rate
+from portfolio_core import active_context
 
 STABLE_PRICE_SYMBOLS: dict[str, Decimal] = {
     "EUR": Decimal("1"),
@@ -14,6 +15,7 @@ STABLE_PRICE_SYMBOLS: dict[str, Decimal] = {
     "USDC": Decimal("1"),
     "DAI": Decimal("1"),
     "USDT": Decimal("1"),
+    "BUSD": Decimal("1"),
     "USDX": Decimal("1"),
     "xUSD": Decimal("1"),
 }
@@ -24,6 +26,7 @@ PRICE_CURRENCY_OVERRIDES: dict[str, str] = {
     "USDC": "USD",
     "USDT": "USD",
     "DAI": "USD",
+    "BUSD": "USD",
     "USDX": "USD",
     "xUSD": "USD",
 }
@@ -64,24 +67,26 @@ def _load_price_history_cached(
     return df[["Date", "Price"]]
 
 
+@functools.lru_cache(maxsize=None)
+def _load_currency_metadata_cached(file_path: str) -> dict[str, dict[str, Any]]:
+    resolved_path = Path(file_path)
+    if not resolved_path.exists():
+        return {}
+    return json.loads(resolved_path.read_text(encoding="utf-8"))
+
+
 def _resolve_price_file_path(
     *,
     symbol: str,
     prices_folder: Path | None,
-    chain: str | None,
-    use_lp_prices: bool,
 ) -> Path:
-    if use_lp_prices and not chain:
-        raise ValueError("LP price lookup requires `chain` from context.")
-
     root = prices_folder or active_context().paths.prices
-    if use_lp_prices:
-        return root / "lp_prices" / str(chain) / f"{symbol}.csv"
     return root / f"{symbol}.csv"
 
 
 def clear_price_cache() -> None:
     _load_price_history_cached.cache_clear()
+    _load_currency_metadata_cached.cache_clear()
 
 
 def get_price_on_or_before(
@@ -89,15 +94,11 @@ def get_price_on_or_before(
     symbol: str,
     as_of_date: str | pd.Timestamp | date,
     prices_folder: Path | None = None,
-    chain: str | None = None,
-    use_lp_prices: bool = False,
     fallback_to_oldest: bool = False,
 ) -> Decimal | None:
     file_path = _resolve_price_file_path(
         symbol=symbol,
         prices_folder=prices_folder,
-        chain=chain,
-        use_lp_prices=use_lp_prices,
     )
     history = _load_price_history_cached(
         symbol=symbol,
@@ -120,8 +121,6 @@ def get_price_eur_on_or_before(
     symbol: str,
     as_of_date: str | pd.Timestamp | date,
     prices_folder: Path | None = None,
-    chain: str | None = None,
-    use_lp_prices: bool = False,
     currency_metadata: dict[str, dict[str, Any]] | None = None,
     fallback_to_oldest: bool = False,
 ) -> Decimal | None:
@@ -129,8 +128,6 @@ def get_price_eur_on_or_before(
         symbol=symbol,
         as_of_date=as_of_date,
         prices_folder=prices_folder,
-        chain=chain,
-        use_lp_prices=use_lp_prices,
         fallback_to_oldest=fallback_to_oldest,
     )
     if price is None:
@@ -138,18 +135,25 @@ def get_price_eur_on_or_before(
 
     context = active_context()
     resolved_prices_folder = prices_folder or context.paths.prices
-    metadata = currency_metadata if currency_metadata is not None else context.currency_metadata()
+    metadata = (
+        currency_metadata
+        if currency_metadata is not None
+        else _load_currency_metadata_cached(str(context.paths.currency_metadata))
+    )
     currency = PRICE_CURRENCY_OVERRIDES.get(
         symbol,
         str(metadata.get(symbol, {}).get("currency", "USD")),
     )
-    fx_rate = Decimal(
-        str(
-            get_forex_rate(
-                currency=currency,
-                date=str(_normalize_date(as_of_date)),
-                prices_folder=resolved_prices_folder,
-            )
-        )
+    if currency == "EUR":
+        return price
+
+    fx_rate = get_price_on_or_before(
+        symbol=f"{currency}_EUR",
+        as_of_date=as_of_date,
+        prices_folder=resolved_prices_folder,
+        fallback_to_oldest=True,
     )
+    if fx_rate is None:
+        fx_path = resolved_prices_folder / f"{currency}_EUR.csv"
+        raise FileNotFoundError(f"No forex data for {currency}: {fx_path}")
     return price * fx_rate

@@ -25,10 +25,17 @@ def _refresh_cex_exports(
     output_path: Path,
     generator: Callable[[Path, Path], None],
 ) -> None:
-    if input_path.exists() and any(input_path.glob("*.csv")):
-        generator(input_path, output_path)
-    else:
+    csv_files = list(input_path.glob("*.csv")) if input_path.exists() else []
+    if not csv_files:
         print(f"Skipping {label} refresh; no CSV exports found in {input_path}")
+        return
+    input_files = [*csv_files, *input_path.glob("*.json")]
+    if output_path.exists() and output_path.stat().st_mtime >= max(
+        path.stat().st_mtime for path in input_files
+    ):
+        print(f"Skipping {label} refresh; {output_path.name} is up to date")
+        return
+    generator(input_path, output_path)
 
 
 def _refresh_nexo(*, context: PortfolioContext) -> None:

@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 from portfolio_core import active_context, atomic_write_csv
 
+from portfolio_crypto_data.composition.core import PriceResolver
 from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
     parse_transaction_datetime_series,
@@ -43,64 +44,66 @@ class UnresolvedPriceEvent:
 def get_crypto_price(
     coin: str,
     date: str,
-    chain: str,
-    use_lp_prices: bool = False,
+    chain: str = "",
+    *,
+    price_resolver: PriceResolver | None = None,
+    warn_unresolved: bool = True,
 ) -> float | None:
     """Retrieves exchange rate of a specific coin on a date.
 
     args:
         coin: The coin you want the price for.
         date: On which date you want the price.
-        chain: Chain identifier used for LP price lookup.
-        use_lp_prices: Whether protocol-derived LP prices should be checked first.
+        chain: Chain identifier.
+        price_resolver: Optional shared resolver for protocol-derived and direct prices.
+        warn_unresolved: Whether to print a warning when no price is resolvable.
 
     returns:
         Crypto price on the requested date, or None when no price is resolvable.
     """
+    if price_resolver is not None:
+        resolved = price_resolver.resolve(symbol=coin, target_date=date)
+        if resolved.price is not None:
+            return float(resolved.price)
+        if warn_unresolved:
+            print(f"Warning: No data for {coin}. Price is unresolved.")
+        return None
+
     context = active_context()
     candidates = [coin]
     proxy = price_proxy_symbol(coin)
     if proxy and proxy not in candidates:
         candidates.append(proxy)
 
-    lookup_modes = [use_lp_prices]
-    if not use_lp_prices:
-        lookup_modes.append(True)
+    for candidate in candidates:
+        price = get_price_eur_on_or_before(
+            symbol=candidate,
+            as_of_date=date,
+            prices_folder=context.paths.prices,
+            fallback_to_oldest=False,
+            currency_metadata=context.currency_metadata(),
+        )
+        if price is not None:
+            return float(price)
 
-    for lookup_lp_prices in lookup_modes:
-        for candidate in candidates:
-            price = get_price_eur_on_or_before(
-                symbol=candidate,
-                as_of_date=date,
-                prices_folder=context.paths.prices,
-                chain=chain,
-                use_lp_prices=lookup_lp_prices,
-                fallback_to_oldest=False,
-                currency_metadata=context.currency_metadata(),
-            )
-            if price is not None:
-                return float(price)
+    for candidate in candidates:
+        oldest_price = get_price_eur_on_or_before(
+            symbol=candidate,
+            as_of_date=date,
+            prices_folder=context.paths.prices,
+            fallback_to_oldest=True,
+            currency_metadata=context.currency_metadata(),
+        )
+        if oldest_price is not None:
+            if candidate not in STABLE_PRICE_SYMBOLS:
+                print(
+                    f"Warning: No price found for {candidate} on/before {date}. "
+                    "Using oldest known price."
+                )
+            return float(oldest_price)
 
-    for lookup_lp_prices in lookup_modes:
-        for candidate in candidates:
-            oldest_price = get_price_eur_on_or_before(
-                symbol=candidate,
-                as_of_date=date,
-                prices_folder=context.paths.prices,
-                chain=chain,
-                use_lp_prices=lookup_lp_prices,
-                fallback_to_oldest=True,
-                currency_metadata=context.currency_metadata(),
-            )
-            if oldest_price is not None:
-                if candidate not in STABLE_PRICE_SYMBOLS:
-                    print(
-                        f"Warning: No price found for {candidate} on/before {date}. "
-                        "Using oldest known price."
-                    )
-                return float(oldest_price)
-
-    print(f"Warning: No data for {coin}. Price is unresolved.")
+    if warn_unresolved:
+        print(f"Warning: No data for {coin}. Price is unresolved.")
     return None
 
 
@@ -261,13 +264,18 @@ class PortfolioLedger:
         self.symbol_to_meta: dict[str, dict[str, Any]] = {}
         self.symbol_protocol = build_symbol_protocol_map(token_metadata=self.token_metadata)
         self.track_economic_principal = track_economic_principal
-        self.principal_ledger = EconomicPrincipalLedger(
-            resolver=PrincipalResolver(
-                chain=chain,
-                token_metadata=self.token_metadata,
-                protocol_root=paths.protocol_underlying_tokens,
-                prices_folder=paths.prices,
-            )
+        principal_resolver = PrincipalResolver(
+            chain=chain,
+            token_metadata=self.token_metadata,
+            protocol_root=paths.protocol_underlying_tokens,
+            prices_folder=paths.prices,
+        )
+        self.principal_ledger = EconomicPrincipalLedger(resolver=principal_resolver)
+        self.price_resolver = PriceResolver(
+            ctx=principal_resolver.ctx,
+            prices_folder=paths.prices,
+            mode="eur",
+            fallback_to_oldest=True,
         )
 
         for meta in self.token_metadata.values():
@@ -440,23 +448,56 @@ class TransactionApplier:
         self.ledger = ledger
         self.parser = parser or TransactionParser()
 
-    def _price_for_asset(self, *, asset: CryptoPosition, date_value: str, action: str) -> float:
+    def _price_for_asset(
+        self,
+        *,
+        asset: CryptoPosition,
+        date_value: str,
+        action: str,
+        warn_unresolved: bool = True,
+    ) -> float:
         self.ledger.sync_daily_underlying_ratios(date_value)
         ratio = self.ledger.resolve_underlying_ratio(asset.coin)
         price = get_crypto_price(
             coin=asset.price_source,
             date=date_value,
             chain=self.ledger.chain,
-            use_lp_prices=asset.valuation_route == ValuationRoute.PROTOCOL_DERIVED,
+            price_resolver=self.ledger.price_resolver,
+            warn_unresolved=warn_unresolved,
         )
         if price is None:
-            self.ledger.record_unresolved_price(
+            if warn_unresolved:
+                self.ledger.record_unresolved_price(
+                    asset=asset,
+                    date_value=date_value,
+                    action=action,
+                )
+            return 0.0
+        return price * ratio
+
+    def _value_swap_leg(
+        self,
+        *,
+        entries: list[TxEntry],
+        date_value: str,
+        action: str,
+    ) -> tuple[float, list[CryptoPosition]]:
+        total_value_eur = 0.0
+        unresolved: list[CryptoPosition] = []
+        for entry in entries:
+            asset = self.ledger.fetch_asset(entry.token)
+            price = self._price_for_asset(
                 asset=asset,
                 date_value=date_value,
                 action=action,
+                warn_unresolved=False,
             )
-            return 0.0
-        return price * ratio
+            if price == 0.0 and entry.quantity != 0:
+                unresolved.append(asset)
+            val = price * float(entry.quantity)
+            total_value_eur += val
+            entry.val = val
+        return total_value_eur, unresolved
 
     def receive(
         self,
@@ -507,21 +548,29 @@ class TransactionApplier:
     ) -> None:
         self.ledger.sync_daily_underlying_ratios(date_value)
         self.ledger.update_swap_underlying_ratio(ins=ins, outs=outs)
-        total_in_value_eur = 0.0
-        for entry in ins:
-            asset = self.ledger.fetch_asset(entry.token)
-            price = self._price_for_asset(asset=asset, date_value=date_value, action="swap_in")
-            val = price * float(entry.quantity)
-            total_in_value_eur += val
-            entry.val = val
-
-        total_out_value_eur = 0.0
-        for entry in outs:
-            asset = self.ledger.fetch_asset(entry.token)
-            price = self._price_for_asset(asset=asset, date_value=date_value, action="swap_out")
-            val = price * float(entry.quantity)
-            total_out_value_eur += val
-            entry.val = val
+        total_in_value_eur, unresolved_ins = self._value_swap_leg(
+            entries=ins,
+            date_value=date_value,
+            action="swap_in",
+        )
+        total_out_value_eur, unresolved_outs = self._value_swap_leg(
+            entries=outs,
+            date_value=date_value,
+            action="swap_out",
+        )
+        for entries, unresolved, action, opposite_total in (
+            (ins, unresolved_ins, "swap_in", total_out_value_eur),
+            (outs, unresolved_outs, "swap_out", total_in_value_eur),
+        ):
+            if len(entries) == 1 and len(unresolved) == 1 and opposite_total > 0:
+                continue
+            for asset in unresolved:
+                print(f"Warning: No data for {asset.price_source}. Price is unresolved.")
+                self.ledger.record_unresolved_price(
+                    asset=asset,
+                    date_value=date_value,
+                    action=action,
+                )
 
         principal_transfer_value_eur = (
             total_out_value_eur if total_out_value_eur > 0 else total_in_value_eur

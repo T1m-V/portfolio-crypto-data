@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 from portfolio_core import active_context
 
-from portfolio_crypto_data.composition.lp_pricing import generate_protocol_lp_price_files
+from portfolio_crypto_data.composition.core import PriceResolver, build_composition_context
 from portfolio_crypto_data.protocols import aave, balancer, beefy, common, curve, liquid_staking
 
 
@@ -236,31 +236,46 @@ def test_curve_lp_share_uses_pool_balances(monkeypatch: pytest.MonkeyPatch) -> N
     assert result == {"WBTC": Decimal("2")}
 
 
-def test_protocol_ratio_generates_derived_price() -> None:
+def test_protocol_derived_price_resolves_from_underlying_composition() -> None:
     paths = active_context().paths
     (paths.tokens / "arbitrum_tokens.json").write_text(
         json.dumps(
             {
                 "native": {"symbol": "ETH"},
                 "0xlst": {"symbol": "wstETH", "protocol": "liquid_staking"},
+                "0xatoken": {
+                    "symbol": "aArbwstETH",
+                    "protocol": "aave",
+                    "price_source": "wstETH",
+                },
             }
         )
     )
     folder = paths.protocol_underlying_tokens / "liquid_staking"
     folder.mkdir(parents=True)
-    pd.DataFrame([{"date": "2025-01-01", "asset_ETH": 1.1}]).to_csv(
-        folder / "arbitrum_wstETH.csv", index=False
-    )
-    pd.DataFrame([{"Date": "2025-01-01", "Price": 1_000}]).to_csv(
+    pd.DataFrame(
+        [
+            {"date": "2025-01-02", "asset_ETH": 1.1},
+            {"date": "2025-01-03", "asset_ETH": 1.2},
+        ]
+    ).to_csv(folder / "arbitrum_wstETH.csv", index=False)
+    pd.DataFrame([{"Date": "2025-01-02", "Price": 1_000}]).to_csv(
         paths.prices / "ETH.csv", index=False
     )
+    # Any stale direct file for a protocol-derived token must be ignored.
+    pd.DataFrame([{"Date": "2025-01-01", "Price": 999}]).to_csv(
+        paths.prices / "wstETH.csv", index=False
+    )
 
-    outputs = generate_protocol_lp_price_files(chain="arbitrum")
+    ctx = build_composition_context(chain="arbitrum")
+    resolver = PriceResolver(ctx=ctx, mode="eur", fallback_to_oldest=True)
 
-    assert len(outputs) == 1
-    assert pd.read_csv(outputs[0]).to_dict("records") == [
-        {"Date": "2025-01-01", "Price": 1_100.0}
-    ]
+    assert resolver.resolve(symbol="wstETH", target_date="2025-01-02").price == Decimal("1100.0")
+    assert resolver.resolve(symbol="wstETH", target_date="2025-01-03").price == Decimal("1200.0")
+    assert resolver.resolve(symbol="wstETH", target_date="2025-01-01").price == Decimal("1100.0")
+    assert resolver.resolve(symbol="aArbwstETH", target_date="2025-01-03").price == Decimal(
+        "1200.0"
+    )
 
 
 def test_liquid_staking_tokens_are_configured_by_chain_metadata() -> None:

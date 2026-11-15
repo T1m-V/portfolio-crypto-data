@@ -442,6 +442,7 @@ def _build_source_base_daily(
     ctx: CompositionContext,
     metadata: dict[str, dict[str, Any]],
     end_date: pd.Timestamp | None,
+    start_date: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
     if snapshots.empty and principal_daily.empty:
         return _empty(SOURCE_BASE_DAILY_COLUMNS)
@@ -451,6 +452,9 @@ def _build_source_base_daily(
         principal_daily=principal_daily,
         end_date=end_date,
     )
+    if start_date is not None:
+        dense = dense[dense["Date"] >= start_date]
+        dense_principal = dense_principal[dense_principal["Date"] >= start_date]
     price_resolver = PriceResolver(ctx=ctx, mode="eur")
     rows: list[dict[str, object]] = []
 
@@ -698,6 +702,7 @@ def build_accounting_artifacts(
     *,
     chain: str,
     as_of_date: str | pd.Timestamp | None = None,
+    incremental: bool = False,
 ) -> AccountingBuildResult:
     clear_price_cache()
     paths = accounting_paths(chain=chain)
@@ -719,14 +724,41 @@ def build_accounting_artifacts(
     if end_date is None and not snapshots.empty:
         end_date = pd.Timestamp(snapshots["Date"].max()).normalize()
 
+    start_date: pd.Timestamp | None = None
+    existing_source_base = _empty(SOURCE_BASE_DAILY_COLUMNS)
+    existing_base = _empty(BASE_DAILY_COLUMNS)
+    if incremental and paths.source_base_daily.exists() and paths.base_daily.exists():
+        existing_source_base = _read_csv(paths.source_base_daily, SOURCE_BASE_DAILY_COLUMNS)
+        existing_base = _read_csv(paths.base_daily, BASE_DAILY_COLUMNS)
+        existing_dates = _parse_daily_series(existing_base["Date"]).dropna()
+        if not existing_dates.empty:
+            start_date = pd.Timestamp(existing_dates.max()).normalize()
+
     source_base = _build_source_base_daily(
         snapshots=snapshots,
         principal_daily=principal_daily,
         ctx=ctx,
         metadata=metadata,
         end_date=end_date,
+        start_date=start_date,
     )
     base_daily = _build_base_daily(source_base=source_base)
+
+    if start_date is not None:
+        prior_source_base = existing_source_base[
+            _parse_daily_series(existing_source_base["Date"]) < start_date
+        ]
+        source_base = (
+            pd.concat([prior_source_base, source_base], ignore_index=True)
+            .sort_values(["Date", "Source", "BaseCoin"])
+            .reset_index(drop=True)
+        )
+        prior_base = existing_base[_parse_daily_series(existing_base["Date"]) < start_date]
+        base_daily = (
+            pd.concat([prior_base, base_daily], ignore_index=True)
+            .sort_values(["Date", "Coin"])
+            .reset_index(drop=True)
+        )
 
     _write_csv(paths.source_base_daily, source_base, SOURCE_BASE_DAILY_COLUMNS)
     _write_csv(paths.base_daily, base_daily, BASE_DAILY_COLUMNS)
