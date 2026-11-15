@@ -19,6 +19,7 @@ from portfolio_crypto_data.shared.aave_symbols import (
     aave_base_symbol,
     is_aave_debt_symbol,
 )
+from portfolio_crypto_data.shared.token_metadata import metadata_by_symbol
 from portfolio_crypto_data.shared.valuation_routes import ValuationRoute
 from portfolio_crypto_data.symbols import canonicalize_symbol, price_proxy_symbol, sanitize_symbol
 
@@ -56,7 +57,7 @@ class PrincipalResolver:
             include_aave=False,
         )
         self.price_resolver = PriceResolver(ctx=self.ctx, prices_folder=prices_folder, mode="eur")
-        self.metadata = self._metadata_by_symbol(token_metadata=token_metadata)
+        self.metadata = metadata_by_symbol(token_metadata)
 
     def components(self, *, symbol: str, date_value: object) -> list[PrincipalComponent]:
         normalized = sanitize_symbol(symbol)
@@ -202,17 +203,6 @@ class PrincipalResolver:
         if not eligible.empty:
             return eligible.iloc[-1]
         return frame.iloc[0]
-
-    @staticmethod
-    def _metadata_by_symbol(token_metadata: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        by_symbol: dict[str, dict[str, Any]] = {}
-        for meta in token_metadata.values():
-            if not isinstance(meta, dict):
-                continue
-            symbol = sanitize_symbol(meta.get("symbol"))
-            if symbol and symbol not in by_symbol:
-                by_symbol[symbol] = meta
-        return by_symbol
 
 
 class EconomicPrincipalLedger:

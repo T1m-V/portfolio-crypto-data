@@ -13,6 +13,7 @@ from portfolio_crypto_data.protocols.common import (
     resolve_date_window,
     write_protocol_history_csv,
 )
+from portfolio_crypto_data.shared.token_metadata import ERC20_ABI
 
 # ==========================================
 # ABIS
@@ -44,23 +45,6 @@ BEEFY_VAULT_ABI = [
         "inputs": [],
         "name": "symbol",
         "outputs": [{"internalType": "string", "name": "", "type": "string"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-]
-
-ERC20_ABI = [
-    {
-        "inputs": [],
-        "name": "symbol",
-        "outputs": [{"internalType": "string", "name": "", "type": "string"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [],
-        "name": "decimals",
-        "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
         "stateMutability": "view",
         "type": "function",
     },

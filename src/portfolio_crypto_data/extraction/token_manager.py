@@ -6,22 +6,7 @@ from typing import Any
 from portfolio_core import atomic_write_text
 from web3 import Web3
 
-ERC20_ABI = [
-    {
-        "constant": True,
-        "inputs": [],
-        "name": "decimals",
-        "outputs": [{"name": "", "type": "uint8"}],
-        "type": "function",
-    },
-    {
-        "constant": True,
-        "inputs": [],
-        "name": "symbol",
-        "outputs": [{"name": "", "type": "string"}],
-        "type": "function",
-    },
-]
+from portfolio_crypto_data.shared.token_metadata import ERC20_ABI
 
 
 class TokenManager:

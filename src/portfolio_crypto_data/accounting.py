@@ -22,12 +22,12 @@ from portfolio_crypto_data.shared.aave_symbols import (
     is_aave_debt_symbol,
 )
 from portfolio_crypto_data.shared.prices import clear_price_cache
-from portfolio_crypto_data.shared.token_metadata import load_token_metadata
+from portfolio_crypto_data.shared.token_metadata import load_token_metadata, metadata_by_symbol
 from portfolio_crypto_data.shared.valuation_routes import ValuationRoute
 from portfolio_crypto_data.symbols import canonicalize_symbol, price_proxy_symbol, sanitize_symbol
 
-MATERIAL_QUANTITY_THRESHOLD = Decimal("0.0000000001")
-MATERIAL_VALUE_THRESHOLD_EUR = Decimal("1.0")
+MATERIAL_QUANTITY_THRESHOLD = 1e-10
+MATERIAL_VALUE_THRESHOLD_EUR = 1.0
 VALUE_DUST_EUR = Decimal("0.01")
 
 SOURCE_BASE_DAILY_COLUMNS = [
@@ -71,7 +71,6 @@ class AccountingArtifactPaths:
 @dataclass(frozen=True)
 class AccountingBuildResult:
     paths: AccountingArtifactPaths
-    rows_written: dict[str, int]
 
 
 def accounting_paths(chain: str) -> AccountingArtifactPaths:
@@ -239,21 +238,6 @@ def _build_context(*, chain: str, token_metadata: dict[str, dict[str, Any]]) -> 
     )
 
 
-def _metadata_by_symbol(token_metadata: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    by_symbol: dict[str, dict[str, Any]] = {}
-    for meta in token_metadata.values():
-        if not isinstance(meta, dict):
-            continue
-        symbol = sanitize_symbol(meta.get("symbol"))
-        if symbol and symbol not in by_symbol:
-            by_symbol[symbol] = meta
-    return by_symbol
-
-
-def _normalize_aave_symbol(symbol: str) -> str:
-    return sanitize_symbol(symbol)
-
-
 def _aave_multiplier(symbol: str, meta: dict[str, Any] | None) -> Decimal:
     return Decimal("-1") if is_aave_debt_symbol(symbol, meta) else Decimal("1")
 
@@ -399,7 +383,7 @@ def _build_aave_overlay_rows(
         if pd.isna(raw_quantity):
             continue
         quantity = Decimal(str(raw_quantity))
-        overlay_symbol = _normalize_aave_symbol(column.replace("net_", "", 1))
+        overlay_symbol = sanitize_symbol(column.replace("net_", "", 1))
         if not overlay_symbol:
             continue
         canonical_overlay = canonicalize_symbol(
@@ -551,36 +535,21 @@ def _allocate_principal_to_sources(
         return source_base
 
     output = source_base.copy()
-    if output.empty:
-        output = _empty(SOURCE_BASE_DAILY_COLUMNS)
-    for column in ("Quantity", "MarketValueEUR", "PrincipalInvestedEUR", "RealizedPnLEUR"):
-        if column not in output.columns:
-            output[column] = 0.0
-        output[column] = pd.to_numeric(output[column], errors="coerce").fillna(0.0)
-
     appended: list[dict[str, object]] = []
-    principal_frame = principal_daily.copy()
-    principal_frame["Date"] = pd.to_datetime(
-        principal_frame["Date"],
-        errors="coerce",
-    ).dt.normalize()
-    principal_frame["PrincipalInvestedEUR"] = pd.to_numeric(
-        principal_frame["PrincipalInvestedEUR"],
-        errors="coerce",
-    ).fillna(0.0)
-    principal_frame = principal_frame.dropna(subset=["Date"])
 
-    for _, row in principal_frame.iterrows():
+    for _, row in principal_daily.iterrows():
         date_value = pd.Timestamp(row["Date"]).normalize()
-        base_coin = sanitize_symbol(row["Coin"])
+        base_coin = str(row["Coin"])
         principal = Decimal(str(row["PrincipalInvestedEUR"]))
         if not base_coin or abs(principal) < VALUE_DUST_EUR:
             continue
 
-        mask = (pd.to_datetime(output["Date"], errors="coerce").dt.normalize() == date_value) & (
-            output["BaseCoin"] == base_coin
-        )
-        active = output[mask & (output["MarketValueEUR"].abs() > float(VALUE_DUST_EUR))]
+        if output.empty:
+            active = output
+        else:
+            date_str = format_daily_datetime(date_value)
+            mask = (output["Date"] == date_str) & (output["BaseCoin"] == base_coin)
+            active = output[mask & (output["MarketValueEUR"].abs() > float(VALUE_DUST_EUR))]
         if active.empty:
             appended.append(
                 _source_base_row(
@@ -667,7 +636,7 @@ def _build_base_daily(source_base: pd.DataFrame) -> pd.DataFrame:
     )
     grouped["PriceEUR"] = grouped.apply(
         lambda row: row["MarketValueEUR"] / row["Quantity"]
-        if abs(float(row["Quantity"])) > float(MATERIAL_QUANTITY_THRESHOLD)
+        if abs(float(row["Quantity"])) > MATERIAL_QUANTITY_THRESHOLD
         else pd.NA,
         axis=1,
     )
@@ -701,7 +670,7 @@ def validate_direct_snapshot_prices(*, chain: str) -> None:
     expander = ExposureExpander(ctx=ctx)
     price_resolver = PriceResolver(ctx=ctx, mode="eur")
 
-    material = snapshots[snapshots["Quantity"].abs() > float(MATERIAL_QUANTITY_THRESHOLD)]
+    material = snapshots[snapshots["Quantity"].abs() > MATERIAL_QUANTITY_THRESHOLD]
     for coin, group in material.groupby("Coin", sort=True):
         source = sanitize_symbol(coin)
         if not source or ctx.route_for(source) != ValuationRoute.DIRECT:
@@ -734,7 +703,7 @@ def build_accounting_artifacts(
     paths = accounting_paths(chain=chain)
     runtime_paths = active_context().paths
     token_metadata = load_token_metadata(chain=chain, tokens_folder=runtime_paths.tokens)
-    metadata = _metadata_by_symbol(token_metadata=token_metadata)
+    metadata = metadata_by_symbol(token_metadata)
     ctx = _build_context(chain=chain, token_metadata=token_metadata)
 
     snapshots = _normalize_snapshot_frame(
@@ -764,12 +733,4 @@ def build_accounting_artifacts(
     if not paths.principal_events.exists():
         _write_csv(paths.principal_events, _empty(PRINCIPAL_EVENT_COLUMNS), PRINCIPAL_EVENT_COLUMNS)
     _write_csv(paths.principal_daily, principal_daily, PRINCIPAL_DAILY_COLUMNS)
-    return AccountingBuildResult(
-        paths=paths,
-        rows_written={
-            "principal_events": _read_csv(paths.principal_events, PRINCIPAL_EVENT_COLUMNS).shape[0],
-            "principal_daily": len(principal_daily),
-            "source_base_daily": len(source_base),
-            "base_daily": len(base_daily),
-        },
-    )
+    return AccountingBuildResult(paths=paths)

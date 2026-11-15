@@ -28,6 +28,7 @@ from portfolio_crypto_data.protocols.common import (
     should_skip_date_window,
     write_protocol_history_csv,
 )
+from portfolio_crypto_data.shared.token_metadata import ERC20_ABI
 from portfolio_crypto_data.symbols import (
     build_address_symbol_map,
     build_symbol_family_map,
@@ -85,23 +86,6 @@ COMPOUND_V2_CTOKEN_ABI = [
         "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
         "name": "borrowBalanceStored",
         "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-]
-
-ERC20_ABI = [
-    {
-        "inputs": [],
-        "name": "symbol",
-        "outputs": [{"internalType": "string", "name": "", "type": "string"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [],
-        "name": "decimals",
-        "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
         "stateMutability": "view",
         "type": "function",
     },

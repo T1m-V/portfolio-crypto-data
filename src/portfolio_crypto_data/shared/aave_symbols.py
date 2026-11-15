@@ -9,9 +9,7 @@ AAVE_DEBT_PREFIXES = ("variabledebt", "stabledebt")
 
 def is_aave_debt_symbol(symbol: str, meta: dict[str, Any] | None = None) -> bool:
     if meta:
-        position_type = sanitize_symbol(
-            meta.get("position_type") or meta.get("aave_position")
-        ).lower()
+        position_type = sanitize_symbol(meta.get("position_type")).lower()
         if position_type:
             return position_type in {"debt", "borrowed"}
     normalized = sanitize_symbol(symbol).lower()

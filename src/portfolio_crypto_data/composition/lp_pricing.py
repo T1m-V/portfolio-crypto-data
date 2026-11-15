@@ -15,34 +15,11 @@ from portfolio_crypto_data.composition.core import (
     CompositionContext,
     PriceResolver,
     ProtocolStore,
-    SymbolMetadata,
     build_symbol_metadata,
 )
 from portfolio_crypto_data.shared.token_metadata import load_token_metadata
 from portfolio_crypto_data.shared.valuation_routes import build_symbol_protocol_map
 from portfolio_crypto_data.symbols import build_symbol_family_map
-
-PricingContext = CompositionContext
-
-
-def _load_token_metadata(
-    *, chain: str, tokens_folder: Path
-) -> dict[str, dict[str, object]]:
-    return load_token_metadata(chain=chain, tokens_folder=tokens_folder)
-
-
-def _build_symbol_metadata(
-    token_metadata: dict[str, dict[str, object]],
-) -> dict[str, SymbolMetadata]:
-    return build_symbol_metadata(token_metadata=token_metadata)
-
-
-def _load_protocol_rows(*, chain: str, protocol_root: Path) -> dict[str, pd.DataFrame]:
-    return ProtocolStore.load(
-        chain=chain,
-        root=protocol_root,
-        include_aave=False,
-    ).rows
 
 
 def _build_incoming_prices(
@@ -86,16 +63,18 @@ def generate_protocol_lp_price_files(
     protocol_root = protocol_root or context.paths.protocol_underlying_tokens
     prices_folder = prices_folder or context.paths.prices
     tokens_folder = tokens_folder or context.paths.tokens
-    token_metadata = _load_token_metadata(chain=chain, tokens_folder=tokens_folder)
-    protocol_rows = _load_protocol_rows(chain=chain, protocol_root=protocol_root)
+    token_metadata = load_token_metadata(chain=chain, tokens_folder=tokens_folder)
+    protocol_rows = ProtocolStore.load(
+        chain=chain, root=protocol_root, include_aave=False
+    ).rows
     symbol_family = build_symbol_family_map(token_metadata=token_metadata)
-    ctx = PricingContext(
+    ctx = CompositionContext(
         chain=chain,
         protocol_rows=protocol_rows,
         symbol_protocol=build_symbol_protocol_map(token_metadata=token_metadata),
         protocol_derived_symbols=set(protocol_rows.keys()),
         symbol_family=symbol_family,
-        symbol_metadata=_build_symbol_metadata(token_metadata=token_metadata),
+        symbol_metadata=build_symbol_metadata(token_metadata=token_metadata),
         currency_metadata=context.currency_metadata(),
     )
     price_resolver = PriceResolver(ctx=ctx, prices_folder=prices_folder, mode="native")

@@ -76,7 +76,7 @@ def parse_evm_chain_config(*, chain: str, raw: dict[str, Any]) -> EvmChainConfig
             f"Chain '{chain}' config field 'native_decimals' cannot be negative."
         )
 
-    rpc_url = str(raw.get("rpc_url") or raw.get("alchemy_url") or "").strip()
+    rpc_url = str(raw.get("rpc_url") or "").strip()
     if not rpc_url:
         raise ValueError(
             f"Chain '{chain}' is missing required config field 'rpc_url'."

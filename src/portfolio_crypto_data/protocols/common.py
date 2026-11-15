@@ -10,7 +10,7 @@ from typing import Any
 
 import pandas as pd
 import requests
-from portfolio_core import active_context, atomic_write_text
+from portfolio_core import active_context, atomic_write_csv, atomic_write_text
 from web3 import Web3
 from web3.exceptions import BadFunctionCallOutput, ContractLogicError
 
@@ -152,7 +152,6 @@ def sync_block_map(chain: str, config: EvmChainConfig | None = None) -> dict[str
     Ensures block_map_{chain}.csv is up to date through today.
     """
     map_file_path = active_context().paths.block_map / f"block_map_{chain}.csv"
-    map_file_path.parent.mkdir(parents=True, exist_ok=True)
     block_map = load_block_map(chain=chain)
 
     today_dt = datetime.now(tz=timezone.utc).date()
@@ -230,11 +229,11 @@ def sync_block_map(chain: str, config: EvmChainConfig | None = None) -> dict[str
         curr_block = block
         curr += timedelta(days=1)
 
-    with open(map_file_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["date", "block"])
-        for ds in sorted(block_map.keys()):
-            writer.writerow([ds, block_map[ds]])
+    frame = pd.DataFrame(
+        [{"date": ds, "block": block_map[ds]} for ds in sorted(block_map)],
+        columns=["date", "block"],
+    )
+    atomic_write_csv(frame=frame, path=map_file_path)
 
     return block_map
 

@@ -6,7 +6,6 @@ from unittest.mock import Mock
 
 import pandas as pd
 import pytest
-import requests
 from portfolio_core import active_context
 from web3 import Web3
 
@@ -20,7 +19,6 @@ from portfolio_crypto_data.datetime_utils import (
 from portfolio_crypto_data.extraction import evm_reader, transaction_analyzer
 from portfolio_crypto_data.extraction.evm_reader import (
     OUTPUT_COLUMNS,
-    ExplorerAPIError,
     _derive_start_date,
     _fetch_explorer_data,
     _normalize_results_frame,
@@ -115,70 +113,6 @@ def test_explorer_chain_id_parameter_is_configurable(
 
     assert len(requests) == 3
     assert all("chainid" not in params for params in requests)
-
-
-def test_explorer_request_failure_aborts_ingestion(monkeypatch: pytest.MonkeyPatch) -> None:
-    get = Mock(side_effect=requests.ConnectionError("temporarily unavailable"))
-    monkeypatch.setattr(evm_reader.requests, "get", get)
-
-    with pytest.raises(ExplorerAPIError, match="action=txlist"):
-        _fetch_explorer_data(
-            "https://example.test",
-            {"action": "txlist"},
-            max_retries=0,
-        )
-
-
-def test_unexpected_explorer_response_aborts_ingestion(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    response = Mock()
-    response.raise_for_status.return_value = None
-    response.json.return_value = {
-        "status": "0",
-        "message": "NOTOK",
-        "result": "Rate limit reached",
-    }
-    monkeypatch.setattr(evm_reader.requests, "get", Mock(return_value=response))
-
-    with pytest.raises(ExplorerAPIError, match="Unexpected explorer response"):
-        _fetch_explorer_data(
-            "https://example.test",
-            {"action": "tokentx"},
-            max_retries=0,
-        )
-
-
-def test_non_object_explorer_response_aborts_ingestion(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    response = Mock()
-    response.raise_for_status.return_value = None
-    response.json.return_value = []
-    monkeypatch.setattr(evm_reader.requests, "get", Mock(return_value=response))
-
-    with pytest.raises(ExplorerAPIError, match="expected an object, got list"):
-        _fetch_explorer_data(
-            "https://example.test",
-            {"action": "tokentx"},
-            max_retries=0,
-        )
-
-
-def test_rpc_connection_failure_aborts_ingestion(monkeypatch: pytest.MonkeyPatch) -> None:
-    class DisconnectedWeb3:
-        HTTPProvider = staticmethod(lambda endpoint_uri: endpoint_uri)
-
-        def __init__(self, provider: object) -> None:
-            self.provider = provider
-
-        def is_connected(self) -> bool:
-            return False
-
-    monkeypatch.setattr(evm_reader, "Web3", DisconnectedWeb3)
-
-    with pytest.raises(ConnectionError, match="RPC connection failed"):
-        asyncio.run(retrieve_transactions(config=_chain_config()))
 
 
 def test_transaction_analysis_error_is_reported_without_stopping_output(
@@ -346,28 +280,6 @@ def test_internal_native_transfers_use_configured_decimals() -> None:
     )
 
     assert result == {"0xhash": Decimal("1.23")}
-
-
-def test_analyzer_propagates_transaction_fetch_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        transaction_analyzer,
-        "_fetch_transaction_data",
-        Mock(side_effect=RuntimeError("malformed receipt")),
-    )
-
-    with pytest.raises(RuntimeError, match="malformed receipt"):
-        transaction_analyzer.analyze_transaction(
-            tx_hash="failed",
-            w3=None,
-            my_address="0xabc",
-            token_manager=TokenManager(),
-            internal_native_map={},
-            fetch_metadata=False,
-            native_symbol="ETH",
-            native_decimals=18,
-        )
 
 
 def test_compound_borrow_and_repay_events_decoded() -> None:

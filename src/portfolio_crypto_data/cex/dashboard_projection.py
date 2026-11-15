@@ -4,12 +4,11 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from portfolio_core import active_context
+from portfolio_core import active_context, load_price_csv
 
 from portfolio_crypto_data.cex.snapshot_io import SNAPSHOT_COLUMNS
+from portfolio_crypto_data.shared.prices import PRICE_CURRENCY_OVERRIDES
 
-USD_STABLES = {"USD", "USDX", "xUSD", "USDC", "USDT", "DAI"}
-EUR_STABLES = {"EUR", "EURX"}
 COLS_TO_FILL = ["Quantity", "Principal Invested"]
 
 
@@ -56,20 +55,18 @@ def get_cex_snapshot_start_date(
 
 
 def _load_usd_eur(*, end_dt: pd.Timestamp) -> pd.DataFrame:
-    frame = pd.read_csv(active_context().paths.direct_price("USD_EUR"))
-    frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-    frame["Price"] = pd.to_numeric(frame["Price"], errors="coerce")
-    frame = frame.dropna(subset=["Date", "Price"])
-    frame = frame[frame["Date"] <= end_dt]
-    return frame.sort_values("Date")[["Date", "Price"]]
+    frame = load_price_csv(active_context().paths.direct_price("USD_EUR"))
+    if frame.empty:
+        return frame
+    frame["Date"] = pd.to_datetime(frame["Date"])
+    return frame[frame["Date"] <= end_dt].sort_values("Date")[["Date", "Price"]]
 
 
 def _resolve_currency(*, coin: str, metadata: dict[str, dict[str, Any]]) -> str:
-    if coin in EUR_STABLES:
-        return "EUR"
-    if coin in USD_STABLES:
-        return "USD"
-    return str(metadata.get(coin, {}).get("currency", "USD"))
+    return PRICE_CURRENCY_OVERRIDES.get(
+        coin,
+        str(metadata.get(coin, {}).get("currency", "USD")),
+    )
 
 
 def _build_price_frame(
@@ -83,13 +80,10 @@ def _build_price_frame(
     currency = _resolve_currency(coin=coin, metadata=metadata)
     full_dates = pd.date_range(start=coin_start, end=end_dt, freq="D")
     price_path = active_context().paths.direct_price(coin)
-    if price_path.exists():
-        prices = pd.read_csv(price_path)
-        prices["Date"] = pd.to_datetime(prices["Date"], errors="coerce")
-        prices["Price"] = pd.to_numeric(prices["Price"], errors="coerce")
-        prices = prices.dropna(subset=["Date", "Price"])
-        prices = prices[prices["Date"] <= end_dt]
-        prices = prices.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+    prices = load_price_csv(price_path)
+    if not prices.empty:
+        prices["Date"] = pd.to_datetime(prices["Date"])
+        prices = prices[prices["Date"] <= end_dt].sort_values("Date")
         if not prices.empty:
             prices = (
                 prices.set_index("Date")
@@ -112,7 +106,7 @@ def _build_price_frame(
             return prices[["Date", "Coin", "Price"]]
 
     fallback = pd.DataFrame({"Date": full_dates})
-    if coin in EUR_STABLES:
+    if currency == "EUR" and coin in PRICE_CURRENCY_OVERRIDES:
         fallback["Price"] = 1.0
     elif currency != "EUR":
         fallback = fallback.merge(

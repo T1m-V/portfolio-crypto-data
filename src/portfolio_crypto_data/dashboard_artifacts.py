@@ -9,6 +9,8 @@ from portfolio_core import active_context, atomic_write_csv
 
 from portfolio_crypto_data.accounting import (
     BASE_DAILY_COLUMNS,
+    MATERIAL_QUANTITY_THRESHOLD,
+    MATERIAL_VALUE_THRESHOLD_EUR,
     SOURCE_BASE_DAILY_COLUMNS,
     accounting_paths,
 )
@@ -17,11 +19,8 @@ from portfolio_crypto_data.datetime_utils import (
     parse_transaction_datetime_series,
 )
 from portfolio_crypto_data.shared.aave_symbols import aave_base_symbol
-from portfolio_crypto_data.shared.token_metadata import load_token_metadata
+from portfolio_crypto_data.shared.token_metadata import load_token_metadata, metadata_by_symbol
 from portfolio_crypto_data.symbols import sanitize_symbol
-
-MATERIAL_QUANTITY_THRESHOLD = 1e-10
-MATERIAL_VALUE_THRESHOLD_EUR = 1.0
 
 ASSET_DAILY_COLUMNS = [
     "Date",
@@ -150,21 +149,6 @@ def _normalize_transactions_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return normalized[TRANSACTIONS_DASHBOARD_COLUMNS[:-1]].reset_index(drop=True)
 
 
-def _metadata_by_symbol(token_metadata: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    by_symbol: dict[str, dict[str, Any]] = {}
-    for meta in token_metadata.values():
-        if not isinstance(meta, dict):
-            continue
-        symbol_key = _selection_key(meta.get("symbol"))
-        if symbol_key and symbol_key not in by_symbol:
-            by_symbol[symbol_key] = meta
-    return by_symbol
-
-
-def _aave_exposure_symbol(symbol: str, meta: dict[str, Any] | None = None) -> str:
-    return aave_base_symbol(symbol=symbol, meta=meta)
-
-
 def _exposure_label(row: pd.Series) -> str:
     flags = []
     if _normalize_bool(row.get("HasDirectExposure")):
@@ -226,7 +210,11 @@ def _build_asset_rows_from_accounting(base: pd.DataFrame) -> pd.DataFrame:
     single_rows = rows.copy()
     single_rows["Selection"] = single_rows["Coin"]
     out = pd.concat([full_rows, single_rows], ignore_index=True, sort=False)
-    return out[ASSET_DAILY_COLUMNS]
+    return (
+        out[ASSET_DAILY_COLUMNS]
+        .sort_values(["Selection", "Date", "Coin", "AssetLayer"])
+        .reset_index(drop=True)
+    )
 
 
 def _normalize_source_base_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -261,7 +249,7 @@ def _build_source_daily_from_accounting(source_base: pd.DataFrame) -> pd.DataFra
         | (source["PrincipalInvestedEUR"].abs() >= MATERIAL_VALUE_THRESHOLD_EUR)
         | (source["ProfitLossEUR"].abs() >= MATERIAL_VALUE_THRESHOLD_EUR)
     )
-    source = source[source["IsMaterial"].map(_normalize_bool)].copy()
+    source = source[source["IsMaterial"]].copy()
     if source.empty:
         return _empty(SOURCE_DAILY_COLUMNS)
     source = source.sort_values(["Selection", "Date", "Source", "Coin"])
@@ -308,7 +296,7 @@ def _asset_keys_for_symbol(
     keys = {_selection_key(symbol)}
     keys.add(
         _selection_key(
-            _aave_exposure_symbol(
+            aave_base_symbol(
                 symbol=symbol,
                 meta=metadata.get(_selection_key(symbol)),
             )
@@ -508,7 +496,7 @@ def build_chain_dashboard_artifacts(chain: str) -> ChainDashboardArtifactPaths:
     paths = artifact_paths(chain=chain)
     runtime_paths = active_context().paths
     token_metadata = load_token_metadata(chain=chain, tokens_folder=runtime_paths.tokens)
-    metadata = _metadata_by_symbol(token_metadata)
+    metadata = metadata_by_symbol(token_metadata, key=_selection_key)
     accounting = accounting_paths(chain=chain)
     base = _normalize_accounting_base_frame(
         _read_csv(
@@ -522,15 +510,8 @@ def build_chain_dashboard_artifacts(chain: str) -> ChainDashboardArtifactPaths:
             SOURCE_BASE_DAILY_COLUMNS,
         )
     )
-    base_asset_rows = _build_asset_rows_from_accounting(base=base)
+    asset_daily = _build_asset_rows_from_accounting(base=base)
     source_daily = _build_source_daily_from_accounting(source_base=source_base)
-    asset_daily = base_asset_rows.copy()
-    if asset_daily.empty:
-        asset_daily = _empty(ASSET_DAILY_COLUMNS)
-    else:
-        asset_daily["Date"] = pd.to_datetime(asset_daily["Date"], errors="coerce").dt.normalize()
-        asset_daily = asset_daily.dropna(subset=["Date"])
-        asset_daily = asset_daily.sort_values(["Selection", "Date", "Coin", "AssetLayer"])
 
     transactions = _build_transactions_dashboard(
         transactions=_normalize_transactions_frame(

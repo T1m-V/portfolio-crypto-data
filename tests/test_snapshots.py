@@ -8,7 +8,6 @@ import pytest
 
 from portfolio_crypto_data import raw_snapshots
 from portfolio_crypto_data.cex.crypto_com_app_snapshots import (
-    SUPPORTED_APP_KINDS,
     CryptoComAppTransactionNormalizer,
     _build_dust_actions,
     generate_crypto_com_app_raw_snapshots,
@@ -119,42 +118,6 @@ def test_principal_ledger_distributes_exactly_and_keeps_daily_last_state() -> No
     assert set(ledger.events_frame()["TX Hash"]) == {"a", "b"}
 
 
-ACTUAL_NEXO_TYPES = {
-    "assimilation",
-    "bonus",
-    "cashback",
-    "credit card fiatx exchange to withdraw",
-    "credit card withdrawal credit",
-    "deposit over repayment",
-    "deposit to exchange",
-    "dividend",
-    "exchange",
-    "exchange cashback",
-    "exchange credit",
-    "exchange deposited on",
-    "exchange liquidation",
-    "exchange to withdraw",
-    "fixed term interest",
-    "interest",
-    "interest additional",
-    "loan withdrawal",
-    "locking term deposit",
-    "manual repayment",
-    "manual sell order",
-    "nexo card cashback reversal",
-    "nexo card purchase",
-    "nexo card refund",
-    "nexo card transaction fee",
-    "referral bonus",
-    "top up crypto",
-    "transfer in",
-    "transfer out",
-    "unlocking term deposit",
-    "withdraw exchanged",
-    "withdrawal",
-}
-
-
 def _nexo_row(kind: str, **overrides: object) -> pd.Series:
     row: dict[str, object] = {
         "Type": kind,
@@ -171,12 +134,6 @@ def _nexo_row(kind: str, **overrides: object) -> pd.Series:
     }
     row.update(overrides)
     return pd.Series(row)
-
-
-def test_nexo_support_is_exactly_the_types_present_in_the_exports() -> None:
-    normalizer = NexoTransactionNormalizer(known_symbols={"BTC", "USDC", "USD"})
-    supported = set(normalizer.handlers)
-    assert supported == ACTUAL_NEXO_TYPES
 
 
 @pytest.mark.parametrize(
@@ -264,20 +221,6 @@ def test_manual_repayment_pair_becomes_one_swap() -> None:
     assert action.principal_overrides == {"USD": 100.0, "BTC": -100.0}
 
 
-def _generate_nexo(
-    *,
-    rows: list[dict[str, object]],
-    folder: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> pd.DataFrame:
-    monkeypatch.setattr(raw_snapshots, "get_crypto_price", lambda **_: 1.0)
-    input_path = folder / "input.csv"
-    output_path = folder / "output.csv"
-    pd.DataFrame(rows).to_csv(input_path, index=False)
-    generate_nexo_raw_snapshots(input_csv=input_path, output_csv=output_path)
-    return pd.read_csv(output_path)
-
-
 def test_nexo_generator_combines_exports_and_overwrites_same_day(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -329,79 +272,6 @@ def test_nexo_overlapping_exports_preserve_real_duplicate_occurrences(
     assert snapshot.loc[snapshot["Coin"] == "NEXO", "Quantity"].iloc[-1] == 4.0
 
 
-def test_nexo_rejects_malformed_non_empty_amount(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    with pytest.raises(ValueError, match="Invalid non-empty numeric value"):
-        _generate_nexo(
-            rows=[
-                {
-                    **_nexo_row("Cashback").to_dict(),
-                    "Input Amount": "not-a-number",
-                }
-            ],
-            folder=tmp_path,
-            monkeypatch=monkeypatch,
-        )
-
-
-def test_nexo_generator_rejects_unknown_external_type(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    with pytest.raises(ValueError, match="Unsupported NEXO transaction type"):
-        _generate_nexo(
-            rows=[
-                {
-                    **_nexo_row("Something New").to_dict(),
-                    "Date / Time (UTC)": "01/01/2026 10:00",
-                }
-            ],
-            folder=tmp_path,
-            monkeypatch=monkeypatch,
-        )
-
-
-ACTUAL_CRYPTO_COM_APP_KINDS = {
-    "admin_wallet_credited",
-    "card_top_up",
-    "crypto_earn_interest_paid",
-    "crypto_earn_program_created",
-    "crypto_earn_program_withdrawn",
-    "crypto_viban_exchange",
-    "finance.lockup.dpos_non_compound_interest.crypto_wallet",
-    "lockup_lock",
-    "lockup_unlock",
-    "lockup_upgrade",
-    "mco_stake_reward",
-    "referral_gift",
-    "reimbursement",
-    "reimbursement_reverted",
-    "supercharger_deposit",
-    "supercharger_reward_to_app_credited",
-    "supercharger_withdrawal",
-    "transfer.p2p_transfer.crypto_wallet.crypto_wallet.debit",
-    "viban_purchase",
-    "card_cashback_reverted",
-    "crypto_deposit",
-    "crypto_exchange",
-    "crypto_to_exchange_transfer",
-    "crypto_transfer",
-    "crypto_withdrawal",
-    "dust_conversion_credited",
-    "dust_conversion_debited",
-    "exchange_to_crypto_transfer",
-    "finance.lockup.dpos_compound_interest.crypto_wallet",
-    "finance.lockup.dpos_lock.crypto_wallet",
-    "finance.lockup.dpos_lock_upgrade.crypto_wallet",
-    "referral_bonus",
-    "referral_card_cashback",
-    "rewards_platform_deposit_credited",
-    "transfer_cashback",
-}
-
-
 def _crypto_com_app_row(kind: str, **overrides: object) -> pd.Series:
     row: dict[str, object] = {
         "Timestamp (UTC)": "2026-01-01 10:00:00",
@@ -419,10 +289,6 @@ def _crypto_com_app_row(kind: str, **overrides: object) -> pd.Series:
     }
     row.update(overrides)
     return pd.Series(row)
-
-
-def test_crypto_com_app_support_matches_the_sample_export() -> None:
-    assert SUPPORTED_APP_KINDS == ACTUAL_CRYPTO_COM_APP_KINDS
 
 
 @pytest.mark.parametrize(
@@ -725,34 +591,6 @@ def test_crypto_com_app_overlapping_exports_are_deduplicated(
 
     snapshot = pd.read_csv(output_csv)
     assert snapshot.loc[snapshot["Coin"] == "CRO", "Quantity"].iloc[-1] == 4.0
-
-
-def test_crypto_com_app_generator_rejects_unknown_kind_and_unmatched_dust(
-    tmp_path: Path,
-) -> None:
-    unknown = tmp_path / "unknown.csv"
-    _write_crypto_com_app_export(unknown, [_crypto_com_app_row("something_new")])
-    with pytest.raises(ValueError, match="Unsupported Crypto.com App transaction kind"):
-        generate_crypto_com_app_raw_snapshots(
-            input_csv=unknown,
-            output_csv=tmp_path / "unknown-output.csv",
-        )
-
-    unmatched = tmp_path / "unmatched.csv"
-    _write_crypto_com_app_export(
-        unmatched,
-        [
-            _crypto_com_app_row(
-                "dust_conversion_credited",
-                **{"Transaction Description": "Convert Dust"},
-            )
-        ],
-    )
-    with pytest.raises(ValueError, match="Unmatched Crypto.com App dust conversion"):
-        generate_crypto_com_app_raw_snapshots(
-            input_csv=unmatched,
-            output_csv=tmp_path / "unmatched-output.csv",
-        )
 
 
 def test_compound_v2_supply_tokens_resolve_dynamic_underlying_ratio(

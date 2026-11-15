@@ -258,7 +258,7 @@ class NexoTransactionNormalizer:
         return self._build_send_action(outs=self._normalize_withdrawal_outs(row=row))
 
     def _handle_deposit_over_repayment(self, row: pd.Series) -> NormalizedAction:
-        return self._build_send_action(outs=self._normalize_positive_input_outs(row=row))
+        return self._build_send_action(outs=self._positive_input_entries(row=row))
 
     def _handle_cashback(self, row: pd.Series) -> NormalizedAction:
         return self._build_reward_action(
@@ -291,7 +291,7 @@ class NexoTransactionNormalizer:
         )
 
     def _handle_positive_input_receive(self, row: pd.Series) -> NormalizedAction:
-        return self._build_receive_action(ins=self._normalize_positive_input_ins(row=row))
+        return self._build_receive_action(ins=self._positive_input_entries(row=row))
 
     def _handle_input_output_swap(self, row: pd.Series) -> NormalizedAction:
         ins, outs = self._normalize_input_output_swap(row=row)
@@ -346,14 +346,7 @@ class NexoTransactionNormalizer:
             rewards=[],
         )
 
-    def _normalize_positive_input_ins(self, row: pd.Series) -> list[TxEntry]:
-        input_symbol = self._parse_symbol(value=row.get("Input Currency"))
-        input_amount = self._parse_amount(value=row.get("Input Amount"))
-        if not input_symbol or input_amount <= 0:
-            return []
-        return [TxEntry(token=input_symbol, quantity=input_amount)]
-
-    def _normalize_positive_input_outs(self, row: pd.Series) -> list[TxEntry]:
+    def _positive_input_entries(self, row: pd.Series) -> list[TxEntry]:
         input_symbol = self._parse_symbol(value=row.get("Input Currency"))
         input_amount = self._parse_amount(value=row.get("Input Amount"))
         if not input_symbol or input_amount <= 0:
