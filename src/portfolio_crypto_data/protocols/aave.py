@@ -16,9 +16,13 @@ from portfolio_crypto_data.datetime_utils import (
 )
 from portfolio_crypto_data.pipeline_logging import PipelineLogger
 from portfolio_crypto_data.protocols.common import (
+    call_with_retry,
+    is_active_protocol_quantity,
     load_block_map,
     load_chain_config,
     load_chain_web3,
+    load_existing_clean_history_by_date,
+    load_snapshot_ranges,
     load_tokens,
     resolve_effective_start_date,
     should_skip_date_window,
@@ -62,6 +66,30 @@ ATOKEN_ABI = [
     },
 ]
 
+COMPOUND_V2_CTOKEN_ABI = [
+    {
+        "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [],
+        "name": "exchangeRateStored",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
+        "name": "borrowBalanceStored",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+]
+
 ERC20_ABI = [
     {
         "inputs": [],
@@ -91,6 +119,8 @@ class AaveTokenDescriptor:
     underlying_address: str
     underlying_symbol: str
     leg: str
+    contract_style: str = "aave"
+    underlying_decimals: int = 18
 
 
 def _classify_aave_leg(symbol: str) -> str:
@@ -188,6 +218,29 @@ def _build_aave_descriptors(
     )
     for addr in aave_addresses:
         info = tokens.get(addr, {})
+        contract_style = str(info.get("contract_style", "aave")).lower()
+
+        if contract_style == "compound_v2":
+            leg = str(info.get("position_type", "supply")).lower()
+            token_symbol = str(info.get("symbol", addr))
+            token_decimals = int(info.get("decimals", 8))
+            underlying_sym = str(info.get("underlying_symbol") or info.get("family") or "UNK")
+            underlying_decimals = int(info.get("underlying_decimals", 18))
+            descriptors.append(
+                AaveTokenDescriptor(
+                    token_address=w3.to_checksum_address(addr),
+                    token_symbol=token_symbol,
+                    token_decimals=token_decimals,
+                    underlying_address=addr,
+                    underlying_symbol=underlying_sym,
+                    leg=leg,
+                    contract_style="compound_v2",
+                    underlying_decimals=underlying_decimals,
+                )
+            )
+            progress.update(1)
+            continue
+
         try:
             token_address = w3.to_checksum_address(addr)
             token_contract = w3.eth.contract(address=token_address, abi=ATOKEN_ABI)
@@ -214,6 +267,8 @@ def _build_aave_descriptors(
                     underlying_address=underlying_address,
                     underlying_symbol=underlying_symbol,
                     leg=_classify_aave_leg(token_symbol),
+                    contract_style="aave",
+                    underlying_decimals=token_decimals,
                 )
             )
         except Exception:
@@ -313,8 +368,15 @@ def _derive_aave_bounds_from_transactions(chain: str) -> tuple[str | None, str |
                 latest = dt
 
     start_date = format_daily_datetime(earliest) if earliest else None
-    end_date = format_daily_datetime(latest) if latest else None
 
+    try:
+        ranges = load_snapshot_ranges(chain=chain)
+        if any(is_active_protocol_quantity(ranges.get(w, {}).get("qty")) for w in wrappers):
+            return start_date, "now"
+    except Exception:
+        pass
+
+    end_date = format_daily_datetime(latest) if latest else None
     return start_date, end_date
 
 
@@ -350,10 +412,16 @@ def get_aave_daily_exposure(
         logger.protocol_skip("aave", "aave_daily_exposure", "no Aave token descriptors resolved")
         return
 
-    token_contracts = {
-        d.token_address: w3.eth.contract(address=d.token_address, abi=ATOKEN_ABI)
-        for d in descriptors
-    }
+    token_contracts = {}
+    for d in descriptors:
+        if d.contract_style == "compound_v2":
+            token_contracts[d.token_address] = w3.eth.contract(
+                address=d.token_address, abi=COMPOUND_V2_CTOKEN_ABI
+            )
+        else:
+            token_contracts[d.token_address] = w3.eth.contract(
+                address=d.token_address, abi=ATOKEN_ABI
+            )
 
     day_items = [
         (date_str, block_num)
@@ -368,6 +436,15 @@ def get_aave_daily_exposure(
     first_processed_day: str | None = None
     last_processed_day: str | None = None
     previous_active_symbols: set[str] = set()
+    known_deployed: set[str] = set()
+    prev_supply_by_symbol: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
+    prev_debt_by_symbol: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
+
+    existing_clean_by_date = load_existing_clean_history_by_date(
+        protocol="aave",
+        chain=chain,
+        symbol="aave_daily_exposure",
+    )
 
     day_progress = tqdm(
         total=len(day_items),
@@ -376,6 +453,49 @@ def get_aave_daily_exposure(
         leave=False,
     )
     for date_str, block_num in day_items:
+        norm_date = format_daily_datetime(date_str)
+        if norm_date in existing_clean_by_date:
+            clean_row = existing_clean_by_date[norm_date]
+            history.append(clean_row)
+            if first_processed_day is None:
+                first_processed_day = date_str
+            last_processed_day = date_str
+
+            prev_supply_by_symbol = defaultdict(lambda: Decimal(0))
+            prev_debt_by_symbol = defaultdict(lambda: Decimal(0))
+            curr_symbols: set[str] = set()
+            for col, val in clean_row.items():
+                if val is None:
+                    continue
+                try:
+                    dec_val = Decimal(str(val))
+                except Exception:
+                    continue
+                if col.startswith("supply_"):
+                    sym = col.replace("supply_", "", 1)
+                    prev_supply_by_symbol[sym] = dec_val
+                    if abs(dec_val) > DUST:
+                        curr_symbols.add(sym)
+                elif col.startswith("debt_"):
+                    sym = col.replace("debt_", "", 1)
+                    prev_debt_by_symbol[sym] = dec_val
+                    if abs(dec_val) > DUST:
+                        curr_symbols.add(sym)
+            previous_active_symbols = set(curr_symbols)
+            day_progress.update(1)
+
+            is_post_end_day = normalized_end_date is not None and date_str > normalized_end_date
+            should_stop_after_day = (
+                is_post_end_day
+                and _all_leg_values_within_dust(
+                    supply_by_symbol=prev_supply_by_symbol,
+                    debt_by_symbol=prev_debt_by_symbol,
+                )
+            )
+            if should_stop_after_day:
+                break
+            continue
+
         supply_by_symbol: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
         debt_by_symbol: dict[str, Decimal] = defaultdict(lambda: Decimal(0))
 
@@ -387,21 +507,66 @@ def get_aave_daily_exposure(
             queried_token_count += 1
             contract = token_contracts[desc.token_address]
             try:
-                if len(w3.eth.get_code(contract.address, block_identifier=block_num)) == 0:
-                    missing_contract_count += 1
-                    continue
+                if contract.address not in known_deployed:
+                    code = call_with_retry(
+                        w3.eth.get_code, contract.address, block_identifier=block_num
+                    )
+                    if len(code) == 0:
+                        missing_contract_count += 1
+                        continue
+                    known_deployed.add(contract.address)
 
-                raw_balance = contract.functions.balanceOf(wallet).call(block_identifier=block_num)
-                balance = Decimal(raw_balance) / Decimal(10**desc.token_decimals)
-                if abs(balance) <= DUST:
-                    continue
-
-                if desc.leg == "supply":
-                    supply_by_symbol[desc.underlying_symbol] += balance
+                if desc.contract_style == "compound_v2":
+                    if desc.leg == "supply":
+                        raw_b = call_with_retry(
+                            contract.functions.balanceOf(wallet).call,
+                            block_identifier=block_num,
+                        )
+                        if raw_b > 0:
+                            rate = call_with_retry(
+                                contract.functions.exchangeRateStored().call,
+                                block_identifier=block_num,
+                            )
+                            underlying_raw = (raw_b * rate) // (10**18)
+                            balance = Decimal(underlying_raw) / Decimal(
+                                10**desc.underlying_decimals
+                            )
+                            if abs(balance) > DUST:
+                                supply_by_symbol[desc.underlying_symbol] += balance
+                    elif desc.leg == "debt":
+                        borrow_raw = call_with_retry(
+                            contract.functions.borrowBalanceStored(wallet).call,
+                            block_identifier=block_num,
+                        )
+                        if borrow_raw > 0:
+                            balance = Decimal(borrow_raw) / Decimal(10**desc.underlying_decimals)
+                            if abs(balance) > DUST:
+                                debt_by_symbol[desc.underlying_symbol] += balance
                 else:
-                    debt_by_symbol[desc.underlying_symbol] += balance
+                    raw_balance = call_with_retry(
+                        contract.functions.balanceOf(wallet).call,
+                        block_identifier=block_num,
+                    )
+                    balance = Decimal(raw_balance) / Decimal(10**desc.token_decimals)
+                    if abs(balance) > DUST:
+                        if desc.leg == "supply":
+                            supply_by_symbol[desc.underlying_symbol] += balance
+                        else:
+                            debt_by_symbol[desc.underlying_symbol] += balance
             except Exception:
                 rpc_error_count += 1
+
+        if rpc_error_count > 0 and (prev_supply_by_symbol or prev_debt_by_symbol):
+            for sym, val in prev_supply_by_symbol.items():
+                if sym not in supply_by_symbol:
+                    supply_by_symbol[sym] = val
+            for sym, val in prev_debt_by_symbol.items():
+                if sym not in debt_by_symbol:
+                    debt_by_symbol[sym] = val
+
+        if rpc_error_count == 0:
+            prev_supply_by_symbol = defaultdict(lambda: Decimal(0), supply_by_symbol)
+            prev_debt_by_symbol = defaultdict(lambda: Decimal(0), debt_by_symbol)
 
         leg_columns = _compute_leg_columns(
             supply_by_symbol=supply_by_symbol,

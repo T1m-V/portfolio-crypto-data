@@ -13,7 +13,7 @@ def isolate_portfolio_io(
     tmp_path: Path,
 ) -> Iterator[PortfolioContext]:
     """Run every crypto test inside an explicit temporary portfolio context."""
-    context = PortfolioContext.from_root(tmp_path, load_secrets=False)
+    context = PortfolioContext.load(tmp_path, load_secrets=False)
     for directory in (
         context.paths.prices,
         context.paths.protocol_underlying_tokens,

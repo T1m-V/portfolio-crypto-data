@@ -251,8 +251,13 @@ def test_transaction_analysis_error_is_reported_without_stopping_output(
 
 
 class TokenManager:
+    def __init__(self, tokens: dict | None = None) -> None:
+        self._tokens = tokens or {}
+
     def get_token(self, address: str, fetch_if_missing: bool = False):
-        del address, fetch_if_missing
+        del fetch_if_missing
+        if self._tokens:
+            return self._tokens.get(address.lower())
         return {"symbol": "USDC", "decimals": 6, "resolved": True}
 
 
@@ -363,3 +368,187 @@ def test_analyzer_propagates_transaction_fetch_errors(
             native_symbol="ETH",
             native_decimals=18,
         )
+
+
+def test_compound_borrow_and_repay_events_decoded() -> None:
+    wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ctoken = "0xeadf7c01da7e93fdb5f16b0aa9ee85f978e89e95"
+
+    token_mgr = TokenManager()
+    token_mgr._tokens[ctoken.lower()] = {
+        "symbol": "debtTCRO",
+        "decimals": 18,
+    }
+
+    # Borrow log
+    # borrower (32B), borrowAmount (32B), accountBorrows (32B), totalBorrows (32B)
+    borrow_data = (
+        bytes.fromhex("00" * 12 + wallet[2:])
+        + (100 * 10**18).to_bytes(32)
+        + (100 * 10**18).to_bytes(32)
+        + (1000 * 10**18).to_bytes(32)
+    )
+    borrow_receipt = {
+        "gasUsed": 50_000,
+        "effectiveGasPrice": 10**9,
+        "logs": [
+            {
+                "address": ctoken,
+                "topics": [Web3.keccak(text="Borrow(address,uint256,uint256,uint256)")],
+                "data": borrow_data,
+            }
+        ],
+    }
+
+    ins, outs, _ = transaction_analyzer._get_token_movements(
+        receipt=borrow_receipt,
+        my_address=wallet,
+        token_manager=token_mgr,
+        fetch_metadata=False,
+    )
+    assert len(ins) == 1
+    assert ins[0].symbol == "debtTCRO"
+    assert ins[0].qty == Decimal("100")
+    assert len(outs) == 0
+
+    # Repay log
+    # payer (32 bytes), borrower (32 bytes), repayAmount (32 bytes), accountBorrows, totalBorrows
+    repay_data = (
+        bytes.fromhex("00" * 12 + wallet[2:])
+        + bytes.fromhex("00" * 12 + wallet[2:])
+        + (40 * 10**18).to_bytes(32)
+        + (60 * 10**18).to_bytes(32)
+        + (960 * 10**18).to_bytes(32)
+    )
+    repay_receipt = {
+        "gasUsed": 50_000,
+        "effectiveGasPrice": 10**9,
+        "logs": [
+            {
+                "address": ctoken,
+                "topics": [
+                    Web3.keccak(text="RepayBorrow(address,address,uint256,uint256,uint256)")
+                ],
+                "data": repay_data,
+            }
+        ],
+    }
+
+    ins, outs, _ = transaction_analyzer._get_token_movements(
+        receipt=repay_receipt,
+        my_address=wallet,
+        token_manager=token_mgr,
+        fetch_metadata=False,
+    )
+    assert len(ins) == 0
+    assert len(outs) == 1
+    assert outs[0].symbol == "debtTCRO"
+    assert outs[0].qty == Decimal("40")
+
+
+def test_ignored_transfers_classified_as_reward_when_incoming_exists() -> None:
+    wallet = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    cro = "0xcro"
+    tonic = "0xtonic"
+
+    token_mgr = TokenManager()
+    token_mgr._tokens[cro.lower()] = {"symbol": "CRO", "decimals": 18}
+    token_mgr._tokens[tonic.lower()] = {"symbol": "TONIC", "decimals": 18, "ignore_transfers": True}
+
+    # Simulate swap: TONIC out, CRO in
+    receipt = {
+        "gasUsed": 100_000,
+        "effectiveGasPrice": 5 * 10**9,
+        "logs": [
+            {
+                "address": tonic,
+                "topics": [
+                    Web3.keccak(text="Transfer(address,address,uint256)"),
+                    Web3.to_bytes(hexstr=f"0x{'0' * 24}{wallet[2:]}"),
+                    Web3.to_bytes(hexstr=f"0x{'0' * 24}{'b' * 40}"),
+                ],
+                "data": (50_000 * 10**18).to_bytes(32),
+            },
+            {
+                "address": cro,
+                "topics": [
+                    Web3.keccak(text="Transfer(address,address,uint256)"),
+                    Web3.to_bytes(hexstr=f"0x{'0' * 24}{'b' * 40}"),
+                    Web3.to_bytes(hexstr=f"0x{'0' * 24}{wallet[2:]}"),
+                ],
+                "data": (25 * 10**18).to_bytes(32),
+            },
+        ],
+    }
+
+    ins, outs, _ = transaction_analyzer._get_token_movements(
+        receipt=receipt,
+        my_address=wallet,
+        token_manager=token_mgr,
+        fetch_metadata=False,
+    )
+    # TONIC is ignored, so outs is empty
+    assert len(outs) == 0
+    assert len(ins) == 1
+    assert ins[0].symbol == "CRO"
+
+    had_ignored = transaction_analyzer._is_ignored_outgoing_transfer(
+        log=receipt["logs"][0], my_address=wallet, token_manager=token_mgr
+    )
+    assert had_ignored is True
+
+    formatted = transaction_analyzer._classify_and_format_transaction(
+        tx_hash="0xswap_tonic",
+        date_str="01/01/2025 12:00:00",
+        final_ins=ins,
+        final_outs=outs,
+        fee_val=Decimal("0.005"),
+        fee_token="CRO",
+        approvals=[],
+        had_ignored_out=had_ignored,
+    )
+    assert formatted is not None
+    assert formatted["Type"] == "Reward"
+    assert formatted["Token in"] == "CRO"
+
+
+def test_vvs_net_swap_normalization() -> None:
+    overrides = {
+        "0x44f973ba2712aa643a6ec0409a473f3281aa0fa1fc54b5dfa9a3f29532bfeb5f": {"ignore": True},
+        "0x05282ca5c0ba4ea8a0ec4ca3364f7b6d1947b9736c4f366113b2e5ea0111624c": {
+            "outs": [{"symbol": "CRO", "qty": "68.640624391699397693"}],
+            "ins": [{"symbol": "WBTC", "qty": "0.00113508"}],
+        },
+    }
+    # Nov 2021 VVS entry
+    formatted_entry = transaction_analyzer._classify_and_format_transaction(
+        tx_hash="0x44f973ba2712aa643a6ec0409a473f3281aa0fa1fc54b5dfa9a3f29532bfeb5f",
+        date_str="19/11/2021 12:00:00",
+        final_ins=[],
+        final_outs=[transaction_analyzer.AssetMovement(symbol="CRO", qty=Decimal("348"))],
+        fee_val=Decimal("0.02"),
+        fee_token="CRO",
+        approvals=[],
+        transaction_overrides=overrides,
+    )
+    assert formatted_entry is not None
+    assert formatted_entry["Type"] == "Interaction"
+    assert formatted_entry["Token in"] == ""
+    assert formatted_entry["Token out"] == ""
+
+    # Nov 2021 VVS exit
+    formatted_exit = transaction_analyzer._classify_and_format_transaction(
+        tx_hash="0x05282ca5c0ba4ea8a0ec4ca3364f7b6d1947b9736c4f366113b2e5ea0111624c",
+        date_str="24/11/2021 12:00:00",
+        final_ins=[],
+        final_outs=[],
+        fee_val=Decimal("0.02"),
+        fee_token="CRO",
+        approvals=[],
+        transaction_overrides=overrides,
+    )
+    assert formatted_exit is not None
+    assert formatted_exit["Type"] == "Swap"
+    assert formatted_exit["Token out"] == "CRO"
+    assert formatted_exit["Token in"] == "WBTC"
+    assert formatted_exit["Qty in"] == "0.00113508"

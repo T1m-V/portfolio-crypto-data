@@ -11,6 +11,9 @@ from portfolio_core import PortfolioContext, mutation_session, validate_data_wor
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="portfolio-crypto")
     parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument(
+        "--chain", type=str, default=None, help="Specific chain to update or rebuild"
+    )
     parser.add_argument("command", choices=["update", "rebuild"])
     return parser
 
@@ -61,18 +64,34 @@ def _refresh_crypto_com_app(*, context: PortfolioContext) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    context = PortfolioContext.from_root(args.data_dir)
+    context = PortfolioContext.load(args.data_dir)
     validate_data_workspace(context.paths.root)
     try:
         with context.activate(), mutation_session(paths=context.paths):
+            from portfolio_crypto_data.chain_config import load_evm_chain_configs
             from portfolio_crypto_data.update import rebuild_derived, update_onchain
 
+            chain_configs = None
+            if args.chain:
+                chain_configs = tuple(
+                    c for c in load_evm_chain_configs() if c.chain == args.chain.strip().lower()
+                )
+                if not chain_configs:
+                    raise ValueError(f"Chain '{args.chain}' not found or disabled in config.")
+
             if args.command == "update":
-                update_onchain()
-                _refresh_nexo(context=context)
-                _refresh_crypto_com_app(context=context)
+                if chain_configs is not None:
+                    update_onchain(chain_configs=chain_configs)
+                else:
+                    update_onchain()
+                if not args.chain:
+                    _refresh_nexo(context=context)
+                    _refresh_crypto_com_app(context=context)
             else:
-                rebuild_derived()
+                if chain_configs is not None:
+                    rebuild_derived(chain_configs=chain_configs)
+                else:
+                    rebuild_derived()
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

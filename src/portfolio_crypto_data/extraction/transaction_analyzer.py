@@ -13,6 +13,8 @@ ctx = Context(prec=78, rounding=ROUND_HALF_UP)
 # Pre-calculate Keccak hashes to save compute time in loops
 TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
 APPROVAL_TOPIC = Web3.keccak(text="Approval(address,address,uint256)").hex()
+BORROW_TOPIC = Web3.keccak(text="Borrow(address,uint256,uint256,uint256)").hex()
+REPAY_BORROW_TOPIC = Web3.keccak(text="RepayBorrow(address,address,uint256,uint256,uint256)").hex()
 
 
 @dataclass
@@ -78,10 +80,14 @@ def _calculate_fee(
         Tuple of (fee_amount, fee_token_symbol).
     """
     gas_used = Decimal(receipt["gasUsed"])
-    gas_price = Decimal(receipt["effectiveGasPrice"])
+    gas_price_val = receipt.get("effectiveGasPrice")
+    if gas_price_val is None:
+        gas_price_val = tx.get("gasPrice", 0)
+    gas_price = Decimal(gas_price_val)
     fee_native = (gas_used * gas_price) / (Decimal(10) ** native_decimals)
 
-    if tx["from"].lower() == my_address.lower():
+    from_addr = str(tx.get("from") or "")
+    if from_addr.lower() == my_address.lower():
         return fee_native, native_symbol
     return Decimal(0), ""
 
@@ -106,11 +112,14 @@ def _process_native_transfer(
         Tuple of (incoming_movements, outgoing_movements).
     """
     raw_ins, raw_outs = [], []
-    if tx["value"] > 0:
-        val = Decimal(tx["value"]) / (Decimal(10) ** native_decimals)
-        if tx["to"] and tx["to"].lower() == my_address.lower():
+    val_int = tx.get("value", 0)
+    if val_int > 0:
+        val = Decimal(val_int) / (Decimal(10) ** native_decimals)
+        to_addr = str(tx.get("to") or "")
+        from_addr = str(tx.get("from") or "")
+        if to_addr.lower() == my_address.lower():
             raw_ins.append(AssetMovement(symbol=native_symbol, qty=val))
-        elif tx["from"].lower() == my_address.lower():
+        elif from_addr.lower() == my_address.lower():
             raw_outs.append(AssetMovement(symbol=native_symbol, qty=val))
     return raw_ins, raw_outs
 
@@ -132,9 +141,10 @@ def _process_internal_native_transfer(
     returns:
         List of internal native-asset movements.
     """
-    if tx_hash in internal_native_map:
-        internal_val = Decimal(str(internal_native_map[tx_hash]))
-        return [AssetMovement(symbol=native_symbol, qty=internal_val)]
+    norm_hash = tx_hash.lower()
+    for h, val in internal_native_map.items():
+        if h.lower() == norm_hash:
+            return [AssetMovement(symbol=native_symbol, qty=Decimal(str(val)))]
     return []
 
 
@@ -153,12 +163,30 @@ def _process_log_entry(
     returns:
         Result containing movements or approvals.
     """
-    if not log["topics"]:
+    if not log.get("topics"):
         return LogResult()
 
-    sig = log["topics"][0].hex()
+    sig = log["topics"][0].hex().lower()
+    if not sig.startswith("0x"):
+        sig = "0x" + sig
 
-    if sig == TRANSFER_TOPIC and len(log["topics"]) == 3:
+    transfer_sig = TRANSFER_TOPIC.lower()
+    if not transfer_sig.startswith("0x"):
+        transfer_sig = "0x" + transfer_sig
+
+    approval_sig = APPROVAL_TOPIC.lower()
+    if not approval_sig.startswith("0x"):
+        approval_sig = "0x" + approval_sig
+
+    borrow_sig = BORROW_TOPIC.lower()
+    if not borrow_sig.startswith("0x"):
+        borrow_sig = "0x" + borrow_sig
+
+    repay_sig = REPAY_BORROW_TOPIC.lower()
+    if not repay_sig.startswith("0x"):
+        repay_sig = "0x" + repay_sig
+
+    if sig == transfer_sig and len(log["topics"]) == 3:
         return _handle_transfer_log(
             log=log,
             my_address=my_address,
@@ -166,12 +194,34 @@ def _process_log_entry(
             fetch_metadata=fetch_metadata,
         )
 
-    elif sig == APPROVAL_TOPIC and len(log["topics"]) == 3:
+    if sig == approval_sig and len(log["topics"]) == 3:
         return _handle_approval_log(
             log=log,
             my_address=my_address,
             token_manager=token_manager,
             fetch_metadata=fetch_metadata,
+        )
+
+    if sig == borrow_sig:
+        return _handle_compound_borrow_event(
+            log=log,
+            my_address=my_address,
+            token_manager=token_manager,
+            fetch_metadata=fetch_metadata,
+            borrower_offset=24,
+            amount_offset=64,
+            is_repay=False,
+        )
+
+    if sig == repay_sig:
+        return _handle_compound_borrow_event(
+            log=log,
+            my_address=my_address,
+            token_manager=token_manager,
+            fetch_metadata=fetch_metadata,
+            borrower_offset=88,
+            amount_offset=128,
+            is_repay=True,
         )
 
     return LogResult()
@@ -200,7 +250,7 @@ def _handle_transfer_log(
         return LogResult()
 
     token_info = token_manager.get_token(address=token_addr, fetch_if_missing=fetch_metadata)
-    if not token_info:
+    if not token_info or token_info.get("ignore_transfers"):
         return LogResult()
 
     raw_amount_int = int(log["data"].hex(), 16)
@@ -238,6 +288,58 @@ def _handle_approval_log(
     return LogResult()
 
 
+def _handle_compound_borrow_event(
+    log: dict[str, Any],
+    my_address: str,
+    token_manager: TokenManager,
+    fetch_metadata: bool,
+    *,
+    borrower_offset: int,
+    amount_offset: int,
+    is_repay: bool,
+) -> LogResult:
+    """
+    Parses a Compound v2 / Tectonic Borrow or RepayBorrow log.
+    """
+    data_hex = log["data"].hex()
+    if data_hex.startswith("0x"):
+        data_hex = data_hex[2:]
+    if len(data_hex) < amount_offset + 64:
+        return LogResult()
+
+    borrower = "0x" + data_hex[borrower_offset : borrower_offset + 40]
+    if borrower.lower() != my_address.lower():
+        return LogResult()
+
+    raw_amount_int = int(data_hex[amount_offset : amount_offset + 64], 16)
+    token_info = token_manager.get_token(address=log["address"], fetch_if_missing=fetch_metadata)
+    decimals = int(token_info.get("decimals", 18)) if token_info else 18
+    symbol = token_info.get("symbol", "UNK") if token_info else "UNK"
+    readable_amount = Decimal(raw_amount_int) / (Decimal(10) ** decimals)
+    movement = AssetMovement(symbol=symbol, qty=readable_amount)
+    return LogResult(outgoing=movement) if is_repay else LogResult(incoming=movement)
+
+
+def _is_ignored_outgoing_transfer(
+    log: dict[str, Any], my_address: str, token_manager: TokenManager
+) -> bool:
+    if not log.get("topics") or len(log["topics"]) != 3:
+        return False
+    sig = log["topics"][0].hex().lower()
+    if not sig.startswith("0x"):
+        sig = "0x" + sig
+    transfer_sig = TRANSFER_TOPIC.lower()
+    if not transfer_sig.startswith("0x"):
+        transfer_sig = "0x" + transfer_sig
+    if sig != transfer_sig:
+        return False
+    from_addr = "0x" + log["topics"][1].hex()[-40:]
+    if from_addr.lower() != my_address.lower():
+        return False
+    token_info = token_manager.get_token(address=log["address"], fetch_if_missing=False)
+    return bool(token_info and token_info.get("ignore_transfers"))
+
+
 def _get_token_movements(
     receipt: dict[str, Any], my_address: str, token_manager: TokenManager, fetch_metadata: bool
 ) -> tuple[list[AssetMovement], list[AssetMovement], list[str]]:
@@ -254,7 +356,7 @@ def _get_token_movements(
         Tuple of (incoming, outgoing, approvals).
     """
     raw_ins, raw_outs, approvals = [], [], []
-    for log in receipt["logs"]:
+    for log in receipt.get("logs", []):
         result = _process_log_entry(
             log=log,
             my_address=my_address,
@@ -327,6 +429,8 @@ def _classify_and_format_transaction(
     fee_val: Decimal,
     fee_token: str,
     approvals: list[str],
+    had_ignored_out: bool = False,
+    transaction_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """
     Determines transaction type and formats final output.
@@ -339,10 +443,29 @@ def _classify_and_format_transaction(
         fee_val: Transaction fee amount.
         fee_token: Fee token symbol.
         approvals: List of approval strings.
+        had_ignored_out: Whether an ignored token was sent out.
+        transaction_overrides: Optional per-hash overrides for manual corrections.
 
     returns:
         Dictionary of transaction details or None if ignored.
     """
+    if transaction_overrides:
+        override = transaction_overrides.get(tx_hash.lower())
+        if override:
+            if override.get("ignore"):
+                final_ins = []
+                final_outs = []
+            if "outs" in override:
+                final_outs = [
+                    AssetMovement(symbol=x["symbol"], qty=Decimal(str(x["qty"])))
+                    for x in override["outs"]
+                ]
+            if "ins" in override:
+                final_ins = [
+                    AssetMovement(symbol=x["symbol"], qty=Decimal(str(x["qty"])))
+                    for x in override["ins"]
+                ]
+
     qtys_in = [x.qty for x in final_ins]
     sum_in = sum(qtys_in, Decimal(0))
     has_in = bool(final_ins and sum_in > 0)
@@ -355,7 +478,7 @@ def _classify_and_format_transaction(
     if has_in and has_out:
         tx_type = "Swap"
     elif has_in:
-        tx_type = "Receive"
+        tx_type = "Reward" if had_ignored_out else "Receive"
     elif has_out:
         tx_type = "Send"
     elif approvals:
@@ -387,6 +510,7 @@ def analyze_transaction(
     fetch_metadata: bool,
     native_symbol: str,
     native_decimals: int,
+    transaction_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """
     Orchestrates the analysis of a single transaction.
@@ -442,6 +566,11 @@ def analyze_transaction(
     raw_ins.extend(log_ins)
     raw_outs.extend(log_outs)
 
+    had_ignored_out = any(
+        _is_ignored_outgoing_transfer(log=log, my_address=my_address, token_manager=token_manager)
+        for log in receipt.get("logs", [])
+    )
+
     final_ins, final_outs = _net_token_movements(raw_ins=raw_ins, raw_outs=raw_outs)
 
     return _classify_and_format_transaction(
@@ -452,4 +581,6 @@ def analyze_transaction(
         fee_val=fee_val,
         fee_token=fee_token,
         approvals=approvals,
+        had_ignored_out=had_ignored_out,
+        transaction_overrides=transaction_overrides,
     )

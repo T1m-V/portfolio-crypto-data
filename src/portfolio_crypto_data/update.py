@@ -6,7 +6,11 @@ from datetime import date
 
 from portfolio_core import active_context
 
-from portfolio_crypto_data.accounting import accounting_paths, build_accounting_artifacts
+from portfolio_crypto_data.accounting import (
+    accounting_paths,
+    build_accounting_artifacts,
+    validate_direct_snapshot_prices,
+)
 from portfolio_crypto_data.chain_config import EvmChainConfig, load_evm_chain_configs
 from portfolio_crypto_data.composition.lp_pricing import generate_protocol_lp_price_files
 from portfolio_crypto_data.dashboard_artifacts import build_chain_dashboard_artifacts
@@ -15,6 +19,7 @@ from portfolio_crypto_data.pipeline_logging import PipelineLogger
 from portfolio_crypto_data.protocols.aave import process_all_aave_tokens
 from portfolio_crypto_data.protocols.balancer import process_all_balancer_tokens
 from portfolio_crypto_data.protocols.beefy import process_all_beefy_tokens
+from portfolio_crypto_data.protocols.common import sync_block_map
 from portfolio_crypto_data.protocols.curve import process_all_curve_tokens
 from portfolio_crypto_data.protocols.liquid_staking import process_all_liquid_staking_tokens
 from portfolio_crypto_data.raw_snapshots import generate_raw_snapshots
@@ -66,6 +71,7 @@ def _build_snapshots(*, config: EvmChainConfig) -> None:
         principal_events_csv=principal.principal_events,
         principal_daily_csv=principal.principal_daily,
     )
+    validate_direct_snapshot_prices(chain=config.chain)
 
 
 def _refresh_protocols(*, config: EvmChainConfig, logger: PipelineLogger) -> None:
@@ -107,6 +113,10 @@ def _update_chain(*, config: EvmChainConfig, logger: PipelineLogger) -> None:
     logger.stage_end(f"{chain}:snapshots")
 
     if config.protocols:
+        logger.stage_start(f"{chain}:block_map")
+        sync_block_map(chain=chain, config=config)
+        logger.stage_end(f"{chain}:block_map")
+
         logger.stage_start(f"{chain}:protocols")
         _refresh_protocols(config=config, logger=logger)
         logger.stage_end(f"{chain}:protocols")

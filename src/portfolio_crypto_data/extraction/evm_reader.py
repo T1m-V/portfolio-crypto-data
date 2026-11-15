@@ -1,4 +1,6 @@
 import asyncio
+import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -69,7 +71,7 @@ def _fetch_explorer_data(
     max_retries: int = 3,
 ) -> list[Any]:
     """
-    Executes a GET request to the Explorer API.
+    Executes a GET request to the Explorer API (Etherscan v2 schema).
 
     args:
         api_url: API endpoint URL.
@@ -125,6 +127,67 @@ def _fetch_explorer_data(
     return []
 
 
+def _fetch_cronos_table_data(
+    endpoint_url: str,
+    address: str,
+    timeout_seconds: int = 20,
+    max_retries: int = 4,
+) -> list[dict[str, Any]]:
+    """
+    Fetches paginated transactions from explorer.cronos.org/table/* Next.js SSR endpoints.
+    """
+    all_rows: list[dict[str, Any]] = []
+    page = 1
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    while True:
+        params = {"address": address, "p": page}
+        data = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = requests.get(
+                    endpoint_url,
+                    params=params,
+                    headers=headers,
+                    timeout=timeout_seconds,
+                )
+                resp.raise_for_status()
+                match = re.search(
+                    r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+                    resp.text,
+                    re.DOTALL,
+                )
+                if match:
+                    nd = json.loads(match.group(1))
+                    data = nd.get("props", {}).get("pageProps", {}).get("data", {})
+                else:
+                    try:
+                        data = resp.json()
+                    except Exception:
+                        data = None
+                break
+            except Exception as e:
+                if attempt == max_retries:
+                    raise ExplorerAPIError(
+                        f"Cronos explorer request failed for {endpoint_url}: {e}"
+                    ) from e
+                time.sleep(0.5 * (2**attempt))
+
+        if not isinstance(data, dict):
+            break
+        rows = data.get("result") or data.get("data")
+        if not isinstance(rows, list) or not rows:
+            break
+        all_rows.extend(rows)
+        pag = data.get("pagination") or {}
+        total_page = pag.get("totalPage", 1)
+        if page >= total_page:
+            break
+        page += 1
+        time.sleep(0.1)
+
+    return all_rows
+
+
 def _parse_input_date_to_utc(date_str: str) -> datetime:
     parsed = parse_transaction_datetime(date_str)
     if parsed is None:
@@ -164,7 +227,7 @@ def _normalize_results_frame(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _safe_timestamp(tx: dict[str, Any]) -> int:
     try:
-        return int(tx.get("timeStamp", 0))
+        return int(tx.get("timeStamp") or tx.get("blockTimestamp") or tx.get("timestamp") or 0)
     except (TypeError, ValueError):
         return 0
 
@@ -178,6 +241,7 @@ def get_all_transaction_hashes(
     start_ts: int,
     end_ts: int,
     include_chain_id: bool,
+    supplementary_hashes: tuple[str, ...] | list[str] | set[str] = (),
 ) -> tuple[set[str], set[str], list[Any]]:
     """
     Retrieves transaction hashes from multiple API endpoints.
@@ -193,6 +257,61 @@ def get_all_transaction_hashes(
     returns:
         Tuple of (standard_hashes, all_hashes, internal_txs).
     """
+    is_cronos = "explorer.cronos.org" in api_url.lower()
+
+    if is_cronos:
+        base_url = api_url.rstrip("/")
+        if not base_url.endswith("/table"):
+            base_url = f"{base_url}/table"
+
+        std_rows = _fetch_cronos_table_data(f"{base_url}/getTransactions", address)
+        tok_rows = _fetch_cronos_table_data(f"{base_url}/addressTransfers", address)
+        int_rows = _fetch_cronos_table_data(f"{base_url}/getInternalTransactions", address)
+
+        hashes_std = set()
+        for tx in std_rows:
+            tx_hash = tx.get("hash") or tx.get("transactionHash")
+            ts = _safe_timestamp(tx)
+            if tx_hash and start_ts <= ts <= end_ts:
+                hashes_std.add(tx_hash)
+
+        hashes_tok = set()
+        for tx in tok_rows:
+            tx_hash = tx.get("transactionHash") or tx.get("hash")
+            ts = _safe_timestamp(tx)
+            if tx_hash and start_ts <= ts <= end_ts:
+                hashes_tok.add(tx_hash)
+
+        hashes_int = set()
+        normalized_int_txs = []
+        seen_internal = set()
+        for tx in int_rows:
+            tx_hash = tx.get("transactionHash") or tx.get("hash")
+            if not tx_hash:
+                continue
+            idx = str(tx.get("index", 0))
+            dedup_key = (tx_hash.lower(), idx)
+            if dedup_key in seen_internal:
+                continue
+            seen_internal.add(dedup_key)
+
+            ts = _safe_timestamp(tx)
+            if start_ts <= ts <= end_ts:
+                hashes_int.add(tx_hash)
+                to_val = tx.get("to")
+                to_addr = to_val.get("address") if isinstance(to_val, dict) else str(to_val or "")
+                normalized_int_txs.append(
+                    {
+                        "hash": tx_hash,
+                        "to": to_addr,
+                        "value": tx.get("value", "0"),
+                    }
+                )
+
+        supplementary = set(supplementary_hashes)
+        all_hashes = hashes_std | hashes_tok | hashes_int | supplementary
+        return hashes_std, all_hashes, normalized_int_txs
+
     base_params: dict[str, Any] = {
         "module": "account",
         "address": address,
@@ -215,12 +334,11 @@ def get_all_transaction_hashes(
     hashes_tok = {tx["hash"] for tx in txs_tok if start_ts <= _safe_timestamp(tx) <= end_ts}
 
     # 3. Internal Transactions
-    # We return the raw list to map values later, but here we just need hashes
     p_int = {**base_params, "action": "txlistinternal"}
     txs_int = _fetch_explorer_data(api_url=api_url, params=p_int)
     hashes_int = {tx["hash"] for tx in txs_int if start_ts <= _safe_timestamp(tx) <= end_ts}
 
-    all_hashes = hashes_std | hashes_tok | hashes_int
+    all_hashes = hashes_std | hashes_tok | hashes_int | set(supplementary_hashes)
     return hashes_std, all_hashes, txs_int
 
 
@@ -241,14 +359,18 @@ def build_internal_native_map(
     returns:
         Dictionary mapping transaction hashes to native-asset amounts.
     """
-    internal_map = {}
+    internal_map: dict[str, Decimal] = {}
     for tx in txs_internal:
-        # Check if 'to' exists (contract creation has None/empty 'to')
         value = Decimal(str(tx.get("value", "0")))
-        if tx.get("to") and tx["to"].lower() == my_address and value > 0:
-            tx_hash = tx["hash"]
-            amount = value / (Decimal(10) ** native_decimals)
-            internal_map[tx_hash] = internal_map.get(tx_hash, Decimal(0)) + amount
+        to_addr = tx.get("to")
+        if isinstance(to_addr, dict):
+            to_addr = to_addr.get("address")
+        to_str = str(to_addr or "")
+        if to_str and to_str.lower() == my_address.lower() and value > 0:
+            tx_hash = tx.get("hash") or tx.get("transactionHash")
+            if tx_hash:
+                amount = value / (Decimal(10) ** native_decimals)
+                internal_map[tx_hash] = internal_map.get(tx_hash, Decimal(0)) + amount
     return internal_map
 
 
@@ -292,6 +414,7 @@ async def retrieve_transactions(config: EvmChainConfig) -> TransactionRetrievalR
         start_ts=start_ts,
         end_ts=end_ts,
         include_chain_id=config.explorer_include_chain_id,
+        supplementary_hashes=config.supplementary_transactions,
     )
 
     internal_map = build_internal_native_map(
@@ -318,31 +441,46 @@ async def retrieve_transactions(config: EvmChainConfig) -> TransactionRetrievalR
     results = []
     failures: list[TransactionAnalysisFailure] = []
 
-    # RPC Rate Limit Protection
-    semaphore = asyncio.Semaphore(5)
+    overrides_path = paths.crypto_transactions / f"{chain}_overrides.json"
+    tx_overrides: dict[str, dict[str, Any]] = {}
+    if overrides_path.exists():
+        try:
+            overrides_data = json.loads(overrides_path.read_text(encoding="utf-8"))
+            tx_overrides = overrides_data.get("transaction_overrides", {})
+        except Exception as e:
+            print(f"Warning: could not read overrides from {overrides_path}: {e}")
 
-    # Wrap sync analysis so a failed transaction can be reported without stopping
-    # the rest of the batch.
+    semaphore = asyncio.Semaphore(config.rpc_concurrency)
+
+    # Wrap sync analysis with retry/backoff on RPC rate limits
     async def analyze_wrapper(
         tx_hash: str,
         fetch_meta: bool,
     ) -> tuple[str, dict[str, Any] | None, Exception | None]:
         async with semaphore:
-            try:
-                result = await asyncio.to_thread(
-                    analyze_transaction,
-                    tx_hash=tx_hash,
-                    w3=w3,
-                    my_address=my_address,
-                    token_manager=token_manager,
-                    internal_native_map=internal_map,
-                    fetch_metadata=fetch_meta,
-                    native_symbol=config.native_symbol,
-                    native_decimals=config.native_decimals,
-                )
-                return tx_hash, result, None
-            except Exception as exc:
-                return tx_hash, None, exc
+            for attempt in range(5):
+                try:
+                    result = await asyncio.to_thread(
+                        analyze_transaction,
+                        tx_hash=tx_hash,
+                        w3=w3,
+                        my_address=my_address,
+                        token_manager=token_manager,
+                        internal_native_map=internal_map,
+                        fetch_metadata=fetch_meta,
+                        native_symbol=config.native_symbol,
+                        native_decimals=config.native_decimals,
+                        transaction_overrides=tx_overrides,
+                    )
+                    return tx_hash, result, None
+                except Exception as exc:
+                    if "429" in str(exc) and attempt < 4:
+                        await asyncio.sleep(1.0 * (2**attempt))
+                        continue
+                    if attempt == 4:
+                        return tx_hash, None, exc
+                    await asyncio.sleep(0.5)
+            return tx_hash, None, RuntimeError(f"Exhausted retries for {tx_hash}")
 
     async def analyze_batch(
         tx_hashes: list[str],
@@ -369,7 +507,6 @@ async def retrieve_transactions(config: EvmChainConfig) -> TransactionRetrievalR
 
     try:
         # 5. Phase A: Process Standard Transactions
-        # We process these first and ALLOW fetching metadata (updating token DB)
         if std_list:
             print(f"Processing {len(std_list)} Standard TXs (Async)...")
             batch_results, batch_failures = await analyze_batch(

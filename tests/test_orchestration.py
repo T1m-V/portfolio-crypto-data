@@ -167,3 +167,32 @@ def test_update_rejects_unsupported_protocol_before_running_pipeline() -> None:
 
     with pytest.raises(ValueError, match="unsupported protocol.*unknown"):
         update.update_onchain(chain_configs=(config,))
+
+
+def test_build_snapshots_fails_fast_when_direct_token_lacks_price(
+    monkeypatch: pytest.MonkeyPatch,
+    isolate_portfolio_io,
+) -> None:
+    import pandas as pd
+
+    config = _chain_config("arbitrum", native_symbol="ETH", protocols=("beefy",))
+    tx_path = isolate_portfolio_io.paths.crypto_transactions / "arbitrum_transactions.csv"
+    tx_path.write_text("Date,Action,Coin,Quantity\n", encoding="utf-8")
+
+    def fake_generate_raw_snapshots(*, output_csv: Path, **_) -> None:
+        pd.DataFrame(
+            {
+                "Date": ["2025-10-06 00:00:00"],
+                "Coin": ["MAGIC"],
+                "Quantity": [1.0],
+                "Principal Invested": [0.0],
+            }
+        ).to_csv(output_csv, index=False)
+
+    monkeypatch.setattr(update, "generate_raw_snapshots", fake_generate_raw_snapshots)
+
+    with pytest.raises(
+        ValueError,
+        match="Missing EUR price for direct token 'MAGIC' on 2025-10-06",
+    ):
+        update._build_snapshots(config=config)

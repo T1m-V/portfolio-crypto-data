@@ -43,6 +43,3 @@ class PipelineLogger:
                 f"[{protocol}] {symbol}: day {day_index}/{total_days} "
                 f"{date_str} block={block_number}"
             )
-
-
-NULL_LOGGER = PipelineLogger(enabled=False)

@@ -49,6 +49,7 @@ def test_chain_configs_are_typed_sorted_and_capability_driven(tmp_path: Path) ->
 
     assert [config.chain for config in configs] == ["arbitrum", "cronos"]
     assert configs[0].protocols == ("aave", "beefy")
+    assert configs[0].rpc_concurrency == 5
     assert configs[1].native_symbol == "CRO"
     assert not configs[1].explorer_include_chain_id
 

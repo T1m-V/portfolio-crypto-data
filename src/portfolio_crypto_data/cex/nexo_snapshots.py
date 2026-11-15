@@ -801,7 +801,7 @@ class NexoTransactionNormalizer:
     @staticmethod
     def _parse_amount(value: object) -> Decimal:
         text = "" if pd.isna(value) else str(value).strip()
-        if not text:
+        if not text or text == "-":
             return Decimal(0)
         try:
             return Decimal(text)

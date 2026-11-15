@@ -1,5 +1,6 @@
 import csv
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -8,17 +9,58 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import requests
 from portfolio_core import active_context, atomic_write_text
 from web3 import Web3
+from web3.exceptions import BadFunctionCallOutput, ContractLogicError
 
 from portfolio_crypto_data.chain_config import EvmChainConfig, load_evm_chain_config
 from portfolio_crypto_data.datetime_utils import (
     format_daily_datetime,
     parse_daily_datetime,
+    parse_transaction_datetime_series,
 )
 from portfolio_crypto_data.pipeline_logging import PipelineLogger
 
-ACTIVE_PROTOCOL_QUANTITY_THRESHOLD = Decimal("0.00000001")
+ACTIVE_PROTOCOL_QUANTITY_THRESHOLD = Decimal("0.0001")
+
+
+def is_transient_rpc_error(exc: Exception) -> bool:
+    if isinstance(exc, (ContractLogicError, BadFunctionCallOutput)):
+        return False
+
+    msg = str(exc).lower()
+    if any(
+        hint in msg
+        for hint in ("429", "rate limit", "too many requests", "timeout", "timed out", "retry")
+    ):
+        return True
+
+    if isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError)):
+        return True
+
+    if isinstance(exc, requests.exceptions.HTTPError):
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        return code in {429, 500, 502, 503, 504}
+
+    if isinstance(exc, (TimeoutError, ConnectionResetError, ConnectionRefusedError)):
+        return True
+
+    return False
+
+
+def call_with_retry(
+    fn: Any, *args: Any, max_retries: int = 5, backoff: float = 0.5, **kwargs: Any
+) -> Any:
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if not is_transient_rpc_error(exc):
+                raise
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(backoff * (2**attempt))
 
 
 @dataclass(frozen=True)
@@ -33,8 +75,8 @@ def load_chain_config(chain: str) -> EvmChainConfig:
     return load_evm_chain_config(chain=chain)
 
 
-def load_chain_web3(chain: str) -> Web3:
-    cfg = load_chain_config(chain=chain)
+def load_chain_web3(chain: str, config: EvmChainConfig | None = None) -> Web3:
+    cfg = config or load_chain_config(chain=chain)
     w3 = Web3(provider=Web3.HTTPProvider(endpoint_uri=cfg.rpc_url))
     if not w3.is_connected():
         raise ConnectionError(f"Connection failed for chain '{chain}'.")
@@ -105,6 +147,98 @@ def load_block_map(chain: str) -> dict[str, int]:
     return block_map
 
 
+def sync_block_map(chain: str, config: EvmChainConfig | None = None) -> dict[str, int]:
+    """
+    Ensures block_map_{chain}.csv is up to date through today.
+    """
+    map_file_path = active_context().paths.block_map / f"block_map_{chain}.csv"
+    map_file_path.parent.mkdir(parents=True, exist_ok=True)
+    block_map = load_block_map(chain=chain)
+
+    today_dt = datetime.now(tz=timezone.utc).date()
+    if block_map:
+        last_date_str = max(block_map.keys())
+        parsed_last = parse_daily_datetime(last_date_str)
+        if parsed_last is not None and parsed_last.date() >= today_dt:
+            return block_map
+
+    try:
+        w3 = load_chain_web3(chain=chain, config=config)
+    except Exception:
+        return block_map
+
+    def safe_get_block(identifier: Any) -> Any:
+        for attempt in range(6):
+            try:
+                return w3.eth.get_block(identifier)
+            except Exception:
+                if attempt == 5:
+                    raise
+                time.sleep(0.5 * (2**attempt))
+
+    try:
+        latest_b = safe_get_block("latest")
+        latest_block = int(latest_b.number)
+        latest_ts = int(latest_b.timestamp)
+    except Exception:
+        return block_map
+
+    if not block_map:
+        start_date = today_dt - timedelta(days=30)
+        tx_path = active_context().paths.crypto_transactions / f"{chain}_transactions.csv"
+        if tx_path.exists():
+            try:
+                df = pd.read_csv(tx_path, usecols=["Date"])
+                min_dt = parse_transaction_datetime_series(df["Date"]).min()
+                if pd.notna(min_dt):
+                    start_date = min_dt.date()
+            except Exception:
+                pass
+        curr_block = 1
+    else:
+        last_date_str = max(block_map.keys())
+        parsed_last = parse_daily_datetime(last_date_str)
+        assert parsed_last is not None
+        start_date = parsed_last.date() + timedelta(days=1)
+        curr_block = block_map[last_date_str]
+
+    if start_date > today_dt:
+        return block_map
+
+    curr = start_date
+    while curr <= today_dt:
+        target_dt = datetime.combine(curr, datetime.min.time(), tzinfo=timezone.utc)
+        target_ts = int(target_dt.timestamp())
+        if target_ts >= latest_ts:
+            block = latest_block
+        else:
+            try:
+                curr_b = safe_get_block(curr_block)
+                curr_ts = int(curr_b.timestamp)
+                if curr_ts >= latest_ts or curr_block >= latest_block:
+                    block = latest_block
+                else:
+                    ratio = (target_ts - curr_ts) / (latest_ts - curr_ts)
+                    block = min(
+                        latest_block,
+                        max(curr_block, int(curr_block + ratio * (latest_block - curr_block))),
+                    )
+            except Exception:
+                block = curr_block
+        date_str = f"{curr.strftime('%Y-%m-%d')} 00:00:00"
+        block_map[date_str] = block
+        curr_block = block
+        curr += timedelta(days=1)
+
+    with open(map_file_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "block"])
+        for ds in sorted(block_map.keys()):
+            writer.writerow([ds, block_map[ds]])
+
+    return block_map
+
+
 def protocol_history_output_path(
     protocol: str,
     chain: str,
@@ -165,6 +299,38 @@ def get_output_max_processed_date(
         return max_date
 
 
+def earliest_unresolved_error_date(
+    protocol: str,
+    chain: str,
+    symbol: str,
+    *,
+    protocol_root: Path | None = None,
+) -> datetime | None:
+    output_file = protocol_history_output_path(
+        protocol=protocol,
+        chain=chain,
+        symbol=symbol,
+        protocol_root=protocol_root,
+    )
+    if not output_file.exists():
+        return None
+
+    with open(file=output_file, mode="r", encoding="utf-8") as f:
+        reader = csv.DictReader(f=f)
+        if not reader.fieldnames or "date" not in reader.fieldnames:
+            return None
+
+        min_error_date: datetime | None = None
+        for row in reader:
+            parsed = _parse_history_date(raw_value=row.get("date"))
+            if parsed is None:
+                continue
+            if int(row.get("rpc_error_count") or 0) > 0:
+                if min_error_date is None or parsed < min_error_date:
+                    min_error_date = parsed
+        return min_error_date
+
+
 def resolve_effective_start_date(
     *,
     protocol: str,
@@ -176,6 +342,18 @@ def resolve_effective_start_date(
     normalized_fallback_start: str | None = None
     if fallback_start_date:
         normalized_fallback_start = format_daily_datetime(fallback_start_date)
+
+    error_date = earliest_unresolved_error_date(
+        protocol=protocol,
+        chain=chain,
+        symbol=symbol,
+        protocol_root=protocol_root,
+    )
+    if error_date is not None:
+        inferred_error_start = format_daily_datetime(error_date)
+        if normalized_fallback_start:
+            return max(inferred_error_start, normalized_fallback_start)
+        return inferred_error_start
 
     max_processed_date = get_output_max_processed_date(
         protocol=protocol,
@@ -280,6 +458,41 @@ def _read_existing_history_rows(output_file: Path) -> list[dict[str, object]]:
     with open(file=output_file, mode="r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f=f)
         return [dict(row) for row in reader]
+
+
+def load_existing_clean_history_by_date(
+    protocol: str,
+    chain: str,
+    symbol: str,
+    *,
+    protocol_root: Path | None = None,
+) -> dict[str, dict[str, object]]:
+    output_file = protocol_history_output_path(
+        protocol=protocol,
+        chain=chain,
+        symbol=symbol,
+        protocol_root=protocol_root,
+    )
+    if not output_file.exists():
+        return {}
+
+    clean_by_date: dict[str, dict[str, object]] = {}
+    for row in _read_existing_history_rows(output_file=output_file):
+        date_key, normalized = _normalize_history_row(row=row)
+        if not date_key:
+            continue
+        err_count = int(normalized.get("rpc_error_count") or 0)
+        if err_count > 0:
+            continue
+        if protocol == "aave":
+            has_val = any(
+                k.startswith(("supply_", "debt_")) and normalized.get(k) is not None
+                for k in normalized
+            )
+            if not has_val and int(normalized.get("queried_token_count") or 0) > 0:
+                continue
+        clean_by_date[date_key] = normalized
+    return clean_by_date
 
 
 def write_protocol_history_csv(

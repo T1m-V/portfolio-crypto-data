@@ -108,6 +108,45 @@ def _derive_aave_price_source(symbol: str, meta: dict[str, Any] | None) -> str:
     return aave_base_symbol(symbol, meta)
 
 
+def _load_aave_supply_by_date(
+    *,
+    chain: str,
+    protocol_root: Path,
+) -> dict[date, dict[str, Decimal]]:
+    exposure_path = protocol_root / "aave" / f"{chain}_aave_daily_exposure.csv"
+    if not exposure_path.exists():
+        return {}
+
+    frame = pd.read_csv(exposure_path)
+    if "date" not in frame.columns:
+        return {}
+
+    supply_cols = [
+        col for col in frame.columns if isinstance(col, str) and col.startswith("supply_")
+    ]
+    if not supply_cols:
+        return {}
+
+    by_date: dict[date, dict[str, Decimal]] = {}
+    for _, row in frame.iterrows():
+        ts = pd.Timestamp(row["date"])
+        if pd.isna(ts):
+            continue
+        row_supplies: dict[str, Decimal] = {}
+        for col in supply_cols:
+            val = row[col]
+            if pd.isna(val):
+                continue
+            qty = Decimal(str(val))
+            if qty > 0:
+                underlying = sanitize_symbol(col.replace("supply_", "", 1))
+                if underlying:
+                    row_supplies[underlying] = qty
+        if row_supplies:
+            by_date[ts.date()] = row_supplies
+    return by_date
+
+
 @dataclass
 class CryptoPosition:
     """Tracks the running state and calculations of a single crypto position."""
@@ -243,6 +282,77 @@ class PortfolioLedger:
         self.daily_coin_cache: dict[str, int] = {}
         self.current_date: date | None = None
         self.unresolved_prices: list[UnresolvedPriceEvent] = []
+        self.aave_supply_by_date = _load_aave_supply_by_date(
+            chain=chain,
+            protocol_root=paths.protocol_underlying_tokens,
+        )
+        self.dynamic_underlying_ratios: dict[str, float] = {}
+        self.last_ratio_sync_date: date | None = None
+
+    def is_compound_v2_supply(self, coin: str) -> bool:
+        meta = self.symbol_to_meta.get(sanitize_symbol(coin))
+        if not meta:
+            return False
+        return (
+            str(meta.get("contract_style") or "").lower() == "compound_v2"
+            and str(meta.get("position_type") or "").lower() == "supply"
+        )
+
+    def matches_underlying(self, ctoken_coin: str, other_coin: str) -> bool:
+        c_meta = self.symbol_to_meta.get(sanitize_symbol(ctoken_coin)) or {}
+        o_norm = sanitize_symbol(other_coin)
+        o_meta = self.symbol_to_meta.get(o_norm) or {}
+        c_targets = {
+            sanitize_symbol(c_meta.get("underlying_symbol")),
+            sanitize_symbol(c_meta.get("family")),
+            sanitize_symbol(c_meta.get("price_source")),
+        } - {""}
+        o_candidates = {
+            o_norm,
+            sanitize_symbol(o_meta.get("underlying_symbol")),
+            sanitize_symbol(o_meta.get("family")),
+            sanitize_symbol(o_meta.get("price_source")),
+        } - {""}
+        return bool(c_targets & o_candidates)
+
+    def sync_daily_underlying_ratios(self, date_value: object) -> None:
+        ts = pd.Timestamp(date_value)
+        if pd.isna(ts):
+            return
+        tx_date = ts.date()
+        if self.last_ratio_sync_date == tx_date:
+            return
+        self.last_ratio_sync_date = tx_date
+        supply_row = self.aave_supply_by_date.get(tx_date)
+        if not supply_row:
+            return
+        for coin, asset in self.assets.items():
+            if not self.is_compound_v2_supply(coin) or asset.quantity <= 0:
+                continue
+            meta = self.symbol_to_meta.get(coin) or {}
+            underlying = _derive_aave_price_source(coin, meta)
+            supply_qty = supply_row.get(underlying)
+            if supply_qty is not None and supply_qty > 0:
+                self.dynamic_underlying_ratios[coin] = float(supply_qty / asset.quantity)
+
+    def update_swap_underlying_ratio(self, *, ins: list[TxEntry], outs: list[TxEntry]) -> None:
+        if len(ins) != 1 or len(outs) != 1:
+            return
+        entry_in, entry_out = ins[0], outs[0]
+        if entry_in.quantity <= 0 or entry_out.quantity <= 0:
+            return
+        in_coin = sanitize_symbol(entry_in.token)
+        out_coin = sanitize_symbol(entry_out.token)
+        if self.is_compound_v2_supply(in_coin) and self.matches_underlying(in_coin, out_coin):
+            self.dynamic_underlying_ratios[in_coin] = float(entry_out.quantity / entry_in.quantity)
+        elif self.is_compound_v2_supply(out_coin) and self.matches_underlying(out_coin, in_coin):
+            self.dynamic_underlying_ratios[out_coin] = float(entry_in.quantity / entry_out.quantity)
+
+    def resolve_underlying_ratio(self, coin: str) -> float:
+        normalized = sanitize_symbol(coin)
+        if self.is_compound_v2_supply(normalized):
+            return self.dynamic_underlying_ratios.get(normalized, 1.0)
+        return 1.0
 
     def fetch_asset(self, coin: str) -> CryptoPosition:
         normalized_coin = sanitize_symbol(coin)
@@ -331,6 +441,8 @@ class TransactionApplier:
         self.parser = parser or TransactionParser()
 
     def _price_for_asset(self, *, asset: CryptoPosition, date_value: str, action: str) -> float:
+        self.ledger.sync_daily_underlying_ratios(date_value)
+        ratio = self.ledger.resolve_underlying_ratio(asset.coin)
         price = get_crypto_price(
             coin=asset.price_source,
             date=date_value,
@@ -344,7 +456,7 @@ class TransactionApplier:
                 action=action,
             )
             return 0.0
-        return price
+        return price * ratio
 
     def receive(
         self,
@@ -354,6 +466,7 @@ class TransactionApplier:
         date_value: str,
         tx_hash: str = "",
     ):
+        self.ledger.sync_daily_underlying_ratios(date_value)
         asset.quantity += amount_received
         price = self._price_for_asset(asset=asset, date_value=date_value, action="receive")
         self.ledger.adjust_principal(
@@ -372,8 +485,9 @@ class TransactionApplier:
         date_value: str,
         tx_hash: str = "",
     ):
-        asset.quantity -= amount_sent
+        self.ledger.sync_daily_underlying_ratios(date_value)
         price = self._price_for_asset(asset=asset, date_value=date_value, action="send")
+        asset.quantity -= amount_sent
         self.ledger.adjust_principal(
             asset=asset,
             amount_eur=-(float(amount_sent) * price),
@@ -391,6 +505,8 @@ class TransactionApplier:
         touched_coins: set[str],
         tx_hash: str = "",
     ) -> None:
+        self.ledger.sync_daily_underlying_ratios(date_value)
+        self.ledger.update_swap_underlying_ratio(ins=ins, outs=outs)
         total_in_value_eur = 0.0
         for entry in ins:
             asset = self.ledger.fetch_asset(entry.token)

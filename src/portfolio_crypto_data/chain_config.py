@@ -10,6 +10,7 @@ from portfolio_core import active_context
 from portfolio_crypto_data.symbols import sanitize_symbol
 
 DEFAULT_PROTOCOLS = ("beefy", "balancer", "curve", "aave", "liquid_staking")
+DEFAULT_RPC_CONCURRENCY = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,6 +25,8 @@ class EvmChainConfig:
     native_decimals: int
     protocols: tuple[str, ...]
     explorer_include_chain_id: bool
+    supplementary_transactions: tuple[str, ...] = ()
+    rpc_concurrency: int = DEFAULT_RPC_CONCURRENCY
 
 
 def _required_text(*, raw: dict[str, Any], key: str, chain: str) -> str:
@@ -79,6 +82,22 @@ def parse_evm_chain_config(*, chain: str, raw: dict[str, Any]) -> EvmChainConfig
             f"Chain '{chain}' is missing required config field 'rpc_url'."
         )
 
+    supp_list = raw.get("supplementary_transactions", [])
+    if isinstance(supp_list, str):
+        supp_list = [supp_list]
+    supplementary_txs = tuple(str(x).strip() for x in supp_list if str(x).strip())
+
+    try:
+        rpc_concurrency = int(raw.get("rpc_concurrency", DEFAULT_RPC_CONCURRENCY))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Chain '{chain}' config field 'rpc_concurrency' must be an integer."
+        ) from exc
+    if rpc_concurrency <= 0:
+        raise ValueError(
+            f"Chain '{chain}' config field 'rpc_concurrency' must be positive."
+        )
+
     return EvmChainConfig(
         chain=chain,
         chain_id=_required_text(raw=raw, key="chain_id", chain=chain),
@@ -95,6 +114,8 @@ def parse_evm_chain_config(*, chain: str, raw: dict[str, Any]) -> EvmChainConfig
             chain=chain,
             default=True,
         ),
+        supplementary_transactions=supplementary_txs,
+        rpc_concurrency=rpc_concurrency,
     )
 
 

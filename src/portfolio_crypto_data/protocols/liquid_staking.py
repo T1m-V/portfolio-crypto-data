@@ -5,6 +5,8 @@ from decimal import Decimal
 from portfolio_crypto_data.datetime_utils import format_daily_datetime
 from portfolio_crypto_data.pipeline_logging import PipelineLogger
 from portfolio_crypto_data.protocols.common import (
+    call_with_retry,
+    is_active_protocol_quantity,
     load_block_map,
     load_chain_web3,
     load_snapshot_ranges,
@@ -24,7 +26,14 @@ RATE_PROVIDER_ABI = [
         "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function",
-    }
+    },
+    {
+        "inputs": [],
+        "name": "exchangeRate",
+        "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
 ]
 
 
@@ -91,6 +100,8 @@ def get_liquid_staking_history(
         abi=RATE_PROVIDER_ABI,
     )
     history_data: list[dict[str, object]] = []
+    known_deployed: set[str] = set()
+    last_ratio: float | None = None
 
     current_dt = start_dt
     total_days = max((end_dt.date() - start_dt.date()).days + 1, 1)
@@ -112,23 +123,36 @@ def get_liquid_staking_history(
             total_days=total_days,
         )
         try:
-            if len(w3.eth.get_code(rate_provider.address, block_identifier=block_num)) == 0:
-                current_dt += timedelta(days=1)
-                continue
+            if rate_provider.address not in known_deployed:
+                code = call_with_retry(
+                    w3.eth.get_code, rate_provider.address, block_identifier=block_num
+                )
+                if len(code) == 0:
+                    current_dt += timedelta(days=1)
+                    continue
+                known_deployed.add(rate_provider.address)
 
-            rate_raw = getattr(rate_provider.functions, rate_provider_method)().call(
-                block_identifier=block_num
-            )
-            ratio = Decimal(rate_raw) / Decimal(rate_scale)
+            rate_fn = getattr(rate_provider.functions, rate_provider_method)
+            rate_raw = call_with_retry(rate_fn().call, block_identifier=block_num)
+            ratio = float(Decimal(rate_raw) / Decimal(rate_scale))
+            last_ratio = ratio
             row: dict[str, object] = {
                 "date": format_daily_datetime(current_dt),
                 "block": block_num,
                 "lst_balance": 1.0,
-                f"asset_{underlying_symbol}": float(ratio),
+                f"asset_{underlying_symbol}": ratio,
             }
             history_data.append(row)
         except Exception as e:
             logger.info(f"[liquid_staking] Error on {current_dt.date()} for {symbol}: {e}")
+            if last_ratio is not None:
+                row = {
+                    "date": format_daily_datetime(current_dt),
+                    "block": block_num,
+                    "lst_balance": 1.0,
+                    f"asset_{underlying_symbol}": last_ratio,
+                }
+                history_data.append(row)
 
         current_dt += timedelta(days=1)
 
@@ -149,6 +173,7 @@ def process_all_liquid_staking_tokens(
 ) -> None:
     logger = logger or PipelineLogger()
     token_ranges = load_snapshot_ranges(chain=chain)
+    all_tokens = load_tokens(chain=chain)
     for config in _load_liquid_staking_configs(chain=chain):
         rng = token_ranges.get(config.symbol)
         if rng is None:
@@ -160,7 +185,20 @@ def process_all_liquid_staking_tokens(
             symbol=config.symbol,
             fallback_start_date=format_daily_datetime(rng["start"]),
         )
-        end_date = resolve_protocol_end_date(rng)
+        has_active = is_active_protocol_quantity(rng.get("qty"))
+        if not has_active:
+            dependent_wrappers = [
+                sanitize_symbol(info.get("symbol"))
+                for info in all_tokens.values()
+                if isinstance(info, dict)
+                and sanitize_symbol(info.get("underlying_symbol")) == config.symbol
+            ]
+            has_active = any(
+                is_active_protocol_quantity(token_ranges.get(w, {}).get("qty"))
+                for w in dependent_wrappers
+            )
+
+        end_date = "now" if has_active else resolve_protocol_end_date(rng)
         if should_skip_date_window(start_date=resolved_start_date, end_date=end_date):
             logger.protocol_skip(
                 "liquid_staking",

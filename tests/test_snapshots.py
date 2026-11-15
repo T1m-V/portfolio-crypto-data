@@ -753,3 +753,58 @@ def test_crypto_com_app_generator_rejects_unknown_kind_and_unmatched_dust(
             input_csv=unmatched,
             output_csv=tmp_path / "unmatched-output.csv",
         )
+
+
+def test_compound_v2_supply_tokens_resolve_dynamic_underlying_ratio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import date
+
+    monkeypatch.setattr(raw_snapshots, "get_crypto_price", lambda **_: 2000.0)
+    token_metadata = {
+        "0x1": {
+            "symbol": "CDCETH",
+            "decimals": 18,
+            "family": "ETH",
+        },
+        "0x2": {
+            "symbol": "tCDCETH",
+            "decimals": 8,
+            "family": "CDCETH",
+            "price_source": "CDCETH",
+            "protocol": "aave",
+            "position_type": "supply",
+            "contract_style": "compound_v2",
+            "underlying_symbol": "CDCETH",
+            "underlying_decimals": 18,
+        },
+    }
+    ledger = PortfolioLedger(chain="cronos", token_metadata=token_metadata)
+    ledger.aave_supply_by_date = {
+        date(2026, 1, 2): {"CDCETH": Decimal("1.02")},
+    }
+    applier = TransactionApplier(ledger=ledger)
+
+    # 1. Mint via Swap: 1.0 CDCETH -> 10.0 tCDCETH (dynamic ratio = 0.10)
+    applier.process_transaction(
+        _chain_row(
+            "Swap",
+            Date=pd.Timestamp("2026-01-01 10:00"),
+            **{"Qty in": "10.0", "Token in": "tCDCETH", "Qty out": "1.0", "Token out": "CDCETH"},
+        )
+    )
+    assert ledger.resolve_underlying_ratio("tCDCETH") == pytest.approx(0.10)
+    assert ledger.assets["tCDCETH"].principal == pytest.approx(2000.0)
+
+    # 2. Next day Send (liquidation of 5.0 tCDCETH) when exposure is 1.02 CDCETH (ratio = 0.102)
+    applier.process_transaction(
+        _chain_row(
+            "Send",
+            Date=pd.Timestamp("2026-01-02 10:00"),
+            **{"Qty out": "5.0", "Token out": "tCDCETH"},
+        )
+    )
+    assert ledger.resolve_underlying_ratio("tCDCETH") == pytest.approx(0.102)
+    # 5.0 tCDCETH * 0.102 * 2000 EUR = 1020 EUR removed -> remaining principal = 980 EUR
+    assert ledger.assets["tCDCETH"].principal == pytest.approx(980.0)
+

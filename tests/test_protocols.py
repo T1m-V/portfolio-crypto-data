@@ -293,3 +293,41 @@ def test_liquid_staking_tokens_are_configured_by_chain_metadata() -> None:
             rate_scale=10**8,
         ),
     )
+
+
+def test_resolve_effective_start_date_skips_completed_aave_and_retries_from_error_date() -> None:
+    common.write_protocol_history_csv(
+        protocol="aave",
+        chain="arbitrum",
+        symbol="aave_daily_exposure",
+        history_data=[
+            {"date": "2025-05-10", "queried_token_count": 3, "rpc_error_count": 0},
+            {"date": "2025-05-11", "queried_token_count": 3, "rpc_error_count": 0},
+        ],
+    )
+    resolved_clean = common.resolve_effective_start_date(
+        protocol="aave",
+        chain="arbitrum",
+        symbol="aave_daily_exposure",
+        fallback_start_date="2023-03-24",
+    )
+    assert resolved_clean == "2025-05-12 00:00:00"
+    assert common.should_skip_date_window(resolved_clean, "2025-05-10 00:00:00")
+
+    common.write_protocol_history_csv(
+        protocol="aave",
+        chain="cronos",
+        symbol="aave_daily_exposure",
+        history_data=[
+            {"date": "2026-11-08", "queried_token_count": 3, "rpc_error_count": 0},
+            {"date": "2026-11-09", "queried_token_count": 3, "rpc_error_count": 1},
+            {"date": "2026-11-10", "queried_token_count": 3, "rpc_error_count": 0},
+        ],
+    )
+    resolved_error = common.resolve_effective_start_date(
+        protocol="aave",
+        chain="cronos",
+        symbol="aave_daily_exposure",
+        fallback_start_date="2025-03-15",
+    )
+    assert resolved_error == "2026-11-09 00:00:00"

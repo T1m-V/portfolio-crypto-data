@@ -213,7 +213,7 @@ def _load_aave_overlay(chain: str) -> pd.DataFrame | None:
     if frame.empty:
         return None
     frame["date"] = frame["date"].dt.normalize()
-    return frame.sort_values("date").reset_index(drop=True)
+    return frame.sort_values("date").ffill().reset_index(drop=True)
 
 
 def _load_aave_wrapper_symbols(token_metadata: dict[str, dict[str, Any]]) -> set[str]:
@@ -682,6 +682,47 @@ def _write_csv(path: Path, frame: pd.DataFrame, columns: list[str]) -> None:
             output[column] = pd.NA
     output = output[columns]
     atomic_write_csv(frame=output, path=path)
+
+
+def validate_direct_snapshot_prices(*, chain: str) -> None:
+    clear_price_cache()
+    runtime_paths = active_context().paths
+    snapshots = _normalize_snapshot_frame(
+        _read_csv(
+            runtime_paths.crypto_snapshots / f"{chain}_raw_snapshots.csv",
+            ["Date", "Coin", "Quantity", "Principal Invested"],
+        )
+    )
+    if snapshots.empty:
+        return
+
+    token_metadata = load_token_metadata(chain=chain, tokens_folder=runtime_paths.tokens)
+    ctx = _build_context(chain=chain, token_metadata=token_metadata)
+    expander = ExposureExpander(ctx=ctx)
+    price_resolver = PriceResolver(ctx=ctx, mode="eur")
+
+    material = snapshots[snapshots["Quantity"].abs() > float(MATERIAL_QUANTITY_THRESHOLD)]
+    for coin, group in material.groupby("Coin", sort=True):
+        source = sanitize_symbol(coin)
+        if not source or ctx.route_for(source) != ValuationRoute.DIRECT:
+            continue
+        first_date = pd.Timestamp(group["Date"].min()).normalize()
+        exposures = expander.expand(
+            symbol=source,
+            quantity=Decimal("1"),
+            date_value=first_date,
+            has_direct_exposure=True,
+            has_protocol_exposure=False,
+            has_aave_exposure=False,
+        )
+        for base_coin in exposures:
+            if price_resolver.resolve(symbol=base_coin, target_date=first_date).price_eur is None:
+                raise ValueError(
+                    f"Missing EUR price for direct token '{base_coin}' "
+                    f"on {first_date.date()} ({chain}): "
+                    f"add '{base_coin}' to config/currency_metadata.json and update prices, "
+                    f"or set its 'protocol' in crypto/tokens/{chain}_tokens.json."
+                )
 
 
 def build_accounting_artifacts(
