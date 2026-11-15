@@ -269,9 +269,15 @@ def get_all_transaction_hashes(
         if not base_url.endswith("/table"):
             base_url = f"{base_url}/table"
 
-        std_rows = _fetch_cronos_table_data(f"{base_url}/getTransactions", address, start_ts=start_ts)
-        tok_rows = _fetch_cronos_table_data(f"{base_url}/addressTransfers", address, start_ts=start_ts)
-        int_rows = _fetch_cronos_table_data(f"{base_url}/getInternalTransactions", address, start_ts=start_ts)
+        std_rows = _fetch_cronos_table_data(
+            f"{base_url}/getTransactions", address, start_ts=start_ts
+        )
+        tok_rows = _fetch_cronos_table_data(
+            f"{base_url}/addressTransfers", address, start_ts=start_ts
+        )
+        int_rows = _fetch_cronos_table_data(
+            f"{base_url}/getInternalTransactions", address, start_ts=start_ts
+        )
 
         hashes_std = set()
         for tx in std_rows:
