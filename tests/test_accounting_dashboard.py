@@ -340,3 +340,46 @@ def test_incremental_accounting_matches_full_rebuild() -> None:
 
     pd.testing.assert_frame_equal(inc_source, full_source)
     pd.testing.assert_frame_equal(inc_base, full_base)
+
+
+def test_accounting_retains_sub_euro_direct_source_when_base_coin_is_material() -> None:
+    _write_workspace(
+        metadata={
+            "native": {"symbol": "CRO", "decimals": 18},
+            "debt": {
+                "symbol": "debtTCRO",
+                "protocol": "aave",
+                "price_source": "CRO",
+                "position_type": "debt",
+            },
+        },
+        snapshots=[
+            {"Date": "2025-01-01", "Coin": "CRO", "Quantity": 10, "Principal Invested": 0},
+            {
+                "Date": "2025-01-01",
+                "Coin": "debtTCRO",
+                "Quantity": 16_000,
+                "Principal Invested": 0,
+            },
+        ],
+        principal=[
+            {"Date": "2025-01-01", "Coin": "CRO", "PrincipalInvestedEUR": 640},
+        ],
+    )
+    _price("CRO", 0.04, "2025-01-01")
+    _protocol(
+        "aave",
+        "aave_daily_exposure",
+        [{"date": "2025-01-01", "net_CRO": -16_000}],
+    )
+
+    result = accounting.build_accounting_artifacts(chain=CHAIN, as_of_date="2025-01-01")
+    source_base = pd.read_csv(result.paths.source_base_daily)
+    base_row = pd.read_csv(result.paths.base_daily).iloc[0]
+
+    assert set(source_base["Source"]) == {"Aave", "CRO"}
+    assert base_row["Coin"] == "CRO"
+    assert base_row["Quantity"] == pytest.approx(-15_990.0)
+    assert base_row["MarketValueEUR"] == pytest.approx(-639.60)
+    assert base_row["PrincipalInvestedEUR"] == pytest.approx(640.0)
+

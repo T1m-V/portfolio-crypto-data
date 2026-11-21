@@ -509,14 +509,9 @@ def _build_source_base_daily(
         for column in ("Quantity", "MarketValueEUR", "PrincipalInvestedEUR", "RealizedPnLEUR"):
             source_base[column] = pd.to_numeric(source_base[column], errors="coerce")
         source_base = source_base[
-            source_base.apply(
-                lambda row: _is_material(
-                    market_value=Decimal(str(row["MarketValueEUR"])),
-                    principal=Decimal(str(row["PrincipalInvestedEUR"])),
-                    realized_pnl=Decimal(str(row["RealizedPnLEUR"])),
-                ),
-                axis=1,
-            )
+            (source_base["MarketValueEUR"].abs() >= float(VALUE_DUST_EUR))
+            | (source_base["PrincipalInvestedEUR"].abs() >= float(VALUE_DUST_EUR))
+            | (source_base["RealizedPnLEUR"].abs() >= float(VALUE_DUST_EUR))
         ].copy()
 
     source_base = _allocate_principal_to_sources(
@@ -590,8 +585,19 @@ def _allocate_principal_to_sources(
             ignore_index=True,
             sort=False,
         )
-    output = output[
-        output.apply(
+    if not output.empty:
+        grouped_totals = output.groupby(["Date", "BaseCoin"], sort=False)[
+            ["MarketValueEUR", "PrincipalInvestedEUR", "RealizedPnLEUR"]
+        ].transform("sum")
+        group_material = (
+            (grouped_totals["MarketValueEUR"].abs() >= float(MATERIAL_VALUE_THRESHOLD_EUR))
+            | (
+                grouped_totals["PrincipalInvestedEUR"].abs()
+                >= float(MATERIAL_VALUE_THRESHOLD_EUR)
+            )
+            | (grouped_totals["RealizedPnLEUR"].abs() >= float(MATERIAL_VALUE_THRESHOLD_EUR))
+        )
+        row_material = output.apply(
             lambda row: _is_material(
                 market_value=Decimal(str(row["MarketValueEUR"])),
                 principal=Decimal(str(row["PrincipalInvestedEUR"])),
@@ -599,7 +605,8 @@ def _allocate_principal_to_sources(
             ),
             axis=1,
         )
-    ].copy()
+        non_dust_active = output["MarketValueEUR"].abs() >= float(VALUE_DUST_EUR)
+        output = output[row_material | (group_material & non_dust_active)].copy()
     return output[SOURCE_BASE_DAILY_COLUMNS].reset_index(drop=True)
 
 
