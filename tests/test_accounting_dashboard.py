@@ -383,3 +383,43 @@ def test_accounting_retains_sub_euro_direct_source_when_base_coin_is_material() 
     assert base_row["MarketValueEUR"] == pytest.approx(-639.60)
     assert base_row["PrincipalInvestedEUR"] == pytest.approx(640.0)
 
+
+def test_accounting_from_date_recomputes_from_given_date_and_preserves_prior_rows() -> None:
+    _write_workspace(
+        metadata={"btc": {"symbol": "BTC"}},
+        snapshots=[
+            {"Date": "2025-01-01", "Coin": "BTC", "Quantity": 1, "Principal Invested": 0},
+        ],
+        principal=[
+            {"Date": "2025-01-01", "Coin": "BTC", "PrincipalInvestedEUR": 40_000},
+        ],
+    )
+    prices_path = active_context().paths.prices / "BTC.csv"
+    pd.DataFrame(
+        [
+            {"Date": "2025-01-01", "Price": 40_000},
+            {"Date": "2025-01-02", "Price": 42_000},
+            {"Date": "2025-01-03", "Price": 45_000},
+        ]
+    ).to_csv(prices_path, index=False)
+
+    accounting.build_accounting_artifacts(chain=CHAIN, as_of_date="2025-01-03")
+
+    pd.DataFrame(
+        [
+            {"Date": "2025-01-01", "Price": 99_000},
+            {"Date": "2025-01-02", "Price": 50_000},
+            {"Date": "2025-01-03", "Price": 55_000},
+        ]
+    ).to_csv(prices_path, index=False)
+
+    result = accounting.build_accounting_artifacts(
+        chain=CHAIN,
+        as_of_date="2025-01-03",
+        from_date="2025-01-02",
+    )
+    base = pd.read_csv(result.paths.base_daily).sort_values("Date").reset_index(drop=True)
+
+    assert base["MarketValueEUR"].tolist() == [40_000.0, 50_000.0, 55_000.0]
+    assert base["ProfitLossEUR"].tolist() == [0.0, 10_000.0, 15_000.0]
+

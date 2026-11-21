@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -708,8 +709,9 @@ def validate_direct_snapshot_prices(*, chain: str) -> None:
 def build_accounting_artifacts(
     *,
     chain: str,
-    as_of_date: str | pd.Timestamp | None = None,
+    as_of_date: str | date | pd.Timestamp | None = None,
     incremental: bool = False,
+    from_date: str | date | pd.Timestamp | None = None,
 ) -> AccountingBuildResult:
     clear_price_cache()
     paths = accounting_paths(chain=chain)
@@ -734,12 +736,18 @@ def build_accounting_artifacts(
     start_date: pd.Timestamp | None = None
     existing_source_base = _empty(SOURCE_BASE_DAILY_COLUMNS)
     existing_base = _empty(BASE_DAILY_COLUMNS)
-    if incremental and paths.source_base_daily.exists() and paths.base_daily.exists():
+    if (incremental or from_date is not None) and (
+        paths.source_base_daily.exists() and paths.base_daily.exists()
+    ):
         existing_source_base = _read_csv(paths.source_base_daily, SOURCE_BASE_DAILY_COLUMNS)
         existing_base = _read_csv(paths.base_daily, BASE_DAILY_COLUMNS)
         existing_dates = _parse_daily_series(existing_base["Date"]).dropna()
         if not existing_dates.empty:
-            start_date = pd.Timestamp(existing_dates.max()).normalize()
+            latest_known = pd.Timestamp(existing_dates.max()).normalize()
+            if from_date is not None:
+                start_date = min(pd.Timestamp(from_date).normalize(), latest_known)
+            else:
+                start_date = latest_known
 
     source_base = _build_source_base_daily(
         snapshots=snapshots,

@@ -84,9 +84,33 @@ def _refresh_protocols(*, config: EvmChainConfig, logger: PipelineLogger) -> Non
         processor(chain=config.chain, logger=logger)
 
 
-def _rebuild_chain(*, config: EvmChainConfig, as_of_date: date) -> None:
-    _build_snapshots(config=config)
-    build_accounting_artifacts(chain=config.chain, as_of_date=as_of_date)
+def _snapshots_up_to_date(*, config: EvmChainConfig) -> bool:
+    paths = active_context().paths
+    transactions = paths.crypto_transactions / f"{config.chain}_transactions.csv"
+    snapshots = paths.crypto_snapshots / f"{config.chain}_raw_snapshots.csv"
+    principal = accounting_paths(chain=config.chain)
+    outputs = (snapshots, principal.principal_events, principal.principal_daily)
+    if not transactions.exists() or not all(path.exists() for path in outputs):
+        return False
+    tx_mtime = transactions.stat().st_mtime
+    return all(path.stat().st_mtime >= tx_mtime for path in outputs)
+
+
+def _rebuild_chain(
+    *,
+    config: EvmChainConfig,
+    as_of_date: date,
+    incremental: bool = False,
+    from_date: str | date | None = None,
+) -> None:
+    if not ((incremental or from_date is not None) and _snapshots_up_to_date(config=config)):
+        _build_snapshots(config=config)
+    build_accounting_artifacts(
+        chain=config.chain,
+        as_of_date=as_of_date,
+        incremental=incremental,
+        from_date=from_date,
+    )
     build_chain_dashboard_artifacts(chain=config.chain)
 
 
@@ -94,11 +118,18 @@ def rebuild_derived(
     *,
     as_of_date: date | None = None,
     chain_configs: Iterable[EvmChainConfig] | None = None,
+    incremental: bool = False,
+    from_date: str | date | None = None,
 ) -> None:
     """Rebuild local artifacts for every configured EVM chain without network requests."""
     target_date = as_of_date or date.today()
     for config in _configured_chains(chain_configs):
-        _rebuild_chain(config=config, as_of_date=target_date)
+        _rebuild_chain(
+            config=config,
+            as_of_date=target_date,
+            incremental=incremental,
+            from_date=from_date,
+        )
 
 
 def _update_chain(*, config: EvmChainConfig, logger: PipelineLogger) -> None:

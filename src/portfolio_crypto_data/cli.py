@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable
+from datetime import date
 from pathlib import Path
 
 from portfolio_core import PortfolioContext, mutation_session, validate_data_workspace
@@ -15,6 +16,17 @@ def _parser() -> argparse.ArgumentParser:
         "--chain", type=str, default=None, help="Specific chain to update or rebuild"
     )
     parser.add_argument("command", choices=["update", "rebuild"])
+    parser.add_argument(
+        "--incremental",
+        action="store_true",
+        help="Reuse existing snapshots and accounting history when rebuilding",
+    )
+    parser.add_argument(
+        "--from-date",
+        type=date.fromisoformat,
+        default=None,
+        help="Start date (YYYY-MM-DD) for incremental accounting rebuild",
+    )
     return parser
 
 
@@ -95,10 +107,11 @@ def main(argv: list[str] | None = None) -> int:
                     _refresh_nexo(context=context)
                     _refresh_crypto_com_app(context=context)
             else:
-                if chain_configs is not None:
-                    rebuild_derived(chain_configs=chain_configs)
-                else:
-                    rebuild_derived()
+                rebuild_derived(
+                    chain_configs=chain_configs,
+                    incremental=args.incremental,
+                    from_date=args.from_date,
+                )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
